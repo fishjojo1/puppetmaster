@@ -1,0 +1,16 @@
+.venv/
+.puppetmaster/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+*.egg-info/
+build/
+dist/
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+.DS_Store

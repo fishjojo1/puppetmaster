@@ -1,0 +1,179 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+from .config import load_config
+from .errors import PuppetError
+from .registry import Registry
+from .services import complete_agent, create_codex_agent, inspect_agent, kill_agent, prompt_agent, read_agent, stop_agent
+from .tmux import Tmux
+
+
+def _context() -> tuple[Any, Registry, Tmux, dict[str, Any]]:
+    cfg = load_config()
+    reg = Registry(cfg)
+    tmux = Tmux(cfg)
+    agent_id = os.environ.get("PUPPETMASTER_AGENT_ID")
+    if not agent_id:
+        raise PuppetError("missing_caller", "Puppetmaster MCP is not running in a managed agent context.")
+    caller = reg.get_agent(agent_id)
+    return cfg, reg, tmux, caller
+
+
+def _authorized(reg: Registry, caller: dict[str, Any], target_id: str, mutate: bool = False) -> None:
+    if target_id == caller["id"]:
+        return
+    target = reg.get_agent(target_id)
+    if caller["role"] == "orchestrator" and target["root_id"] == caller["root_id"]:
+        return
+    if target_id in reg.descendants(caller["id"]):
+        return
+    raise PuppetError("not_authorized", f"{caller['id']} is not authorized for {target_id}")
+
+
+def _error(exc: PuppetError) -> dict:
+    return exc.as_dict()
+
+
+mcp = FastMCP("puppetmaster")
+
+
+@mcp.tool()
+def create_agent(description: str, prompt: str, cwd: str, name: str | None = None, metadata: dict | None = None) -> dict:
+    """Create a child Codex agent. cwd is required and must be an existing absolute path."""
+    try:
+        cfg, reg, tmux, caller = _context()
+        agent = create_codex_agent(cfg, reg, tmux, cwd=cwd, description=description, prompt=prompt, parent_id=caller["id"], name=name)
+        return {"id": agent["id"], "status": agent["status"], "cwd": agent["cwd"], "attach_command": tmux.attach_command(agent["tmux_session"])}
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool(name="complete_agent")
+def complete_agent_tool(status: str, summary: str, result: str | None = None, files_changed: list[str] | None = None, next_steps: list[str] | None = None) -> dict:
+    """Report this agent complete, failed, blocked, or cancelled."""
+    try:
+        cfg, reg, tmux, caller = _context()
+        return complete_agent(
+            reg,
+            caller["id"],
+            status=status,
+            summary=summary,
+            result=result,
+            files_changed=files_changed,
+            next_steps=next_steps,
+            source="mcp_tool",
+            config=cfg,
+            tmux=tmux,
+        )
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool(name="read_agent")
+def read_agent_tool(agent_id: str, lines: int = 120, source: str = "auto") -> dict:
+    """Read recent terminal output for an authorized agent."""
+    try:
+        cfg, reg, tmux, caller = _context()
+        _authorized(reg, caller, agent_id)
+        return {"agent_id": agent_id, "output": read_agent(cfg, reg, tmux, agent_id, lines, source)}
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool(name="inspect_agent")
+def inspect_agent_tool(agent_id: str) -> dict:
+    """Inspect metadata, state, children, events, and recent output for an authorized agent."""
+    try:
+        cfg, reg, tmux, caller = _context()
+        _authorized(reg, caller, agent_id)
+        return inspect_agent(cfg, reg, tmux, agent_id)
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+def list_agents(root_id: str | None = None, parent_id: str | None = None, status: str | None = None, include_dead: bool = True) -> dict:
+    """List agents visible to the caller."""
+    try:
+        _cfg, reg, _tmux, caller = _context()
+        root = root_id or caller["root_id"]
+        if caller["role"] != "orchestrator" and root != caller["root_id"]:
+            raise PuppetError("not_authorized", "caller cannot list another root tree")
+        return {"agents": reg.list_agents(root_id=root, parent_id=parent_id, status=status, include_dead=include_dead)}
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool(name="prompt_agent")
+def prompt_agent_tool(agent_id: str, prompt: str) -> dict:
+    """Send a prompt to an authorized live agent."""
+    try:
+        _cfg, reg, tmux, caller = _context()
+        _authorized(reg, caller, agent_id, mutate=True)
+        return prompt_agent(reg, tmux, agent_id, prompt, source="mcp_tool")
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool(name="stop_agent")
+def stop_agent_tool(agent_id: str) -> dict:
+    """Gracefully stop an authorized agent session."""
+    try:
+        _cfg, reg, tmux, caller = _context()
+        _authorized(reg, caller, agent_id, mutate=True)
+        return stop_agent(reg, tmux, agent_id, source="mcp_tool")
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool(name="kill_agent")
+def kill_agent_tool(agent_id: str) -> dict:
+    """Force-kill an authorized agent tmux session."""
+    try:
+        _cfg, reg, tmux, caller = _context()
+        _authorized(reg, caller, agent_id, mutate=True)
+        return kill_agent(reg, tmux, agent_id, source="mcp_tool")
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+def pause_agent(agent_id: str) -> dict:
+    """Mark an agent awaiting input. This does not suspend the process."""
+    try:
+        _cfg, reg, _tmux, caller = _context()
+        _authorized(reg, caller, agent_id, mutate=True)
+        return reg.update_agent(agent_id, status="awaiting_input")
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+def resume_agent(agent_id: str) -> dict:
+    """Mark an awaiting agent running. Use prompt_agent to actually send instructions."""
+    try:
+        _cfg, reg, _tmux, caller = _context()
+        _authorized(reg, caller, agent_id, mutate=True)
+        return reg.update_agent(agent_id, status="running")
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+def attach_agent(agent_id: str) -> dict:
+    """Return the tmux attach command for an authorized agent."""
+    try:
+        _cfg, reg, tmux, caller = _context()
+        _authorized(reg, caller, agent_id)
+        agent = reg.get_agent(agent_id)
+        return {"attach_command": tmux.attach_command(agent["tmux_session"])}
+    except PuppetError as exc:
+        return _error(exc)
+
+
+def run() -> None:
+    mcp.run()

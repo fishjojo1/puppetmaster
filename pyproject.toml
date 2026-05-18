@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pupptermaster"
+version = "0.1.0"
+description = "Local tmux supervisor and MCP control plane for Codex agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.0",
+]
+
+[project.scripts]
+puppet = "puppetmaster.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
