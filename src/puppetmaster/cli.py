@@ -11,6 +11,7 @@ from .config import load_config
 from .errors import PuppetError
 from .registry import Registry
 from .services import (
+    cleanup_completed_agents,
     complete_agent,
     create_codex_agent,
     create_raw_agent,
@@ -256,6 +257,22 @@ def cmd_agent_cleanup_dead(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_cleanup_completed(args: argparse.Namespace) -> int:
+    _cfg, reg, tmux = build_context()
+    emit(
+        cleanup_completed_agents(
+            reg,
+            tmux,
+            root_id=args.root,
+            dry_run=args.dry_run,
+            kill_stale=args.kill_stale,
+            include_roots=args.include_roots,
+        ),
+        args.json,
+    )
+    return 0
+
+
 def cmd_orchestrator_start(args: argparse.Namespace) -> int:
     cfg, reg, tmux = build_context()
     agent = start_orchestrator(cfg, reg, tmux, cwd=args.cwd, prompt=read_prompt(args), name=args.name, new_root=args.new_root)
@@ -329,6 +346,13 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
 
     run()
     return 0
+
+
+def cmd_tui(args: argparse.Namespace) -> int:
+    from .tui import run_tui
+
+    cfg, reg, tmux = build_context()
+    return run_tui(cfg, reg, tmux, root_id=args.root, refresh=args.refresh, lines=args.lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -439,6 +463,13 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--kill-stale", action="store_true")
     add_json(cleanup)
     cleanup.set_defaults(func=cmd_agent_cleanup_dead)
+    cleanup_completed = a.add_parser("cleanup-completed", help="Prune completed agents from the registry tree while preserving logs.")
+    cleanup_completed.add_argument("--root", help="Limit cleanup to one root_id.")
+    cleanup_completed.add_argument("--dry-run", action="store_true", help="Preview cleanup without changing registry or tmux.")
+    cleanup_completed.add_argument("--kill-stale", action="store_true", help="Kill live tmux sessions for pruned completed agents.")
+    cleanup_completed.add_argument("--include-roots", action="store_true", help="Allow pruning completed root orchestrators.")
+    add_json(cleanup_completed)
+    cleanup_completed.set_defaults(func=cmd_agent_cleanup_completed)
 
     events = sub.add_parser("events", help="Inspect event queues.")
     e = events.add_subparsers(required=True)
@@ -470,6 +501,12 @@ def build_parser() -> argparse.ArgumentParser:
     m = mcp.add_subparsers(required=True)
     serve = m.add_parser("serve")
     serve.set_defaults(func=cmd_mcp_serve)
+
+    tui = sub.add_parser("tui", help="Navigate agents and preview live output.")
+    tui.add_argument("--root", help="Limit the view to one root_id.")
+    tui.add_argument("--refresh", type=float, default=1.0, help="Refresh interval in seconds.")
+    tui.add_argument("--lines", type=int, default=120, help="Terminal preview lines to capture.")
+    tui.set_defaults(func=cmd_tui)
 
     doc = sub.add_parser("doctor", help="Check local dependencies and state.")
     doc.add_argument("--deep", action="store_true")

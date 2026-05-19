@@ -58,6 +58,7 @@ puppet agent tree
 puppet orchestrator inspect
 puppet agent inspect <agent-id>
 puppet agent read <agent-id> --lines 120
+puppet tui
 ```
 
 Attach to a live session:
@@ -70,6 +71,13 @@ Print the attach command without attaching:
 
 ```bash
 puppet agent attach <agent-id> --print
+```
+
+Open the terminal UI to navigate the agent tree, view stats, and preview the selected agent's live tmux pane or saved log:
+
+```bash
+puppet tui --refresh 1 --lines 120
+puppet tui --root <root-agent-id>
 ```
 
 Create a child from the human CLI:
@@ -166,6 +174,14 @@ Human override with audit trail:
 puppet agent mark-status <agent-id> --status blocked --reason "Human found it waiting on input."
 ```
 
+Prune completed agents from the registry tree while preserving their logs and state directories:
+
+```bash
+puppet agent cleanup-completed --dry-run
+puppet agent cleanup-completed
+puppet agent cleanup-completed --root <root-agent-id> --kill-stale
+```
+
 ## Troubleshooting
 
 Codex not found:
@@ -229,4 +245,3 @@ Live Codex workflow validation requires working Codex credentials and may start 
 - Uses tmux and Codex hooks; both must work on the host.
 - Idle detection is conservative and hook-based, not a perfect terminal parser.
 - No browser dashboard or multi-user authentication.
-

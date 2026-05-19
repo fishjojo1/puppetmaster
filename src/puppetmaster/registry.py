@@ -188,6 +188,22 @@ class Registry:
             conn.execute(f"update agents set {assignments} where id=?", values)
         return self.get_agent(agent_id)
 
+    def delete_agents(self, agent_ids: list[str]) -> int:
+        if not agent_ids:
+            return 0
+        placeholders = ",".join("?" for _ in agent_ids)
+        with self.connect() as conn:
+            conn.execute(
+                f"""
+                delete from event_deliveries
+                where recipient_agent_id in ({placeholders})
+                   or event_id in (select id from events where agent_id in ({placeholders}))
+                """,
+                agent_ids + agent_ids,
+            )
+            cursor = conn.execute(f"delete from agents where id in ({placeholders})", agent_ids)
+        return int(cursor.rowcount)
+
     def append_event(
         self,
         agent_id: str,
@@ -377,4 +393,3 @@ class Registry:
         if "payload_json" in data:
             data["payload"] = json_loads(data.pop("payload_json", "{}"))
         return data
-

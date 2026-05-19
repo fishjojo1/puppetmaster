@@ -178,6 +178,57 @@ def kill_agent(registry: Registry, tmux: Tmux, agent_id: str, source: str = "hum
     return updated
 
 
+def cleanup_completed_agents(
+    registry: Registry,
+    tmux: Tmux,
+    *,
+    root_id: str | None = None,
+    dry_run: bool = True,
+    kill_stale: bool = False,
+    include_roots: bool = False,
+) -> dict[str, Any]:
+    agents = registry.list_agents(root_id=root_id)
+    by_id = {agent["id"]: agent for agent in agents}
+    completed_ids = {
+        agent["id"]
+        for agent in agents
+        if agent["status"] == "completed" and (include_roots or agent["parent_id"] is not None)
+    }
+    prunable = {
+        agent_id
+        for agent_id in completed_ids
+        if all(descendant_id in completed_ids for descendant_id in registry.descendants(agent_id) if descendant_id in by_id)
+    }
+    pruned = sorted(prunable, key=lambda agent_id: int(by_id[agent_id]["depth"]), reverse=True)
+    skipped = [
+        {
+            "agent_id": agent_id,
+            "reason": "has non-completed descendants",
+        }
+        for agent_id in sorted(completed_ids - prunable)
+    ]
+    killed = []
+    for agent_id in pruned:
+        agent = by_id[agent_id]
+        if kill_stale and tmux.session_exists(agent["tmux_session"]):
+            if not dry_run:
+                tmux.kill_session(agent["tmux_session"])
+            killed.append(agent_id)
+    if not dry_run:
+        registry.delete_agents(pruned)
+    return {
+        "dry_run": dry_run,
+        "root_id": root_id,
+        "candidates": [by_id[agent_id] for agent_id in pruned],
+        "pruned": pruned if not dry_run else [],
+        "would_prune": pruned if dry_run else [],
+        "killed": killed if not dry_run else [],
+        "would_kill": killed if dry_run else [],
+        "skipped": skipped,
+        "logs_preserved": True,
+    }
+
+
 def prompt_agent(registry: Registry, tmux: Tmux, agent_id: str, prompt: str, source: str = "human_cli") -> dict[str, Any]:
     agent = registry.get_agent(agent_id)
     if not tmux.session_exists(agent["tmux_session"]):
