@@ -438,6 +438,7 @@ Input:
 ```json
 {
   "name": "optional short name",
+  "goal": "optional boolean; true prepends /goal to the prompt",
   "description": "what this agent is for",
   "prompt": "full initial prompt",
   "cwd": "/absolute/path",
@@ -447,9 +448,10 @@ Input:
 
 Required fields:
 
-1. `description`
+1. `cwd`
 2. `prompt`
-3. `cwd`
+
+`goal` is an optional boolean. When true, Puppetmaster starts the child in goal mode by prepending literal `/goal ` to the start of `prompt`. It does nothing else. `description` is an optional short human-readable label; if omitted, Puppetmaster may derive it from `prompt`.
 
 Behavior:
 
@@ -779,12 +781,14 @@ Recommended defaults:
 
 ```text
 max_depth = 3
-max_children_per_agent = 5
+max_concurrent_children_per_agent = 5
 max_total_agents = 30
 max_event_prompt_events = 5
 max_log_read_lines_default = 120
 max_log_read_lines_hard = 2000
 ```
+
+`max_concurrent_children_per_agent` counts only nonterminal child agents. Completed, failed, blocked, stopped, killed, and dead children do not consume child concurrency.
 
 The system should refuse new agent creation when limits are exceeded and return a clear error with the current counts.
 
@@ -890,4 +894,3 @@ These are intentionally left open until implementation begins:
 7. How much Codex session id discovery is possible without depending on unstable transcript formats.
 
 None of these block the v1 architecture.
-

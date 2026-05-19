@@ -62,8 +62,22 @@ def parse_context_left(text: str) -> str | None:
     return None
 
 
+ANSI_RE = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|\x1b[P^_X][\s\S]*?(?:\x1b\\|$)"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[0-9=>]"
+    r"|\x1b[ -/]*[@-~]"
+    r"|\x9d[^\x07\x9c]*(?:\x07|\x9c)?"
+    r"|[\x90\x98\x9e\x9f][\s\S]*?(?:\x9c|$)"
+    r"|\x9b[0-?]*[ -/]*[@-~]"
+)
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
 def strip_ansi(text: str) -> str:
-    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    clean = ANSI_RE.sub("", text)
+    return CONTROL_RE.sub("", clean)
 
 
 def count_log_lines(path: str) -> int:
@@ -164,7 +178,7 @@ class TuiApp:
         live = agent["tmux_session"] in self.live_sessions
         self.preview_source = "tmux" if live else "log"
         try:
-            self.preview = read_agent(self.config, self.registry, self.tmux, agent["id"], self.lines, self.preview_source)
+            self.preview = strip_ansi(read_agent(self.config, self.registry, self.tmux, agent["id"], self.lines, self.preview_source))
         except PuppetError as exc:
             self.preview = f"error[{exc.code}]: {exc.message}"
             self.preview_source = "error"

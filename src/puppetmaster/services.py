@@ -79,11 +79,11 @@ def enforce_create_limits(config: Config, registry: Registry, parent: dict[str, 
             "limit_exceeded",
             f"Cannot create child agent: max_depth={config.limits.max_depth} would be exceeded by parent {parent['id']}.",
         )
-        children = len(registry.children(parent["id"]))
+        concurrent_children = sum(1 for child in registry.children(parent["id"]) if child["status"] not in TERMINAL_STATUSES)
         require(
-            children < config.limits.max_children_per_agent,
+            concurrent_children < config.limits.max_concurrent_children_per_agent,
             "limit_exceeded",
-            f"Cannot create child agent: parent {parent['id']} already has max_children_per_agent={config.limits.max_children_per_agent}.",
+            f"Cannot create child agent: parent {parent['id']} already has max_concurrent_children_per_agent={config.limits.max_concurrent_children_per_agent}.",
         )
 
 
@@ -189,23 +189,24 @@ def cleanup_completed_agents(
 ) -> dict[str, Any]:
     agents = registry.list_agents(root_id=root_id)
     by_id = {agent["id"]: agent for agent in agents}
-    completed_ids = {
+    cleanup_statuses = {"completed", "stopped"}
+    cleanup_ids = {
         agent["id"]
         for agent in agents
-        if agent["status"] == "completed" and (include_roots or agent["parent_id"] is not None)
+        if agent["status"] in cleanup_statuses and (include_roots or agent["parent_id"] is not None)
     }
     prunable = {
         agent_id
-        for agent_id in completed_ids
-        if all(descendant_id in completed_ids for descendant_id in registry.descendants(agent_id) if descendant_id in by_id)
+        for agent_id in cleanup_ids
+        if all(descendant_id in cleanup_ids for descendant_id in registry.descendants(agent_id) if descendant_id in by_id)
     }
     pruned = sorted(prunable, key=lambda agent_id: int(by_id[agent_id]["depth"]), reverse=True)
     skipped = [
         {
             "agent_id": agent_id,
-            "reason": "has non-completed descendants",
+            "reason": "has non-completed-or-stopped descendants",
         }
-        for agent_id in sorted(completed_ids - prunable)
+        for agent_id in sorted(cleanup_ids - prunable)
     ]
     killed = []
     for agent_id in pruned:
@@ -543,6 +544,7 @@ def create_codex_agent(
     parent_id: str | None = None,
     name: str | None = None,
     role: str = "subagent",
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parent = registry.maybe_agent(parent_id) if parent_id else None
     enforce_create_limits(config, registry, parent)
@@ -556,7 +558,7 @@ def create_codex_agent(
         parent_id=parent_id,
         root_id=parent["root_id"] if parent else None,
         name=name,
-        metadata={"runtime": "codex"},
+        metadata={"runtime": "codex", **(metadata or {})},
     )
     files = write_codex_files(config, agent, prompt, orchestrator=role == "orchestrator")
     agent = registry.update_agent(

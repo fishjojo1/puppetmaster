@@ -131,7 +131,7 @@ resume_agent
 attach_agent
 ```
 
-`create_agent` always requires an explicit absolute `cwd`; v1 does not default to the caller's cwd and does not create worktrees.
+`create_agent` can start a child in goal mode with `goal: true`. `goal` is an optional boolean; when true, Puppetmaster prepends literal `/goal ` to the start of the child agent's initial `prompt`. It does nothing else. `create_agent` always requires an explicit absolute `cwd` and a `prompt`; v1 does not default to the caller's cwd and does not create worktrees.
 
 ## State And Logs
 
@@ -174,7 +174,7 @@ Human override with audit trail:
 puppet agent mark-status <agent-id> --status blocked --reason "Human found it waiting on input."
 ```
 
-Prune completed agents from the registry tree while preserving their logs and state directories:
+Prune completed or stopped agents from the registry tree while preserving their logs and state directories:
 
 ```bash
 puppet agent cleanup-completed --dry-run

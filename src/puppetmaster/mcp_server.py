@@ -42,14 +42,56 @@ mcp = FastMCP("puppetmaster")
 
 
 @mcp.tool()
-def create_agent(description: str, prompt: str, cwd: str, name: str | None = None, metadata: dict | None = None) -> dict:
-    """Create a child Codex agent. cwd is required and must be an existing absolute path."""
+def create_agent(
+    cwd: str,
+    description: str | None = None,
+    prompt: str | None = None,
+    goal: bool = False,
+    name: str | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Create a child Codex agent.
+
+    cwd is required and must be an existing absolute path. prompt is the child
+    agent's initial task. goal is an optional boolean; when true, Puppetmaster
+    starts the agent in goal mode by prepending literal "/goal " to the start of
+    prompt. It does nothing else. description is a short human-readable label.
+    """
     try:
         cfg, reg, tmux, caller = _context()
-        agent = create_codex_agent(cfg, reg, tmux, cwd=cwd, description=description, prompt=prompt, parent_id=caller["id"], name=name)
+        task = _task_with_goal_mode(prompt, goal)
+        if not task:
+            raise PuppetError("prompt_required", "create_agent requires prompt.", "Pass a full prompt.")
+        agent_metadata = dict(metadata or {})
+        agent_description = (description or _description_from_task(prompt or task)).strip()
+        agent = create_codex_agent(
+            cfg,
+            reg,
+            tmux,
+            cwd=cwd,
+            description=agent_description,
+            prompt=task,
+            parent_id=caller["id"],
+            name=name,
+            metadata=agent_metadata,
+        )
         return {"id": agent["id"], "status": agent["status"], "cwd": agent["cwd"], "attach_command": tmux.attach_command(agent["tmux_session"])}
     except PuppetError as exc:
         return _error(exc)
+
+
+def _description_from_task(task: str) -> str:
+    first_line = next((line.strip() for line in task.splitlines() if line.strip()), "Child Codex agent")
+    if len(first_line) <= 96:
+        return first_line
+    return first_line[:93].rstrip() + "..."
+
+
+def _task_with_goal_mode(prompt: str | None, goal: bool) -> str:
+    task = (prompt or "").strip()
+    if goal and task:
+        return f"/goal {task}"
+    return task
 
 
 @mcp.tool(name="complete_agent")

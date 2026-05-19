@@ -9,7 +9,7 @@ from pathlib import Path
 @dataclass(frozen=True)
 class Limits:
     max_depth: int = 3
-    max_children_per_agent: int = 5
+    max_concurrent_children_per_agent: int = 5
     max_total_agents: int = 30
     max_event_prompt_events: int = 5
     default_log_lines: int = 120
@@ -56,11 +56,15 @@ def load_config() -> Config:
     raw = _read_local_config(state_dir)
     limit_raw = raw.get("limits", {})
     codex_raw = raw.get("codex", {})
+    max_concurrent_children = (
+        os.environ.get("PUPPETMASTER_MAX_CONCURRENT_CHILDREN")
+        or os.environ.get("PUPPETMASTER_MAX_CHILDREN")
+        or limit_raw.get("max_concurrent_children_per_agent")
+        or limit_raw.get("max_children_per_agent", 5)
+    )
     limits = Limits(
         max_depth=int(os.environ.get("PUPPETMASTER_MAX_DEPTH", limit_raw.get("max_depth", 3))),
-        max_children_per_agent=int(
-            os.environ.get("PUPPETMASTER_MAX_CHILDREN", limit_raw.get("max_children_per_agent", 5))
-        ),
+        max_concurrent_children_per_agent=int(max_concurrent_children),
         max_total_agents=int(os.environ.get("PUPPETMASTER_MAX_TOTAL_AGENTS", limit_raw.get("max_total_agents", 30))),
         max_event_prompt_events=int(limit_raw.get("max_event_prompt_events", 5)),
         default_log_lines=int(limit_raw.get("default_log_lines", 120)),
@@ -86,7 +90,7 @@ def ensure_state(config: Config) -> None:
         default_config.write_text(
             """[limits]
 max_depth = 3
-max_children_per_agent = 5
+max_concurrent_children_per_agent = 5
 max_total_agents = 30
 max_event_prompt_events = 5
 default_log_lines = 120
@@ -98,4 +102,3 @@ bypass_approvals_and_sandbox = true
 """,
             encoding="utf-8",
         )
-

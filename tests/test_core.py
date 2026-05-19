@@ -9,6 +9,8 @@ from puppetmaster.config import load_config
 from puppetmaster.errors import PuppetError
 from puppetmaster.registry import Registry
 import puppetmaster.services as services
+import puppetmaster.mcp_server as mcp_server
+import puppetmaster.tmux as tmux_module
 from puppetmaster.services import (
     cleanup_completed_agents,
     complete_agent,
@@ -48,6 +50,23 @@ def test_cwd_validation_rejects_relative(ctx):
     assert exc.value.code == "invalid_cwd"
 
 
+def test_legacy_max_children_config_loads_as_concurrent_limit(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        """[limits]
+max_children_per_agent = 7
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+
+    cfg = load_config()
+
+    assert cfg.limits.max_concurrent_children_per_agent == 7
+
+
 def test_completion_queues_parent_and_root(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
@@ -69,6 +88,29 @@ def test_drain_events_marks_delivered(ctx, tmp_path):
     assert result["decision"] == "block"
     assert "PUPPETMASTER EVENT" in result["reason"]
     assert reg.pending_deliveries(root["id"]) == []
+
+
+def test_create_limit_counts_concurrent_children_only(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    parent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="parent", role="orchestrator")
+    children = [
+        create_agent_record(cfg, reg, cwd=str(tmp_path), description=f"child {index}", parent_id=parent["id"])
+        for index in range(5)
+    ]
+    for child, status in zip(children, ["running", "idle", "awaiting_input", "completed", "stopped"], strict=True):
+        reg.update_agent(child["id"], status=status)
+
+    services.enforce_create_limits(cfg, reg, parent)
+
+    extra_running_1 = create_agent_record(cfg, reg, cwd=str(tmp_path), description="extra 1", parent_id=parent["id"])
+    extra_running_2 = create_agent_record(cfg, reg, cwd=str(tmp_path), description="extra 2", parent_id=parent["id"])
+    reg.update_agent(extra_running_1["id"], status="running")
+    reg.update_agent(extra_running_2["id"], status="starting")
+
+    with pytest.raises(PuppetError) as exc:
+        services.enforce_create_limits(cfg, reg, parent)
+    assert exc.value.code == "limit_exceeded"
+    assert "max_concurrent_children_per_agent=5" in exc.value.message
 
 
 def test_stop_hook_marks_idle_and_coalesces(ctx, tmp_path):
@@ -103,6 +145,92 @@ def test_generated_codex_config_shape(ctx, tmp_path, monkeypatch):
     assert data["hooks"]["state"][state_key]["trusted_hash"].startswith("sha256:")
     assert data["projects"][str(tmp_path)]["trust_level"] == "trusted"
     assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_AGENT_ID"] == agent["id"]
+
+
+def test_tmux_send_prompt_pastes_and_confirms_with_second_enter(ctx, monkeypatch):
+    _cfg, _reg, tmux = ctx
+    calls = []
+    sleeps = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(tmux, "require_tmux", lambda: "/usr/bin/tmux")
+    monkeypatch.setattr(tmux_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(tmux_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    tmux.send_prompt("puppet_agt_child", "continue")
+
+    commands = [call[0] for call in calls]
+    assert commands[:4] == [
+        ["tmux", "set-buffer", "-b", commands[0][3], "continue"],
+        ["tmux", "paste-buffer", "-b", commands[0][3], "-t", "puppet_agt_child"],
+        ["tmux", "send-keys", "-t", "puppet_agt_child", "Enter"],
+        ["tmux", "send-keys", "-t", "puppet_agt_child", "Enter"],
+    ]
+    assert commands[4] == ["tmux", "delete-buffer", "-b", commands[0][3]]
+    assert sleeps == [tmux_module.PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS]
+
+
+def test_mcp_create_agent_prepends_goal_mode_to_prompt(tmp_path, monkeypatch):
+    captured = {}
+    caller = {"id": "agt_parent"}
+
+    class FakeTmux:
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    def fake_create_codex_agent(cfg, reg, tmux, **kwargs):
+        captured.update(kwargs)
+        return {"id": "agt_child", "status": "running", "cwd": kwargs["cwd"], "tmux_session": "puppet_agt_child"}
+
+    monkeypatch.setattr(mcp_server, "_context", lambda: (object(), object(), FakeTmux(), caller))
+    monkeypatch.setattr(mcp_server, "create_codex_agent", fake_create_codex_agent)
+
+    result = mcp_server.create_agent(cwd=str(tmp_path), prompt="Run the focused smoke tests", goal=True)
+
+    assert result["id"] == "agt_child"
+    assert captured["prompt"] == "/goal Run the focused smoke tests"
+    assert captured["description"] == "Run the focused smoke tests"
+    assert captured["parent_id"] == caller["id"]
+    assert captured["metadata"] == {}
+
+
+def test_mcp_create_agent_leaves_prompt_unchanged_without_goal_mode(tmp_path, monkeypatch):
+    captured = {}
+    caller = {"id": "agt_parent"}
+
+    class FakeTmux:
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    def fake_create_codex_agent(cfg, reg, tmux, **kwargs):
+        captured.update(kwargs)
+        return {"id": "agt_child", "status": "running", "cwd": kwargs["cwd"], "tmux_session": "puppet_agt_child"}
+
+    monkeypatch.setattr(mcp_server, "_context", lambda: (object(), object(), FakeTmux(), caller))
+    monkeypatch.setattr(mcp_server, "create_codex_agent", fake_create_codex_agent)
+
+    result = mcp_server.create_agent(cwd=str(tmp_path), prompt="Use the release workspace.", goal=False)
+
+    assert result["id"] == "agt_child"
+    assert captured["prompt"] == "Use the release workspace."
+    assert captured["metadata"] == {}
+
+
+def test_mcp_create_agent_requires_prompt_when_goal_omitted(tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp_server, "_context", lambda: (object(), object(), object(), {"id": "agt_parent"}))
+
+    result = mcp_server.create_agent(cwd=str(tmp_path))
+
+    assert result["error"]["code"] == "prompt_required"
 
 
 def test_completion_injects_pending_event_when_root_idle(ctx, tmp_path):
@@ -147,6 +275,25 @@ def test_tui_parses_context_left():
     assert parse_context_left("status 17.5% context remaining") == "17.5%"
     assert parse_context_left("\x1b[32mContext: 120k/200k\x1b[0m") == "120k/200k"
     assert parse_context_left("no context metric here") is None
+
+
+def test_tui_strips_terminal_control_sequences_from_log_preview():
+    raw = "\x1b[?1049l\x1b[?25h\x1b]0;agent title\x07done\x1b[0m\x1b7clean\x1b8\x1b]2;unterminated"
+
+    assert tui_module.strip_ansi(raw) == "doneclean"
+
+
+def test_tui_refresh_preview_sanitizes_stopped_agent_log(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    Path(agent["log_path"]).write_text("before\n\x1b[?1049l\x1b]0;title\x07after\x1b[0m\n", encoding="utf-8")
+
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.rows = build_tree_rows([agent])
+    app.live_sessions = set()
+    app.refresh_preview()
+
+    assert app.preview == "before\nafter"
 
 
 def test_tui_summarizes_tree_stats(ctx, tmp_path):
@@ -252,3 +399,30 @@ def test_cleanup_completed_prunes_subtrees_with_pending_deliveries(ctx, tmp_path
     assert reg.maybe_agent(child["id"]) is None
     assert reg.maybe_agent(root["id"]) is not None
     assert reg.pending_deliveries(root["id"]) == []
+
+
+def test_cleanup_completed_prunes_stopped_subtrees(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    stopped_parent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="stopped parent", parent_id=root["id"])
+    stopped_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="stopped child", parent_id=stopped_parent["id"])
+    completed_parent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="completed parent", parent_id=root["id"])
+    stopped_leaf = create_agent_record(cfg, reg, cwd=str(tmp_path), description="stopped leaf", parent_id=completed_parent["id"])
+    active_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="active child", parent_id=stopped_leaf["id"])
+
+    for agent in (stopped_parent, stopped_child, stopped_leaf):
+        reg.update_agent(agent["id"], status="stopped")
+    reg.update_agent(completed_parent["id"], status="completed")
+    reg.update_agent(active_child["id"], status="running")
+
+    dry_run = cleanup_completed_agents(reg, tmux, dry_run=True)
+    assert set(dry_run["would_prune"]) == {stopped_parent["id"], stopped_child["id"]}
+    assert {item["agent_id"] for item in dry_run["skipped"]} == {completed_parent["id"], stopped_leaf["id"]}
+
+    result = cleanup_completed_agents(reg, tmux, dry_run=False)
+    assert set(result["pruned"]) == {stopped_parent["id"], stopped_child["id"]}
+    assert reg.maybe_agent(stopped_parent["id"]) is None
+    assert reg.maybe_agent(stopped_child["id"]) is None
+    assert reg.maybe_agent(completed_parent["id"]) is not None
+    assert reg.maybe_agent(stopped_leaf["id"]) is not None
+    assert reg.maybe_agent(active_child["id"]) is not None

@@ -4,10 +4,13 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from .config import Config
 from .errors import PuppetError
+
+PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS = 0.15
 
 
 class Tmux:
@@ -64,6 +67,8 @@ class Tmux:
         try:
             subprocess.run(["tmux", "paste-buffer", "-b", buffer_name, "-t", session], check=True)
             subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+            time.sleep(PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS)
+            subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
         finally:
             subprocess.run(["tmux", "delete-buffer", "-b", buffer_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -100,4 +105,3 @@ class Tmux:
                 {"session": name, "created": created, "attached": attached, "pane_command": pane_command}
             )
         return sessions
-
