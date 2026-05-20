@@ -147,6 +147,41 @@ def test_generated_codex_config_shape(ctx, tmp_path, monkeypatch):
     assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_AGENT_ID"] == agent["id"]
 
 
+def test_generated_codex_config_preserves_user_defaults(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    home = tmp_path / "home"
+    codex_home = home / ".codex"
+    codex_home.mkdir(parents=True)
+    (codex_home / "config.toml").write_text(
+        """model = "gpt-custom"
+approval_policy = "on-request"
+
+[features]
+hooks = false
+
+[profiles.default]
+model = "gpt-profile"
+
+[mcp_servers.existing]
+command = "existing-server"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+
+    files = write_codex_files(cfg, agent, "hello", orchestrator=True)
+
+    data = tomllib.loads(Path(files["config"]).read_text(encoding="utf-8"))
+    assert data["model"] == "gpt-custom"
+    assert data["approval_policy"] == "on-request"
+    assert data["profiles"]["default"]["model"] == "gpt-profile"
+    assert data["mcp_servers"]["existing"]["command"] == "existing-server"
+    assert data["features"]["hooks"] is True
+    assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_AGENT_ID"] == agent["id"]
+
+
 def test_tmux_send_prompt_pastes_and_confirms_with_second_enter(ctx, monkeypatch):
     _cfg, _reg, tmux = ctx
     calls = []

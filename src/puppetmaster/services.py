@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -410,6 +412,90 @@ attach to this tmux session at any time.
 """
 
 
+_TOML_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def toml_key(key: str) -> str:
+    if _TOML_BARE_KEY.match(key):
+        return key
+    return json.dumps(key)
+
+
+def toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        items = ", ".join(f"{toml_key(str(key))} = {toml_value(item)}" for key, item in value.items())
+        return "{ " + items + " }"
+    return json.dumps(str(value))
+
+
+def toml_table_path(parts: list[str]) -> str:
+    return ".".join(toml_key(part) for part in parts)
+
+
+def toml_dumps(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+
+    def scalar_items(table: dict[str, Any]) -> list[tuple[str, Any]]:
+        return [(key, value) for key, value in table.items() if not isinstance(value, dict)]
+
+    def child_items(table: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        return [(key, value) for key, value in table.items() if isinstance(value, dict)]
+
+    for key, value in scalar_items(data):
+        lines.append(f"{toml_key(str(key))} = {toml_value(value)}")
+    if lines:
+        lines.append("")
+
+    def emit_table(path: list[str], table: dict[str, Any]) -> None:
+        scalars = scalar_items(table)
+        children = child_items(table)
+        if scalars or not children:
+            lines.append(f"[{toml_table_path(path)}]")
+            for key, value in scalars:
+                lines.append(f"{toml_key(str(key))} = {toml_value(value)}")
+            lines.append("")
+        for key, value in children:
+            emit_table([*path, str(key)], value)
+
+    for key, value in child_items(data):
+        emit_table([str(key)], value)
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in overlay.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = deep_merge(existing, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def user_codex_config() -> dict[str, Any]:
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return {}
+    try:
+        return tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise PuppetError(
+            "codex_config_invalid",
+            f"failed to parse {config_path}",
+            f"Fix the TOML syntax in {config_path}: {exc}",
+        ) from exc
+
+
 def write_codex_files(config: Config, agent: dict[str, Any], user_prompt: str, orchestrator: bool = False) -> dict[str, str]:
     directory = agent_dir(config, agent["id"])
     codex_home = directory / "codex-config"
@@ -436,29 +522,22 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         "PUPPETMASTER_ROLE": agent["role"],
         "PYTHONPATH": str(config.repo_dir / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""),
     }
-    env_toml = "\n".join(f'{key} = "{value.replace(chr(34), chr(92)+chr(34))}"' for key, value in env.items())
     hooks_json = codex_home / "hooks.json"
     hook_hash = codex_hook_trust_hash(str(stop_hook), "Reporting Puppetmaster turn stop", 30)
     config_toml = codex_home / "config.toml"
-    config_toml.write_text(
-        f"""[features]
-hooks = true
-
-[hooks.state."{hooks_json}:stop:0:0"]
-trusted_hash = "{hook_hash}"
-
-[projects."{agent['cwd']}"]
-trust_level = "trusted"
-
-[mcp_servers.puppetmaster]
-command = "{sys.executable}"
-args = ["-m", "puppetmaster.cli", "mcp", "serve"]
-
-[mcp_servers.puppetmaster.env]
-{env_toml}
-""",
-        encoding="utf-8",
-    )
+    generated_codex_config = {
+        "features": {"hooks": True},
+        "hooks": {"state": {f"{hooks_json}:stop:0:0": {"trusted_hash": hook_hash}}},
+        "projects": {agent["cwd"]: {"trust_level": "trusted"}},
+        "mcp_servers": {
+            "puppetmaster": {
+                "command": sys.executable,
+                "args": ["-m", "puppetmaster.cli", "mcp", "serve"],
+                "env": env,
+            }
+        },
+    }
+    config_toml.write_text(toml_dumps(deep_merge(user_codex_config(), generated_codex_config)), encoding="utf-8")
     hooks_json.write_text(
         json.dumps(
             {

@@ -148,6 +148,8 @@ By default Puppetmaster writes state in `.puppetmaster/`:
 .puppetmaster/agents/<agent-id>/codex-config/
 ```
 
+Each generated `codex-config/config.toml` starts from `~/.codex/config.toml` and overlays the per-agent hooks, project trust, and Puppetmaster MCP server settings. `CODEX_HOME` is still per-agent so Puppetmaster can avoid mutating your global Codex config while giving each managed session its own hook trust and runtime state.
+
 Override the state directory with `PUPPETMASTER_STATE_DIR`.
 
 ## Recovery
