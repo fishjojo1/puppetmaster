@@ -7,7 +7,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,9 @@ from .logging import log
 from .model import COMPLETION_STATUSES, TERMINAL_STATUSES, json_dumps, new_id, now, validate_cwd
 from .registry import Registry
 from .tmux import Tmux
+
+
+WAKEUP_REASON_MAX_LENGTH = 240
 
 
 def agent_dir(config: Config, agent_id: str) -> Path:
@@ -164,19 +169,49 @@ def inspect_agent(config: Config, registry: Registry, tmux: Tmux, agent_id: str)
     }
 
 
-def stop_agent(registry: Registry, tmux: Tmux, agent_id: str, source: str = "human_cli") -> dict[str, Any]:
+def stop_agent(
+    registry: Registry,
+    tmux: Tmux,
+    agent_id: str,
+    source: str = "human_cli",
+    config: Config | None = None,
+) -> dict[str, Any]:
     agent = registry.get_agent(agent_id)
     tmux.stop_session(agent["tmux_session"])
     updated = registry.update_agent(agent_id, status="stopped", stopped_at=now(), termination_reason="stopped")
-    registry.append_event(agent_id, "agent.stopped", "Agent stopped.", source=source)
+    notify_agent_state_change(
+        registry,
+        agent_id,
+        "agent.stopped",
+        "Agent stopped.",
+        severity="warning",
+        source=source,
+        config=config,
+        tmux=tmux,
+    )
     return updated
 
 
-def kill_agent(registry: Registry, tmux: Tmux, agent_id: str, source: str = "human_cli") -> dict[str, Any]:
+def kill_agent(
+    registry: Registry,
+    tmux: Tmux,
+    agent_id: str,
+    source: str = "human_cli",
+    config: Config | None = None,
+) -> dict[str, Any]:
     agent = registry.get_agent(agent_id)
     tmux.kill_session(agent["tmux_session"])
     updated = registry.update_agent(agent_id, status="killed", stopped_at=now(), termination_reason="killed")
-    registry.append_event(agent_id, "agent.killed", "Agent killed.", severity="warning", source=source)
+    notify_agent_state_change(
+        registry,
+        agent_id,
+        "agent.killed",
+        "Agent killed.",
+        severity="warning",
+        source=source,
+        config=config,
+        tmux=tmux,
+    )
     return updated
 
 
@@ -243,6 +278,77 @@ def prompt_agent(registry: Registry, tmux: Tmux, agent_id: str, prompt: str, sou
     return event
 
 
+def notify_agent_state_change(
+    registry: Registry,
+    agent_id: str,
+    event_type: str,
+    summary: str,
+    payload: dict[str, Any] | None = None,
+    *,
+    severity: str = "info",
+    source: str = "supervisor",
+    coalesce: bool = False,
+    config: Config | None = None,
+    tmux: Tmux | None = None,
+) -> dict[str, Any]:
+    agent = registry.get_agent(agent_id)
+    event = registry.append_event(agent_id, event_type, summary, payload, severity=severity, source=source)
+    recipients = []
+    if agent.get("parent_id"):
+        recipients.append(agent["parent_id"])
+    if agent["root_id"] not in recipients and agent["root_id"] != agent_id:
+        recipients.append(agent["root_id"])
+    for recipient in recipients:
+        registry.queue_delivery(event["id"], recipient, coalesce=coalesce)
+    injected = False
+    if config and tmux:
+        for recipient in recipients:
+            injected = inject_pending_prompt(config, registry, tmux, recipient) or injected
+    return {"event": event, "deliveries": recipients, "injected": injected}
+
+
+def pause_agent(
+    registry: Registry,
+    agent_id: str,
+    *,
+    source: str = "human_cli",
+    config: Config | None = None,
+    tmux: Tmux | None = None,
+) -> dict[str, Any]:
+    updated = registry.update_agent(agent_id, status="awaiting_input")
+    notify_agent_state_change(
+        registry,
+        agent_id,
+        "agent.paused",
+        "Agent marked awaiting input.",
+        source=source,
+        config=config,
+        tmux=tmux,
+    )
+    return updated
+
+
+def resume_agent(
+    registry: Registry,
+    agent_id: str,
+    *,
+    source: str = "human_cli",
+    config: Config | None = None,
+    tmux: Tmux | None = None,
+) -> dict[str, Any]:
+    updated = registry.update_agent(agent_id, status="running")
+    notify_agent_state_change(
+        registry,
+        agent_id,
+        "agent.resumed",
+        "Agent marked running.",
+        source=source,
+        config=config,
+        tmux=tmux,
+    )
+    return updated
+
+
 def complete_agent(
     registry: Registry,
     agent_id: str,
@@ -274,22 +380,116 @@ def complete_agent(
         completed_at=now(),
         metadata_json=json_dumps({**agent_metadata(registry.get_agent(agent_id)), "completion": {"summary": summary, **payload}}),
     )
-    event = registry.append_event(agent_id, event_type, summary, payload, severity=severity, source=source)
-    recipients = []
-    if updated.get("parent_id"):
-        recipients.append(updated["parent_id"])
-    if updated["root_id"] not in recipients and updated["root_id"] != agent_id:
-        recipients.append(updated["root_id"])
-    for recipient in recipients:
-        registry.queue_delivery(event["id"], recipient)
-    injected = False
-    if config and tmux and updated["root_id"] != agent_id:
-        injected = maybe_inject_event_prompt(config, registry, tmux, updated["root_id"])
-    return {"agent": updated, "event": event, "deliveries": recipients, "injected": injected}
+    notification = notify_agent_state_change(
+        registry,
+        agent_id,
+        event_type,
+        summary,
+        payload,
+        severity=severity,
+        source=source,
+        config=config,
+        tmux=tmux,
+    )
+    return {"agent": updated, **notification}
 
 
 def agent_metadata(agent: dict[str, Any]) -> dict[str, Any]:
     return dict(agent.get("metadata") or {})
+
+
+def utc_after(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc_timestamp(value: str) -> float:
+    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+
+
+def normalize_wait_reason(reason: str | None) -> str:
+    return (reason or "").strip()[:WAKEUP_REASON_MAX_LENGTH]
+
+
+def schedule_wakeup(
+    config: Config,
+    registry: Registry,
+    agent_id: str,
+    seconds: int,
+    reason: str | None = None,
+    *,
+    spawn_helper: bool = True,
+) -> dict[str, Any]:
+    if seconds <= 0:
+        raise PuppetError("invalid_wait", "wait seconds must be positive.")
+    if seconds > config.limits.max_wait_seconds:
+        raise PuppetError(
+            "invalid_wait",
+            f"wait seconds must be <= max_wait_seconds={config.limits.max_wait_seconds}.",
+        )
+    wakeup = registry.create_wakeup(
+        agent_id,
+        utc_after(seconds),
+        normalize_wait_reason(reason),
+        {"seconds": seconds},
+    )
+    if spawn_helper:
+        spawn_wakeup_helper(config, wakeup["id"])
+    return wakeup
+
+
+def spawn_wakeup_helper(config: Config, wakeup_id: str) -> None:
+    env = os.environ.copy()
+    env["PUPPETMASTER_STATE_DIR"] = str(config.state_dir)
+    env["PYTHONPATH"] = str(config.repo_dir / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    subprocess.Popen(
+        [sys.executable, "-m", "puppetmaster.cli", "wakeup", "sleep-and-fire", "--wakeup-id", wakeup_id],
+        cwd=str(config.repo_dir),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def fire_wakeup(
+    config: Config,
+    registry: Registry,
+    wakeup_id: str,
+    *,
+    tmux: Tmux | None = None,
+) -> dict[str, Any]:
+    wakeup = registry.mark_wakeup_fired(wakeup_id)
+    if not wakeup:
+        return {"fired": False, "wakeup": registry.get_wakeup(wakeup_id)}
+    payload = {
+        "wakeup_id": wakeup["id"],
+        "seconds": wakeup.get("payload", {}).get("seconds"),
+        "reason": wakeup["reason"],
+    }
+    event = registry.append_event(wakeup["agent_id"], "agent.wait_over", "Wait over.", payload, source="wakeup")
+    registry.queue_delivery(event["id"], wakeup["agent_id"])
+    injected = inject_pending_prompt(config, registry, tmux, wakeup["agent_id"]) if tmux else False
+    return {"fired": True, "wakeup": wakeup, "event": event, "deliveries": [wakeup["agent_id"]], "injected": injected}
+
+
+def fire_due_wakeups(
+    config: Config,
+    registry: Registry,
+    *,
+    agent_id: str | None = None,
+    tmux: Tmux | None = None,
+) -> dict[str, Any]:
+    due = registry.list_wakeups(agent_id=agent_id, status="scheduled", due_at=now())
+    fired = [fire_wakeup(config, registry, wakeup["id"], tmux=tmux) for wakeup in due]
+    return {"fired": fired, "count": sum(1 for item in fired if item.get("fired"))}
+
+
+def sleep_and_fire_wakeup(config: Config, registry: Registry, tmux: Tmux, wakeup_id: str) -> dict[str, Any]:
+    wakeup = registry.get_wakeup(wakeup_id)
+    if wakeup["status"] == "scheduled":
+        time.sleep(max(0.0, utc_timestamp(wakeup["wake_at"]) - time.time()))
+    return fire_wakeup(config, registry, wakeup_id, tmux=tmux)
 
 
 def handle_stop_hook(registry: Registry, agent_id: str, hook_input: str, source: str = "codex_hook") -> dict[str, Any]:
@@ -306,28 +506,48 @@ def handle_stop_hook(registry: Registry, agent_id: str, hook_input: str, source:
         )
         return {"event": event, "ok": False}
     agent = registry.get_agent(agent_id)
-    event = registry.append_event(agent_id, "agent.turn_stopped", "Agent turn stopped.", payload, source=source)
-    if agent["status"] not in TERMINAL_STATUSES:
-        registry.update_agent(agent_id, status="idle", last_turn_stopped_at=now())
-        if agent.get("parent_id"):
-            registry.queue_delivery(event["id"], agent["parent_id"], coalesce=True)
-        if agent["root_id"] != agent.get("parent_id") and agent["root_id"] != agent_id:
-            registry.queue_delivery(event["id"], agent["root_id"], coalesce=True)
-    return {"event": event, "ok": True}
+    if agent["status"] in TERMINAL_STATUSES:
+        event = registry.append_event(agent_id, "agent.turn_stopped", "Agent turn stopped.", payload, source=source)
+        return {"event": event, "ok": True}
+    registry.update_agent(agent_id, status="idle", last_turn_stopped_at=now())
+    notification = notify_agent_state_change(
+        registry,
+        agent_id,
+        "agent.turn_stopped",
+        "Agent turn stopped.",
+        payload,
+        source=source,
+        coalesce=True,
+    )
+    return {"event": notification["event"], "ok": True}
 
 
 def format_event_prompt(registry: Registry, deliveries: list[dict[str, Any]], remaining: int) -> str:
-    header = "PUPPETMASTER EVENT" if len(deliveries) == 1 else "PUPPETMASTER EVENTS"
+    if len(deliveries) == 1 and deliveries[0]["type"] == "agent.wait_over":
+        header = "PUPPETMASTER WAIT OVER"
+    else:
+        header = "PUPPETMASTER EVENT" if len(deliveries) == 1 else "PUPPETMASTER EVENTS"
     parts = [header]
     for index, delivery in enumerate(deliveries, 1):
         agent = registry.get_agent(delivery["agent_id"])
+        payload = delivery.get("payload") or {}
+        if delivery["type"] == "agent.wait_over":
+            lines = [
+                f"Wait over for agent {agent['id']}.",
+                f"Reason: {payload.get('reason') or '-'}",
+                f"Elapsed seconds: {payload.get('seconds') or '-'}",
+            ]
+            if len(deliveries) > 1:
+                lines[0] = f"{index}. {lines[0]}"
+            parts.append("\n".join(lines))
+            continue
         summary = delivery.get("summary", "")
         if len(summary) > 600:
             summary = summary[:597] + "..."
         parts.append(
             "\n".join(
                 [
-                    f"{index}. Agent {agent['id']} {delivery['type'].replace('agent.', '')}.",
+                    f"{index}. {agent['id']} has new state {agent['status']}.",
                     f"Name: {agent.get('name') or '-'}",
                     f"Status: {agent['status']}",
                     f"Cwd: {agent['cwd']}",
@@ -346,6 +566,7 @@ def format_event_prompt(registry: Registry, deliveries: list[dict[str, Any]], re
 
 
 def drain_events(config: Config, registry: Registry, agent_id: str) -> dict[str, Any]:
+    fire_due_wakeups(config, registry, agent_id=agent_id)
     deliveries = registry.pending_deliveries(agent_id, limit=config.limits.max_event_prompt_events)
     if not deliveries:
         return {"continue": True}
@@ -357,23 +578,29 @@ def drain_events(config: Config, registry: Registry, agent_id: str) -> dict[str,
 
 
 def maybe_inject_event_prompt(config: Config, registry: Registry, tmux: Tmux, root_agent_id: str) -> bool:
-    root = registry.maybe_agent(root_agent_id)
-    if not root or root["status"] not in {"idle", "awaiting_input"}:
+    return inject_pending_prompt(config, registry, tmux, root_agent_id)
+
+
+def inject_pending_prompt(config: Config, registry: Registry, tmux: Tmux, recipient_agent_id: str) -> bool:
+    fire_due_wakeups(config, registry, agent_id=recipient_agent_id)
+    recipient = registry.maybe_agent(recipient_agent_id)
+    if not recipient:
         return False
-    if not tmux.session_exists(root["tmux_session"]):
+    if not tmux.session_exists(recipient["tmux_session"]):
         return False
-    deliveries = registry.pending_deliveries(root_agent_id, limit=config.limits.max_event_prompt_events)
+    deliveries = registry.pending_deliveries(recipient_agent_id, limit=config.limits.max_event_prompt_events)
     if not deliveries:
         return False
-    all_pending = registry.pending_deliveries(root_agent_id, limit=None)
+    all_pending = registry.pending_deliveries(recipient_agent_id, limit=None)
     prompt = format_event_prompt(registry, deliveries, max(0, len(all_pending) - len(deliveries)))
-    tmux.send_prompt(root["tmux_session"], prompt)
+    tmux.send_prompt(recipient["tmux_session"], prompt)
     registry.mark_delivered([delivery["id"] for delivery in deliveries])
-    registry.update_agent(root_agent_id, status="running")
+    if recipient["status"] not in TERMINAL_STATUSES:
+        registry.update_agent(recipient_agent_id, status="running")
     registry.append_event(
-        root_agent_id,
+        recipient_agent_id,
         "orchestrator.event_prompt_injected",
-        "Pending Puppetmaster events were injected into the orchestrator tmux session.",
+        "Pending Puppetmaster events were injected into the agent tmux session.",
         {"delivery_ids": [delivery["id"] for delivery in deliveries]},
         source="supervisor",
     )
@@ -705,16 +932,17 @@ def reconcile(config: Config, registry: Registry, tmux: Tmux, agent_id: str | No
             changes.append({"agent_id": agent["id"], "from": agent["status"], "to": proposed, "reason": reason})
             if not dry_run:
                 registry.update_agent(agent["id"], status=proposed)
-                event = registry.append_event(
+                notify_agent_state_change(
+                    registry,
                     agent["id"],
                     "agent.dead_detected" if proposed == "dead" else "supervisor.reconciled",
                     reason or "Reconciled agent status.",
                     {"from": agent["status"], "to": proposed, "tmux_exists": exists},
                     severity="warning" if proposed == "dead" else "info",
+                    coalesce=proposed != "dead",
+                    config=config,
+                    tmux=tmux,
                 )
-                if proposed == "dead":
-                    for recipient in {agent.get("parent_id"), agent["root_id"]} - {None, agent["id"]}:
-                        registry.queue_delivery(event["id"], recipient)
     unmanaged_tmux = [name for name in tmux_names if not any(agent["tmux_session"] == name for agent in agents)]
     return {"changes": changes, "unmanaged_tmux": unmanaged_tmux, "dry_run": dry_run}
 

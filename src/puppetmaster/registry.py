@@ -64,6 +64,20 @@ create table if not exists event_deliveries(
   delivered_at text null,
   acknowledged_at text null
 );
+create table if not exists scheduled_wakeups(
+  id text primary key,
+  agent_id text not null,
+  root_id text not null,
+  status text not null,
+  requested_at text not null,
+  wake_at text not null,
+  fired_at text null,
+  cancelled_at text null,
+  reason text not null,
+  payload_json text not null
+);
+create index if not exists scheduled_wakeups_due_idx
+on scheduled_wakeups(status, wake_at);
 """
 
 
@@ -193,6 +207,7 @@ class Registry:
             return 0
         placeholders = ",".join("?" for _ in agent_ids)
         with self.connect() as conn:
+            conn.execute(f"delete from scheduled_wakeups where agent_id in ({placeholders})", agent_ids)
             conn.execute(
                 f"""
                 delete from event_deliveries
@@ -301,7 +316,19 @@ class Registry:
             select d.*, e.agent_id, e.type, e.severity, e.summary, e.payload_json, e.created_at as event_created_at
             from event_deliveries d join events e on e.id=d.event_id
             where d.recipient_agent_id=? and d.status='pending'
-            order by case e.severity when 'error' then 0 when 'warning' then 1 else 2 end, e.created_at asc
+            order by
+              case e.severity when 'error' then 0 when 'warning' then 1 else 2 end,
+              case e.type
+                when 'agent.completed' then 0
+                when 'agent.failed' then 0
+                when 'agent.blocked' then 0
+                when 'agent.cancelled' then 0
+                when 'agent.killed' then 0
+                when 'agent.stopped' then 0
+                when 'agent.wait_over' then 2
+                else 1
+              end,
+              e.created_at asc
         """
         params: list[Any] = [recipient_agent_id]
         if limit is not None:
@@ -340,6 +367,84 @@ class Registry:
                 "update event_deliveries set status='acknowledged', acknowledged_at=? where id=?",
                 (now(), delivery_id),
             )
+
+    def create_wakeup(self, agent_id: str, wake_at: str, reason: str, payload: dict[str, Any]) -> dict[str, Any]:
+        agent = self.get_agent(agent_id)
+        wakeup = {
+            "id": new_id("wkp"),
+            "agent_id": agent_id,
+            "root_id": agent["root_id"],
+            "status": "scheduled",
+            "requested_at": now(),
+            "wake_at": wake_at,
+            "fired_at": None,
+            "cancelled_at": None,
+            "reason": reason,
+            "payload_json": json_dumps(payload),
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into scheduled_wakeups(
+                  id,agent_id,root_id,status,requested_at,wake_at,fired_at,cancelled_at,reason,payload_json
+                ) values(
+                  :id,:agent_id,:root_id,:status,:requested_at,:wake_at,:fired_at,:cancelled_at,:reason,:payload_json
+                )
+                """,
+                wakeup,
+            )
+        return self.get_wakeup(wakeup["id"])
+
+    def get_wakeup(self, wakeup_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("select * from scheduled_wakeups where id=?", (wakeup_id,)).fetchone()
+        if not row:
+            raise PuppetError("not_found", f"wakeup not found: {wakeup_id}")
+        return self._wakeup(row)
+
+    def list_wakeups(
+        self,
+        agent_id: str | None = None,
+        status: str | None = None,
+        due_at: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if agent_id:
+            clauses.append("agent_id=?")
+            values.append(agent_id)
+        if status:
+            clauses.append("status=?")
+            values.append(status)
+        if due_at:
+            clauses.append("wake_at<=?")
+            values.append(due_at)
+        where = " where " + " and ".join(clauses) if clauses else ""
+        with self.connect() as conn:
+            rows = conn.execute(f"select * from scheduled_wakeups{where} order by wake_at asc", values).fetchall()
+        return [self._wakeup(row) for row in rows]
+
+    def mark_wakeup_fired(self, wakeup_id: str) -> dict[str, Any] | None:
+        ts = now()
+        with self.connect() as conn:
+            row = conn.execute("select * from scheduled_wakeups where id=?", (wakeup_id,)).fetchone()
+            if not row:
+                raise PuppetError("not_found", f"wakeup not found: {wakeup_id}")
+            if row["status"] != "scheduled":
+                return None
+            conn.execute(
+                "update scheduled_wakeups set status='fired', fired_at=? where id=? and status='scheduled'",
+                (ts, wakeup_id),
+            )
+        return self.get_wakeup(wakeup_id)
+
+    def cancel_wakeup(self, wakeup_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            conn.execute(
+                "update scheduled_wakeups set status='cancelled', cancelled_at=? where id=? and status='scheduled'",
+                (now(), wakeup_id),
+            )
+        return self.get_wakeup(wakeup_id)
 
     def children(self, agent_id: str) -> list[dict[str, Any]]:
         return self.list_agents(parent_id=agent_id)
@@ -392,4 +497,9 @@ class Registry:
         data = dict(row)
         if "payload_json" in data:
             data["payload"] = json_loads(data.pop("payload_json", "{}"))
+        return data
+
+    def _wakeup(self, row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["payload"] = json_loads(data.pop("payload_json", "{}"))
         return data

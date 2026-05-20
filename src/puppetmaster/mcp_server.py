@@ -8,7 +8,18 @@ from mcp.server.fastmcp import FastMCP
 from .config import load_config
 from .errors import PuppetError
 from .registry import Registry
-from .services import complete_agent, create_codex_agent, inspect_agent, kill_agent, prompt_agent, read_agent, stop_agent
+from .services import (
+    complete_agent,
+    create_codex_agent,
+    inspect_agent,
+    kill_agent,
+    pause_agent as pause_agent_service,
+    prompt_agent,
+    read_agent,
+    resume_agent as resume_agent_service,
+    schedule_wakeup,
+    stop_agent,
+)
 from .tmux import Tmux
 
 
@@ -115,6 +126,22 @@ def complete_agent_tool(status: str, summary: str, result: str | None = None, fi
         return _error(exc)
 
 
+@mcp.tool(name="wait")
+def wait_tool(seconds: int, reason: str | None = None) -> dict:
+    """Schedule a wakeup and return immediately. End your turn after calling this."""
+    try:
+        cfg, reg, _tmux, caller = _context()
+        wakeup = schedule_wakeup(cfg, reg, caller["id"], int(seconds), reason)
+        return {
+            "scheduled": True,
+            "wakeup_id": wakeup["id"],
+            "wake_at": wakeup["wake_at"],
+            "instruction": "End your turn. Puppetmaster will send a wait-over message when the timer expires.",
+        }
+    except PuppetError as exc:
+        return _error(exc)
+
+
 @mcp.tool(name="read_agent")
 def read_agent_tool(agent_id: str, lines: int = 120, source: str = "auto") -> dict:
     """Read recent terminal output for an authorized agent."""
@@ -165,9 +192,9 @@ def prompt_agent_tool(agent_id: str, prompt: str) -> dict:
 def stop_agent_tool(agent_id: str) -> dict:
     """Gracefully stop an authorized agent session."""
     try:
-        _cfg, reg, tmux, caller = _context()
+        cfg, reg, tmux, caller = _context()
         _authorized(reg, caller, agent_id, mutate=True)
-        return stop_agent(reg, tmux, agent_id, source="mcp_tool")
+        return stop_agent(reg, tmux, agent_id, source="mcp_tool", config=cfg)
     except PuppetError as exc:
         return _error(exc)
 
@@ -176,9 +203,9 @@ def stop_agent_tool(agent_id: str) -> dict:
 def kill_agent_tool(agent_id: str) -> dict:
     """Force-kill an authorized agent tmux session."""
     try:
-        _cfg, reg, tmux, caller = _context()
+        cfg, reg, tmux, caller = _context()
         _authorized(reg, caller, agent_id, mutate=True)
-        return kill_agent(reg, tmux, agent_id, source="mcp_tool")
+        return kill_agent(reg, tmux, agent_id, source="mcp_tool", config=cfg)
     except PuppetError as exc:
         return _error(exc)
 
@@ -187,9 +214,9 @@ def kill_agent_tool(agent_id: str) -> dict:
 def pause_agent(agent_id: str) -> dict:
     """Mark an agent awaiting input. This does not suspend the process."""
     try:
-        _cfg, reg, _tmux, caller = _context()
+        cfg, reg, tmux, caller = _context()
         _authorized(reg, caller, agent_id, mutate=True)
-        return reg.update_agent(agent_id, status="awaiting_input")
+        return pause_agent_service(reg, agent_id, source="mcp_tool", config=cfg, tmux=tmux)
     except PuppetError as exc:
         return _error(exc)
 
@@ -198,9 +225,9 @@ def pause_agent(agent_id: str) -> dict:
 def resume_agent(agent_id: str) -> dict:
     """Mark an awaiting agent running. Use prompt_agent to actually send instructions."""
     try:
-        _cfg, reg, _tmux, caller = _context()
+        cfg, reg, tmux, caller = _context()
         _authorized(reg, caller, agent_id, mutate=True)
-        return reg.update_agent(agent_id, status="running")
+        return resume_agent_service(reg, agent_id, source="mcp_tool", config=cfg, tmux=tmux)
     except PuppetError as exc:
         return _error(exc)
 

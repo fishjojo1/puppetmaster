@@ -17,12 +17,18 @@ from .services import (
     create_raw_agent,
     drain_events,
     doctor,
+    fire_due_wakeups,
+    fire_wakeup,
     handle_stop_hook,
     inspect_agent,
     kill_agent,
+    notify_agent_state_change,
+    pause_agent,
     prompt_agent,
     read_agent,
     reconcile,
+    resume_agent,
+    sleep_and_fire_wakeup,
     start_orchestrator,
     stop_agent,
 )
@@ -187,14 +193,14 @@ def cmd_agent_read(args: argparse.Namespace) -> int:
 
 
 def cmd_agent_stop(args: argparse.Namespace) -> int:
-    _cfg, reg, tmux = build_context()
-    emit(stop_agent(reg, tmux, args.agent_id), args.json)
+    cfg, reg, tmux = build_context()
+    emit(stop_agent(reg, tmux, args.agent_id, config=cfg), args.json)
     return 0
 
 
 def cmd_agent_kill(args: argparse.Namespace) -> int:
-    _cfg, reg, tmux = build_context()
-    emit(kill_agent(reg, tmux, args.agent_id), args.json)
+    cfg, reg, tmux = build_context()
+    emit(kill_agent(reg, tmux, args.agent_id, config=cfg), args.json)
     return 0
 
 
@@ -221,26 +227,33 @@ def cmd_agent_complete(args: argparse.Namespace) -> int:
 
 
 def cmd_agent_mark_status(args: argparse.Namespace) -> int:
-    _cfg, reg, _tmux = build_context()
+    cfg, reg, tmux = build_context()
     updated = reg.update_agent(args.agent_id, status=args.status, termination_reason=args.reason)
-    reg.append_event(args.agent_id, "agent.status_overridden", args.reason, {"status": args.status}, severity="warning", source="human_cli")
+    notify_agent_state_change(
+        reg,
+        args.agent_id,
+        "agent.status_overridden",
+        args.reason,
+        {"status": args.status},
+        severity="warning",
+        source="human_cli",
+        coalesce=True,
+        config=cfg,
+        tmux=tmux,
+    )
     emit(updated, args.json)
     return 0
 
 
 def cmd_agent_pause(args: argparse.Namespace) -> int:
-    _cfg, reg, _tmux = build_context()
-    updated = reg.update_agent(args.agent_id, status="awaiting_input")
-    reg.append_event(args.agent_id, "agent.paused", "Agent marked awaiting input.", source="human_cli")
-    emit(updated, args.json)
+    cfg, reg, tmux = build_context()
+    emit(pause_agent(reg, args.agent_id, source="human_cli", config=cfg, tmux=tmux), args.json)
     return 0
 
 
 def cmd_agent_resume(args: argparse.Namespace) -> int:
-    _cfg, reg, _tmux = build_context()
-    updated = reg.update_agent(args.agent_id, status="running")
-    reg.append_event(args.agent_id, "agent.resumed", "Agent marked running.", source="human_cli")
-    emit(updated, args.json)
+    cfg, reg, tmux = build_context()
+    emit(resume_agent(reg, args.agent_id, source="human_cli", config=cfg, tmux=tmux), args.json)
     return 0
 
 
@@ -313,6 +326,30 @@ def cmd_hook_drain(args: argparse.Namespace) -> int:
     result = drain_events(cfg, reg, args.agent_id)
     if result.get("decision"):
         print(json.dumps(result))
+    return 0
+
+
+def cmd_wakeup_fire_due(args: argparse.Namespace) -> int:
+    cfg, reg, tmux = build_context()
+    emit(fire_due_wakeups(cfg, reg, agent_id=args.agent, tmux=tmux), args.json)
+    return 0
+
+
+def cmd_wakeup_fire(args: argparse.Namespace) -> int:
+    cfg, reg, tmux = build_context()
+    emit(fire_wakeup(cfg, reg, args.wakeup_id, tmux=tmux), args.json)
+    return 0
+
+
+def cmd_wakeup_sleep_and_fire(args: argparse.Namespace) -> int:
+    cfg, reg, tmux = build_context()
+    sleep_and_fire_wakeup(cfg, reg, tmux, args.wakeup_id)
+    return 0
+
+
+def cmd_wakeup_list(args: argparse.Namespace) -> int:
+    _cfg, reg, _tmux = build_context()
+    emit(reg.list_wakeups(agent_id=args.agent, status=args.status), args.json)
     return 0
 
 
@@ -487,6 +524,25 @@ def build_parser() -> argparse.ArgumentParser:
     ack.add_argument("delivery_id")
     add_json(ack)
     ack.set_defaults(func=cmd_events_ack)
+
+    wakeup = sub.add_parser("wakeup", help="Manage scheduled agent wakeups.")
+    w = wakeup.add_subparsers(required=True)
+    fire_due = w.add_parser("fire-due", help="Fire due scheduled wakeups.")
+    fire_due.add_argument("--agent")
+    add_json(fire_due)
+    fire_due.set_defaults(func=cmd_wakeup_fire_due)
+    fire = w.add_parser("fire", help="Fire one scheduled wakeup.")
+    fire.add_argument("wakeup_id")
+    add_json(fire)
+    fire.set_defaults(func=cmd_wakeup_fire)
+    list_w = w.add_parser("list", help="List scheduled wakeups.")
+    list_w.add_argument("--agent")
+    list_w.add_argument("--status", choices=["scheduled", "fired", "cancelled"])
+    add_json(list_w)
+    list_w.set_defaults(func=cmd_wakeup_list)
+    sleep_fire = w.add_parser("sleep-and-fire", help=argparse.SUPPRESS)
+    sleep_fire.add_argument("--wakeup-id", required=True)
+    sleep_fire.set_defaults(func=cmd_wakeup_sleep_and_fire)
 
     hook = sub.add_parser("hook", help="Commands invoked by generated Codex hooks.")
     h = hook.add_subparsers(required=True)
