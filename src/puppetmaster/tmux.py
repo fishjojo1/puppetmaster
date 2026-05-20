@@ -10,6 +10,7 @@ from pathlib import Path
 from .config import Config
 from .errors import PuppetError
 
+PROMPT_PASTE_SETTLE_DELAY_SECONDS = 0.5
 PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS = 0.15
 
 
@@ -65,10 +66,11 @@ class Tmux:
         buffer_name = f"puppet_prompt_{os.getpid()}"
         subprocess.run(["tmux", "set-buffer", "-b", buffer_name, prompt], check=True)
         try:
-            subprocess.run(["tmux", "paste-buffer", "-b", buffer_name, "-t", session], check=True)
-            subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+            subprocess.run(["tmux", "paste-buffer", "-pr", "-b", buffer_name, "-t", session], check=True)
+            time.sleep(PROMPT_PASTE_SETTLE_DELAY_SECONDS)
+            subprocess.run(["tmux", "send-keys", "-t", session, "C-m"], check=True)
             time.sleep(PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS)
-            subprocess.run(["tmux", "send-keys", "-t", session, "Enter"], check=True)
+            subprocess.run(["tmux", "send-keys", "-t", session, "C-m"], check=True)
         finally:
             subprocess.run(["tmux", "delete-buffer", "-b", buffer_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 

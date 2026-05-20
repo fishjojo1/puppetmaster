@@ -465,12 +465,15 @@ def test_tmux_send_prompt_pastes_and_confirms_with_second_enter(ctx, monkeypatch
     commands = [call[0] for call in calls]
     assert commands[:4] == [
         ["tmux", "set-buffer", "-b", commands[0][3], "continue"],
-        ["tmux", "paste-buffer", "-b", commands[0][3], "-t", "puppet_agt_child"],
-        ["tmux", "send-keys", "-t", "puppet_agt_child", "Enter"],
-        ["tmux", "send-keys", "-t", "puppet_agt_child", "Enter"],
+        ["tmux", "paste-buffer", "-pr", "-b", commands[0][3], "-t", "puppet_agt_child"],
+        ["tmux", "send-keys", "-t", "puppet_agt_child", "C-m"],
+        ["tmux", "send-keys", "-t", "puppet_agt_child", "C-m"],
     ]
     assert commands[4] == ["tmux", "delete-buffer", "-b", commands[0][3]]
-    assert sleeps == [tmux_module.PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS]
+    assert sleeps == [
+        tmux_module.PROMPT_PASTE_SETTLE_DELAY_SECONDS,
+        tmux_module.PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS,
+    ]
 
 
 def test_mcp_create_agent_prepends_goal_mode_to_prompt(tmp_path, monkeypatch):
