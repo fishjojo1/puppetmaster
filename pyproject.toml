@@ -9,6 +9,7 @@ description = "Local tmux supervisor and MCP control plane for Codex agents"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "discord-py>=2.4",
   "mcp>=1.0",
 ]
 

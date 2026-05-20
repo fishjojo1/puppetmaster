@@ -385,6 +385,19 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_discord_serve(args: argparse.Namespace) -> int:
+    try:
+        from .discord_bot import run_discord_bot
+    except ImportError as exc:
+        raise PuppetError(
+            "discord_dependency_missing",
+            "discord.py is not installed.",
+            "Install project dependencies with `uv sync` and retry.",
+        ) from exc
+
+    return run_discord_bot()
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     from .tui import run_tui
 
@@ -557,6 +570,11 @@ def build_parser() -> argparse.ArgumentParser:
     m = mcp.add_subparsers(required=True)
     serve = m.add_parser("serve")
     serve.set_defaults(func=cmd_mcp_serve)
+
+    discord_p = sub.add_parser("discord", help="Discord bot commands.")
+    discord_sub = discord_p.add_subparsers(required=True)
+    discord_serve = discord_sub.add_parser("serve", help="Run the Discord bot.")
+    discord_serve.set_defaults(func=cmd_discord_serve)
 
     tui = sub.add_parser("tui", help="Navigate agents and preview live output.")
     tui.add_argument("--root", help="Limit the view to one root_id.")

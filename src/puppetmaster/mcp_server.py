@@ -18,6 +18,7 @@ from .services import (
     read_agent,
     resume_agent as resume_agent_service,
     schedule_wakeup,
+    send_human_message as send_human_message_service,
     stop_agent,
 )
 from .tmux import Tmux
@@ -184,6 +185,16 @@ def prompt_agent_tool(agent_id: str, prompt: str) -> dict:
         _cfg, reg, tmux, caller = _context()
         _authorized(reg, caller, agent_id, mutate=True)
         return prompt_agent(reg, tmux, agent_id, prompt, source="mcp_tool")
+    except PuppetError as exc:
+        return _error(exc)
+
+
+@mcp.tool()
+def send_human_message(message: str) -> dict:
+    """Send a concise message to the bound human operator channel. Use this when replying to a human request received through Puppetmaster."""
+    try:
+        _cfg, reg, _tmux, caller = _context()
+        return send_human_message_service(reg, caller["id"], message, source="mcp_tool")
     except PuppetError as exc:
         return _error(exc)
 

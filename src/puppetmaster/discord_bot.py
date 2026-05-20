@@ -1,0 +1,750 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from .config import Config, DiscordConfig, load_config
+from .errors import PuppetError
+from .logging import log as supervisor_log
+from .model import now
+from .registry import Registry
+from .services import prompt_agent, read_agent
+from .tmux import Tmux
+
+try:  # pragma: no cover - exercised through CLI-friendly import handling.
+    import discord
+    from discord import app_commands
+    from discord.ext import commands
+except ImportError:  # pragma: no cover
+    discord = None  # type: ignore[assignment]
+    app_commands = None  # type: ignore[assignment]
+    commands = None  # type: ignore[assignment]
+
+
+TRUNCATED_MARKER = "[truncated]"
+CODE_BLOCK_OVERHEAD = len("```\n\n```")
+DISCORD_PROMPT_PREFIX = "DISCORD MESSAGE RECEIVED:\n"
+TEXT_ONLY_REPLY = "I only accept text messages right now."
+NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents, then /puppet bind."
+PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound root."
+PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
+PROMPT_DELIVERED_REACTION = "\N{WHITE HEAVY CHECK MARK}"
+LOGGER = logging.getLogger(__name__)
+
+
+def _discord_config(config: Config | DiscordConfig) -> DiscordConfig:
+    return config.discord if isinstance(config, Config) else config
+
+
+def validate_discord_config(config: Config | DiscordConfig) -> DiscordConfig:
+    discord_config = _discord_config(config)
+    if not discord_config.token:
+        raise PuppetError(
+            "discord_token_required",
+            "discord.token is required.",
+            "Set discord.token in .puppetmaster/config.toml.",
+        )
+    if discord_config.guild_id is None:
+        raise PuppetError(
+            "discord_guild_required",
+            "discord.guild_id is required.",
+            "Set discord.guild_id in .puppetmaster/config.toml.",
+        )
+    return discord_config
+
+
+def chunk_text(text: str, chunk_size: int, max_chunks: int) -> list[str]:
+    if chunk_size <= 0:
+        raise PuppetError("invalid_config", "discord.chunk_size must be positive")
+    if max_chunks <= 0:
+        raise PuppetError("invalid_config", "discord.max_chunks must be positive")
+
+    remaining = str(text)
+    if remaining == "":
+        return [""]
+
+    chunks: list[str] = []
+    while remaining and len(chunks) < max_chunks:
+        if len(remaining) <= chunk_size:
+            chunks.append(remaining)
+            remaining = ""
+            break
+        split_at = remaining.rfind("\n", 0, chunk_size + 1)
+        if split_at <= 0:
+            split_at = chunk_size
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
+
+    if remaining and chunks:
+        suffix = "\n" + TRUNCATED_MARKER
+        if len(suffix) >= chunk_size:
+            chunks[-1] = suffix[-chunk_size:]
+        else:
+            chunks[-1] = chunks[-1][: chunk_size - len(suffix)] + suffix
+
+    return chunks
+
+
+def code_block(text: str) -> str:
+    sanitized = str(text).replace("```", "'''")
+    return f"```\n{sanitized}\n```"
+
+
+def _code_block_chunks(text: str, config: Config | DiscordConfig) -> list[str]:
+    discord_config = _discord_config(config)
+    content_size = max(1, discord_config.chunk_size - CODE_BLOCK_OVERHEAD)
+    return [code_block(chunk) for chunk in chunk_text(text, content_size, discord_config.max_chunks)]
+
+
+async def send_chunks(destination: Any, text: str, config: Config | DiscordConfig) -> None:
+    for chunk in _code_block_chunks(text, config):
+        await destination.send(chunk)
+
+
+async def send_plain_chunks(destination: Any, text: str, config: Config | DiscordConfig) -> None:
+    discord_config = _discord_config(config)
+    for chunk in chunk_text(text, discord_config.chunk_size, discord_config.max_chunks):
+        await destination.send(chunk)
+
+
+async def send_interaction_chunks(interaction: Any, text: str, config: Config | DiscordConfig) -> None:
+    chunks = _code_block_chunks(text, config)
+    if not chunks:
+        chunks = [code_block("")]
+    response = interaction.response
+    if response.is_done():
+        for chunk in chunks:
+            await interaction.followup.send(chunk)
+        return
+    await response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
+
+
+def format_error(exc: PuppetError) -> str:
+    lines = [f"error[{exc.code}]: {exc.message}"]
+    if exc.hint:
+        lines.append(f"hint: {exc.hint}")
+    return "\n".join(lines)
+
+
+def _short_exception(exc: Exception) -> str:
+    text = str(exc).strip()
+    if not text:
+        return exc.__class__.__name__
+    return text[:500]
+
+
+@dataclass
+class TypingState:
+    root_agent_id: str
+    channel_id: str
+    channel: Any
+    prompt_delivered_at: str
+    timeout_at_monotonic: float
+    task: asyncio.Task[None] | None = None
+
+
+def _user_id(user: Any) -> str | None:
+    user_id = getattr(user, "id", None)
+    return str(user_id) if user_id is not None else None
+
+
+def _is_bot_author(message: Any, bot_user: Any) -> bool:
+    bot_user_id = _user_id(bot_user)
+    author = getattr(message, "author", None)
+    author_id = _user_id(author)
+    return author_id is not None and bot_user_id is not None and author_id == bot_user_id
+
+
+def _message_mentions_bot(message: Any, bot_user: Any) -> bool:
+    bot_user_id = _user_id(bot_user)
+    if bot_user_id is None:
+        return False
+    for mentioned in getattr(message, "mentions", []) or []:
+        if _user_id(mentioned) == bot_user_id:
+            return True
+    content = str(getattr(message, "content", "") or "")
+    return bool(re.search(rf"<@!?{re.escape(bot_user_id)}>", content))
+
+
+def _strip_bot_mentions(content: str, bot_user: Any) -> str:
+    bot_user_id = _user_id(bot_user)
+    cleaned = str(content or "")
+    if bot_user_id is not None:
+        cleaned = re.sub(rf"<@!?{re.escape(bot_user_id)}>", "", cleaned)
+    mention = getattr(bot_user, "mention", None)
+    if mention:
+        cleaned = cleaned.replace(str(mention), "")
+    return cleaned.strip()
+
+
+async def _is_reply_to_bot(message: Any, bot_user: Any) -> bool:
+    bot_user_id = _user_id(bot_user)
+    if bot_user_id is None:
+        return False
+
+    reference = getattr(message, "reference", None)
+    if reference is None:
+        return False
+
+    resolved = getattr(reference, "resolved", None) or getattr(message, "referenced_message", None)
+    if resolved is not None and _user_id(getattr(resolved, "author", None)) == bot_user_id:
+        return True
+
+    message_id = getattr(reference, "message_id", None)
+    channel = getattr(message, "channel", None)
+    fetch_message = getattr(channel, "fetch_message", None)
+    if message_id is None or fetch_message is None:
+        return False
+    try:
+        referenced = await fetch_message(message_id)
+    except Exception:
+        return False
+    return _user_id(getattr(referenced, "author", None)) == bot_user_id
+
+
+class DiscordRuntime:
+    def __init__(
+        self,
+        config: Config | DiscordConfig,
+        registry: Registry,
+        tmux: Tmux,
+        *,
+        bot: Any | None = None,
+        prompt_func: Callable[[Registry, Tmux, str, str, str], dict[str, Any]] = prompt_agent,
+    ) -> None:
+        self.config = config
+        self.discord_config = _discord_config(config)
+        self.registry = registry
+        self.tmux = tmux
+        self.bot = bot
+        self.prompt_func = prompt_func
+        self.active_typing: dict[str, TypingState] = {}
+        self._poll_task: asyncio.Task[None] | None = None
+
+    def _log(self, level: str, event: str, message: str, **fields: Any) -> None:
+        log_method = getattr(LOGGER, level, LOGGER.info)
+        log_method("%s", message, extra={"event": event, **fields})
+        if isinstance(self.config, Config):
+            supervisor_log(self.config, level, event, message, **fields)
+
+    async def handle_message(self, message: Any, bot_user: Any) -> bool:
+        if _is_bot_author(message, bot_user):
+            return False
+        if getattr(message, "interaction", None) is not None:
+            return False
+
+        guild = getattr(message, "guild", None)
+        if guild is None or str(getattr(guild, "id", "")) != str(self.discord_config.guild_id):
+            return False
+
+        channel = getattr(message, "channel", None)
+        try:
+            channel_id, _guild_id = _text_channel_ids(channel)
+        except PuppetError:
+            return False
+
+        mentioned = _message_mentions_bot(message, bot_user)
+        reply_to_bot = await _is_reply_to_bot(message, bot_user)
+        if not mentioned and not reply_to_bot:
+            return False
+
+        binding = self.registry.discord_binding_for_channel(channel_id)
+        if not binding:
+            self._log(
+                "info",
+                "discord.inbound.unbound",
+                "Discord prompt ignored because the channel is not bound.",
+                channel_id=channel_id,
+                guild_id=str(getattr(guild, "id", "")),
+                discord_message_id=str(getattr(message, "id", "")) or None,
+            )
+            await message.reply(NOT_BOUND_REPLY)
+            return True
+
+        cleaned = _strip_bot_mentions(str(getattr(message, "content", "") or ""), bot_user)
+        if not cleaned:
+            await message.reply(TEXT_ONLY_REPLY)
+            return True
+
+        prompt = f"{DISCORD_PROMPT_PREFIX}{cleaned}"
+        try:
+            event = self.prompt_func(self.registry, self.tmux, binding["root_agent_id"], prompt, "discord")
+        except PuppetError as exc:
+            self._log(
+                "warning",
+                "discord.inbound.failed",
+                "Discord prompt delivery failed.",
+                root_agent_id=binding["root_agent_id"],
+                channel_id=channel_id,
+                discord_message_id=str(getattr(message, "id", "")) or None,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            await message.reply(f"{PROMPT_DELIVERY_FAILED_REPLY} {format_error(exc)}\n{PROMPT_DELIVERY_FAILED_HINT}")
+            return True
+        except Exception as exc:
+            LOGGER.exception(
+                "Failed to deliver Discord prompt to root %s from Discord message %s",
+                binding["root_agent_id"],
+                getattr(message, "id", None),
+            )
+            self._log(
+                "error",
+                "discord.inbound.failed",
+                "Discord prompt delivery failed.",
+                root_agent_id=binding["root_agent_id"],
+                channel_id=channel_id,
+                discord_message_id=str(getattr(message, "id", "")) or None,
+                error_message=_short_exception(exc),
+            )
+            await message.reply(f"{PROMPT_DELIVERY_FAILED_REPLY} {_short_exception(exc)}\n{PROMPT_DELIVERY_FAILED_HINT}")
+            return True
+
+        await message.add_reaction(PROMPT_DELIVERED_REACTION)
+        self._log(
+            "info",
+            "discord.inbound.delivered",
+            "Discord prompt delivered to root orchestrator.",
+            root_agent_id=binding["root_agent_id"],
+            channel_id=channel_id,
+            guild_id=str(getattr(guild, "id", "")),
+            discord_message_id=str(getattr(message, "id", "")) or None,
+            prompt_length=len(cleaned),
+            event_id=event.get("id"),
+        )
+        self.start_typing(binding["root_agent_id"], channel, event.get("created_at") or now())
+        return True
+
+    def start_typing(self, root_agent_id: str, channel: Any, prompt_delivered_at: str) -> None:
+        timeout_at = time.monotonic() + self.discord_config.typing_timeout_seconds
+        existing = self.active_typing.get(root_agent_id)
+        if existing is not None:
+            existing.channel_id = str(getattr(channel, "id"))
+            existing.channel = channel
+            existing.prompt_delivered_at = prompt_delivered_at
+            existing.timeout_at_monotonic = timeout_at
+            if existing.task is None or existing.task.done():
+                existing.task = asyncio.create_task(self._typing_loop(root_agent_id))
+            return
+
+        state = TypingState(
+            root_agent_id=root_agent_id,
+            channel_id=str(getattr(channel, "id")),
+            channel=channel,
+            prompt_delivered_at=prompt_delivered_at,
+            timeout_at_monotonic=timeout_at,
+        )
+        self.active_typing[root_agent_id] = state
+        state.task = asyncio.create_task(self._typing_loop(root_agent_id))
+
+    def stop_typing(self, root_agent_id: str) -> None:
+        state = self.active_typing.pop(root_agent_id, None)
+        if state and state.task and not state.task.done():
+            state.task.cancel()
+
+    def stop_expired_typing(self) -> None:
+        current = time.monotonic()
+        for root_agent_id, state in list(self.active_typing.items()):
+            if current >= state.timeout_at_monotonic:
+                self._log(
+                    "info",
+                    "discord.typing.timeout",
+                    "Discord typing indicator timed out.",
+                    root_agent_id=root_agent_id,
+                    channel_id=state.channel_id,
+                )
+                self.stop_typing(root_agent_id)
+
+    async def _typing_loop(self, root_agent_id: str) -> None:
+        try:
+            while True:
+                state = self.active_typing.get(root_agent_id)
+                if state is None:
+                    return
+                remaining = state.timeout_at_monotonic - time.monotonic()
+                if remaining <= 0:
+                    self._log(
+                        "info",
+                        "discord.typing.timeout",
+                        "Discord typing indicator timed out.",
+                        root_agent_id=root_agent_id,
+                        channel_id=state.channel_id,
+                    )
+                    self.active_typing.pop(root_agent_id, None)
+                    return
+                sleep_for = min(8.0, max(0.05, remaining))
+                typing = state.channel.typing()
+                async with typing:
+                    await asyncio.sleep(sleep_for)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Discord typing loop failed for root %s", root_agent_id)
+            self.active_typing.pop(root_agent_id, None)
+
+    async def _get_channel(self, channel_id: str) -> Any | None:
+        if self.bot is None:
+            return None
+        channel: Any | None = None
+        get_channel = getattr(self.bot, "get_channel", None)
+        if get_channel is not None:
+            try:
+                channel = get_channel(int(channel_id))
+            except (TypeError, ValueError):
+                channel = get_channel(channel_id)
+        if channel is not None:
+            return channel
+        fetch_channel = getattr(self.bot, "fetch_channel", None)
+        if fetch_channel is None:
+            return None
+        try:
+            return await fetch_channel(int(channel_id))
+        except (TypeError, ValueError):
+            return await fetch_channel(channel_id)
+
+    async def dispatch_pending_outbound_once(self) -> None:
+        for outbound in self.registry.pending_outbound_human_messages("discord", limit=20):
+            try:
+                channel = await self._get_channel(outbound["channel_id"])
+                if channel is None:
+                    raise PuppetError("channel_not_found", f"Discord channel not found: {outbound['channel_id']}")
+                await send_plain_chunks(channel, outbound["message"], self.config)
+                self.registry.mark_outbound_human_message_delivered(outbound["id"])
+                self._log(
+                    "info",
+                    "discord.outbound.delivered",
+                    "Outbound Discord message delivered.",
+                    message_id=outbound["id"],
+                    root_agent_id=outbound["root_agent_id"],
+                    agent_id=outbound["agent_id"],
+                    channel_id=outbound["channel_id"],
+                    message_length=len(outbound["message"]),
+                )
+                self.stop_typing(outbound["root_agent_id"])
+            except Exception as exc:
+                error = _short_exception(exc)
+                LOGGER.exception("Failed to deliver outbound Discord message %s", outbound["id"])
+                self.registry.mark_outbound_human_message_failed(outbound["id"], error)
+                self._log(
+                    "warning",
+                    "discord.outbound.failed",
+                    "Outbound Discord message delivery failed.",
+                    message_id=outbound["id"],
+                    root_agent_id=outbound["root_agent_id"],
+                    agent_id=outbound["agent_id"],
+                    channel_id=outbound["channel_id"],
+                    message_length=len(outbound["message"]),
+                    error_message=error,
+                )
+
+    def stop_typing_for_turn_stops(self) -> None:
+        for root_agent_id, state in list(self.active_typing.items()):
+            stopped_at = self.registry.latest_event_time(root_agent_id, "agent.turn_stopped")
+            if stopped_at is not None and stopped_at > state.prompt_delivered_at:
+                self.stop_typing(root_agent_id)
+
+    async def poll_once(self) -> None:
+        await self.dispatch_pending_outbound_once()
+        self.stop_typing_for_turn_stops()
+        self.stop_expired_typing()
+
+    def start(self) -> None:
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = asyncio.create_task(self._poll_loop())
+
+    async def _poll_loop(self) -> None:
+        while self.bot is None or not self.bot.is_closed():
+            try:
+                await self.poll_once()
+            except Exception:
+                LOGGER.exception("Discord runtime poll loop failed")
+            await asyncio.sleep(self.discord_config.poll_interval_seconds)
+
+    async def close(self) -> None:
+        if self._poll_task is not None and not self._poll_task.done():
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
+        typing_tasks = [state.task for state in self.active_typing.values() if state.task is not None]
+        for root_agent_id in list(self.active_typing):
+            self.stop_typing(root_agent_id)
+        for task in typing_tasks:
+            if not task.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+
+def root_agents(registry: Registry) -> list[dict[str, Any]]:
+    return [
+        agent
+        for agent in registry.list_agents()
+        if agent["role"] == "orchestrator" and agent["id"] == agent["root_id"]
+    ]
+
+
+def handle_agents_command(registry: Registry) -> str:
+    roots = root_agents(registry)
+    if not roots:
+        return "No root orchestrators found."
+    rows = ["ID STATUS NAME CWD"]
+    rows.extend(f"{agent['id']} {agent['status']} {agent.get('name') or '-'} {agent['cwd']}" for agent in roots)
+    return "\n".join(rows)
+
+
+def _text_channel_ids(channel: Any) -> tuple[str, str | None]:
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        raise PuppetError("invalid_channel", "This command must be used in a guild text channel.")
+
+    is_text_channel = bool(getattr(channel, "is_text_channel", False))
+    if discord is not None and isinstance(channel, discord.TextChannel):
+        is_text_channel = True
+    if not is_text_channel:
+        raise PuppetError(
+            "invalid_channel",
+            "This command must be used in a guild text channel.",
+            "Run it from a normal Discord text channel, not a DM, thread, or voice/forum channel.",
+        )
+
+    return str(getattr(channel, "id")), str(getattr(guild, "id")) if getattr(guild, "id", None) is not None else None
+
+
+def _require_bound_root(registry: Registry, channel: Any) -> dict[str, Any]:
+    channel_id, _guild_id = _text_channel_ids(channel)
+    binding = registry.discord_binding_for_channel(channel_id)
+    if not binding:
+        raise PuppetError(
+            "not_bound",
+            "No orchestrator is bound to this channel.",
+            "Use /puppet agents, then /puppet bind.",
+        )
+    return registry.get_agent(binding["root_agent_id"])
+
+
+def _require_root_orchestrator(registry: Registry, agent_id: str) -> dict[str, Any]:
+    agent = registry.maybe_agent(agent_id)
+    if not agent:
+        raise PuppetError("not_found", f"agent not found: {agent_id}")
+    if agent["role"] != "orchestrator" or agent["id"] != agent["root_id"]:
+        raise PuppetError(
+            "invalid_agent",
+            f"agent is not a root orchestrator: {agent_id}",
+            "/puppet bind accepts root orchestrator ids only.",
+        )
+    return agent
+
+
+def handle_bind_command(registry: Registry, channel: Any, agent_id: str) -> str:
+    agent = _require_root_orchestrator(registry, agent_id)
+    channel_id, guild_id = _text_channel_ids(channel)
+    registry.bind_discord_channel(channel_id, agent["id"], guild_id)
+    LOGGER.info(
+        "Bound Discord channel %s to root orchestrator %s.",
+        channel_id,
+        agent["id"],
+        extra={"event": "discord.binding.bound", "channel_id": channel_id, "root_agent_id": agent["id"], "guild_id": guild_id},
+    )
+    return f"Bound this channel to {agent['id']}"
+
+
+def handle_unbind_command(registry: Registry, channel: Any) -> str:
+    channel_id, _guild_id = _text_channel_ids(channel)
+    binding = registry.discord_binding_for_channel(channel_id)
+    if not binding:
+        return "This channel was not bound."
+    registry.unbind_discord_channel(channel_id)
+    LOGGER.info(
+        "Unbound Discord channel %s from root orchestrator %s.",
+        channel_id,
+        binding["root_agent_id"],
+        extra={
+            "event": "discord.binding.unbound",
+            "channel_id": channel_id,
+            "root_agent_id": binding["root_agent_id"],
+            "guild_id": binding.get("guild_id"),
+        },
+    )
+    return f"Unbound this channel from {binding['root_agent_id']}"
+
+
+def handle_status_command(registry: Registry, tmux: Tmux, channel: Any) -> str:
+    root = _require_bound_root(registry, channel)
+    child_count = sum(1 for agent in registry.list_agents(root_id=root["id"]) if agent["id"] != root["id"])
+    live_tmux = "yes" if tmux.session_exists(root["tmux_session"]) else "no"
+    lines = [
+        f"Root: {root['id']}",
+        f"Name: {root.get('name') or '-'}",
+        f"Status: {root['status']}",
+        f"Cwd: {root['cwd']}",
+        f"Live tmux: {live_tmux}",
+        f"Child count: {child_count}",
+        f"Last turn stopped: {root.get('last_turn_stopped_at') or '-'}",
+        f"Completed at: {root.get('completed_at') or '-'}",
+    ]
+    return "\n".join(lines)
+
+
+def handle_read_command(config: Config, registry: Registry, tmux: Tmux, channel: Any, lines: int | None = None) -> str:
+    if lines is not None and lines <= 0:
+        raise PuppetError("invalid_lines", "lines must be a positive integer.")
+    root = _require_bound_root(registry, channel)
+    output = read_agent(config, registry, tmux, root["id"], lines, "auto")
+    return output or "(no output)"
+
+
+def handle_tree_command(registry: Registry, channel: Any) -> str:
+    root = _require_bound_root(registry, channel)
+    agents = registry.list_agents(root_id=root["id"])
+    if not agents:
+        return "No agents found."
+    by_parent: dict[str | None, list[dict[str, Any]]] = {}
+    for agent in agents:
+        by_parent.setdefault(agent["parent_id"], []).append(agent)
+
+    def walk(parent_id: str | None, depth: int) -> list[str]:
+        rows: list[str] = []
+        for agent in by_parent.get(parent_id, []):
+            rows.append(
+                "  " * depth
+                + f"{agent['id']} {agent['role']} {agent['status']} {agent.get('name') or '-'} {agent['cwd']}"
+            )
+            rows.extend(walk(agent["id"], depth + 1))
+        return rows
+
+    return "\n".join(walk(root["parent_id"], 0))
+
+
+CommandFunc = Callable[..., str]
+
+
+async def _run_interaction_command(
+    interaction: Any,
+    config: Config,
+    func: CommandFunc,
+    *args: Any,
+) -> None:
+    try:
+        text = func(*args)
+    except PuppetError as exc:
+        text = format_error(exc)
+    await send_interaction_chunks(interaction, text, config)
+
+
+def _require_discord_dependency() -> None:
+    if discord is None or app_commands is None or commands is None:
+        raise PuppetError(
+            "discord_dependency_missing",
+            "discord.py is not installed.",
+            "Install project dependencies with `uv sync` and retry.",
+        )
+
+
+def build_discord_bot(config: Config | None = None, registry: Registry | None = None, tmux: Tmux | None = None) -> Any:
+    _require_discord_dependency()
+    cfg = config or load_config()
+    discord_config = validate_discord_config(cfg)
+    reg = registry or Registry(cfg)
+    tmux_client = tmux or Tmux(cfg)
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix="puppet!", intents=intents)
+    runtime = DiscordRuntime(cfg, reg, tmux_client, bot=bot)
+    guild = discord.Object(id=discord_config.guild_id)
+    group = app_commands.Group(name="puppet", description="Puppetmaster commands")
+
+    @group.command(name="agents", description="List root orchestrators.")
+    async def agents(interaction: discord.Interaction) -> None:
+        await _run_interaction_command(interaction, cfg, handle_agents_command, reg)
+
+    @group.command(name="bind", description="Bind this channel to a root orchestrator.")
+    @app_commands.describe(agent_id="Root orchestrator agent id.")
+    async def bind(interaction: discord.Interaction, agent_id: str) -> None:
+        await _run_interaction_command(interaction, cfg, handle_bind_command, reg, interaction.channel, agent_id)
+
+    @group.command(name="unbind", description="Remove this channel binding.")
+    async def unbind(interaction: discord.Interaction) -> None:
+        await _run_interaction_command(interaction, cfg, handle_unbind_command, reg, interaction.channel)
+
+    @group.command(name="status", description="Show the bound root orchestrator status.")
+    async def status(interaction: discord.Interaction) -> None:
+        await _run_interaction_command(interaction, cfg, handle_status_command, reg, tmux_client, interaction.channel)
+
+    @group.command(name="read", description="Read recent output from the bound root orchestrator.")
+    @app_commands.describe(lines="Optional number of terminal lines to read.")
+    async def read(interaction: discord.Interaction, lines: int | None = None) -> None:
+        await _run_interaction_command(interaction, cfg, handle_read_command, cfg, reg, tmux_client, interaction.channel, lines)
+
+    @group.command(name="tree", description="Show the bound root orchestrator tree.")
+    async def tree(interaction: discord.Interaction) -> None:
+        await _run_interaction_command(interaction, cfg, handle_tree_command, reg, interaction.channel)
+
+    @bot.event
+    async def setup_hook() -> None:
+        bot.tree.add_command(group, guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        LOGGER.info(
+            "Synced %s Discord slash command group(s) to guild %s.",
+            len(synced),
+            discord_config.guild_id,
+            extra={"event": "discord.commands.synced", "guild_id": str(discord_config.guild_id), "command_count": len(synced)},
+        )
+        supervisor_log(
+            cfg,
+            "info",
+            "discord.commands.synced",
+            "Discord slash commands synced.",
+            guild_id=str(discord_config.guild_id),
+            command_count=len(synced),
+        )
+        print(f"Synced {len(synced)} Discord slash command group(s) to guild {discord_config.guild_id}.")
+
+    @bot.event
+    async def on_ready() -> None:
+        runtime.start()
+
+    @bot.event
+    async def on_message(message: discord.Message) -> None:
+        await runtime.handle_message(message, bot.user)
+        await bot.process_commands(message)
+
+    original_close = bot.close
+
+    async def close_with_runtime() -> None:
+        await runtime.close()
+        await original_close()
+
+    bot.close = close_with_runtime  # type: ignore[method-assign]
+    bot.puppetmaster_runtime = runtime  # type: ignore[attr-defined]
+    return bot
+
+
+def run_discord_bot() -> int:
+    cfg = load_config()
+    discord_config = validate_discord_config(cfg)
+    LOGGER.info(
+        "Starting Discord bot for guild %s.",
+        discord_config.guild_id,
+        extra={"event": "discord.bot.starting", "guild_id": str(discord_config.guild_id)},
+    )
+    supervisor_log(
+        cfg,
+        "info",
+        "discord.bot.starting",
+        "Discord bot starting.",
+        guild_id=str(discord_config.guild_id),
+        poll_interval_seconds=discord_config.poll_interval_seconds,
+        typing_timeout_seconds=discord_config.typing_timeout_seconds,
+    )
+    bot = build_discord_bot(cfg)
+    bot.run(discord_config.token)
+    return 0

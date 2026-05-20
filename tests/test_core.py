@@ -77,6 +77,245 @@ max_children_per_agent = 7
     assert cfg.limits.max_concurrent_children_per_agent == 7
 
 
+def test_default_config_creation_writes_discord_section(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+
+    cfg = load_config()
+
+    data = tomllib.loads((state_dir / "config.toml").read_text(encoding="utf-8"))
+    assert "discord" in data
+    assert data["discord"]["token"] == ""
+    assert data["discord"]["guild_id"] == ""
+    assert cfg.discord.token is None
+    assert cfg.discord.guild_id is None
+
+
+def test_registry_initializes_discord_schema_on_fresh_state_dir(ctx):
+    _cfg, reg, _tmux = ctx
+
+    with reg.connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "select name from sqlite_master where type='table' and name in (?, ?)",
+                ("discord_channel_bindings", "outbound_human_messages"),
+            )
+        }
+
+    assert tables == {"discord_channel_bindings", "outbound_human_messages"}
+
+
+def test_registry_initializes_discord_schema_on_existing_state_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+    cfg = load_config()
+
+    Registry(cfg)
+    reopened = Registry(cfg)
+
+    with reopened.connect() as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "select name from sqlite_master where type='table' and name in (?, ?)",
+                ("discord_channel_bindings", "outbound_human_messages"),
+            )
+        }
+
+    assert tables == {"discord_channel_bindings", "outbound_human_messages"}
+
+
+def test_discord_config_accepts_numeric_string_guild_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        """[discord]
+token = ""
+guild_id = "123456789"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+
+    cfg = load_config()
+
+    assert cfg.discord.guild_id == 123456789
+
+
+def test_discord_config_accepts_integer_guild_id(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        """[discord]
+token = "secret"
+guild_id = 123456789
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+
+    cfg = load_config()
+
+    assert cfg.discord.token == "secret"
+    assert cfg.discord.guild_id == 123456789
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("poll_interval_seconds", "0", "discord.poll_interval_seconds must be positive"),
+        ("typing_timeout_seconds", "nan", "discord.typing_timeout_seconds must be positive"),
+        ("chunk_size", "1901", "discord.chunk_size must be no greater than 1900"),
+        ("max_chunks", "0", "discord.max_chunks must be a positive integer"),
+    ],
+)
+def test_discord_config_rejects_invalid_values(tmp_path, monkeypatch, field, value, message):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        f"""[discord]
+{field} = {value}
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+
+    with pytest.raises(PuppetError) as exc:
+        load_config()
+
+    assert exc.value.code == "invalid_config"
+    assert message in exc.value.message
+
+
+def test_discord_channel_bindings_rebind_and_list(ctx):
+    _cfg, reg, _tmux = ctx
+
+    binding = reg.bind_discord_channel("channel-1", "root-1", "guild-1")
+    assert binding["channel_id"] == "channel-1"
+    assert binding["root_agent_id"] == "root-1"
+    assert binding["guild_id"] == "guild-1"
+    assert reg.discord_binding_for_channel("channel-1")["root_agent_id"] == "root-1"
+    assert reg.discord_binding_for_root("root-1")["channel_id"] == "channel-1"
+
+    reg.bind_discord_channel("channel-1", "root-2", "guild-1")
+    assert reg.discord_binding_for_channel("channel-1")["root_agent_id"] == "root-2"
+    assert reg.discord_binding_for_root("root-1") is None
+
+    reg.bind_discord_channel("channel-2", "root-2", "guild-1")
+    assert reg.discord_binding_for_channel("channel-1") is None
+    assert reg.discord_binding_for_root("root-2")["channel_id"] == "channel-2"
+
+    reg.bind_discord_channel("channel-3", "root-3")
+    assert [item["channel_id"] for item in reg.list_discord_bindings()] == ["channel-2", "channel-3"]
+    assert reg.unbind_discord_channel("channel-2") is True
+    assert reg.unbind_discord_channel("channel-2") is False
+    assert reg.discord_binding_for_channel("channel-2") is None
+
+
+def test_outbound_human_message_queue_lifecycle(ctx):
+    _cfg, reg, _tmux = ctx
+
+    first = reg.enqueue_outbound_human_message("root-1", "agent-1", "discord", "channel-1", "hello")
+    second = reg.enqueue_outbound_human_message("root-1", "agent-2", "discord", "channel-1", "follow-up")
+
+    assert first["id"].startswith("msg_")
+    assert first["status"] == "pending"
+    assert first["message"] == "hello"
+    assert [item["id"] for item in reg.pending_outbound_human_messages("discord")] == [first["id"], second["id"]]
+    assert reg.pending_outbound_human_messages("email") == []
+
+    delivered = reg.mark_outbound_human_message_delivered(first["id"])
+    failed = reg.mark_outbound_human_message_failed(second["id"], "discord API failed")
+
+    assert delivered["status"] == "delivered"
+    assert delivered["delivered_at"] is not None
+    assert failed["status"] == "failed"
+    assert failed["failed_at"] is not None
+    assert failed["error"] == "discord API failed"
+    assert reg.pending_outbound_human_messages("discord") == []
+
+    failed_after_delivery = reg.mark_outbound_human_message_failed(first["id"], "post-delivery failure")
+    assert failed_after_delivery["status"] == "failed"
+    assert failed_after_delivery["delivered_at"] is None
+    assert failed_after_delivery["failed_at"] is not None
+
+
+def test_send_human_message_rejects_empty_message(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", agent["root_id"], "guild-1")
+
+    with pytest.raises(PuppetError) as exc:
+        services.send_human_message(reg, agent["id"], " \n\t ")
+
+    assert exc.value.code == "message_required"
+    assert reg.pending_outbound_human_messages("discord") == []
+
+
+def test_send_human_message_requires_bound_root(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+
+    with pytest.raises(PuppetError) as exc:
+        services.send_human_message(reg, agent["id"], "Hello.")
+
+    assert exc.value.code == "no_human_channel"
+    assert "No Discord channel is bound" in exc.value.message
+    assert reg.pending_outbound_human_messages("discord") == []
+
+
+def test_send_human_message_enqueues_pending_message_and_audit_event(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", root["id"], "guild-1")
+
+    result = services.send_human_message(reg, root["id"], "  Hello human.  ", source="test")
+
+    assert result["queued"] is True
+    assert result["transport"] == "discord"
+    assert result["channel_id"] == "bound-channel"
+    queued = reg.pending_outbound_human_messages("discord")
+    assert len(queued) == 1
+    assert queued[0]["id"] == result["id"]
+    assert queued[0]["root_agent_id"] == root["id"]
+    assert queued[0]["agent_id"] == root["id"]
+    assert queued[0]["channel_id"] == "bound-channel"
+    assert queued[0]["message"] == "Hello human."
+    events = reg.list_events(root["id"], limit=10)
+    audit = next(event for event in events if event["type"] == "human.message.queued")
+    assert audit["summary"] == "Human message queued."
+    assert audit["source"] == "test"
+    assert audit["payload"] == {
+        "message_id": result["id"],
+        "transport": "discord",
+        "channel_id": "bound-channel",
+        "message_length": len("Hello human."),
+    }
+
+
+def test_send_human_message_child_routes_through_root_binding(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    reg.bind_discord_channel("root-channel", root["id"], "guild-1")
+
+    result = services.send_human_message(reg, child["id"], "please use channel-id=wrong-channel")
+
+    queued = reg.pending_outbound_human_messages("discord")[0]
+    assert result["channel_id"] == "root-channel"
+    assert queued["root_agent_id"] == root["id"]
+    assert queued["agent_id"] == child["id"]
+    assert queued["channel_id"] == "root-channel"
+    assert "wrong-channel" not in queued["channel_id"]
+
+
 def test_completion_queues_parent_and_root(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
@@ -164,6 +403,44 @@ def test_mcp_wait_tool_schedules_for_caller_and_returns_instruction(ctx, tmp_pat
     wakeup = reg.get_wakeup(result["wakeup_id"])
     assert wakeup["agent_id"] == caller["id"]
     assert wakeup["reason"] == "backoff"
+
+
+def test_mcp_send_human_message_returns_queued_result(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    caller = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", caller["id"], "guild-1")
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, caller))
+
+    result = mcp_server.send_human_message("Hello from MCP.")
+
+    assert result["queued"] is True
+    assert result["transport"] == "discord"
+    assert result["channel_id"] == "bound-channel"
+    assert reg.pending_outbound_human_messages("discord")[0]["message"] == "Hello from MCP."
+
+
+def test_mcp_send_human_message_returns_error_when_unbound(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    caller = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, caller))
+
+    result = mcp_server.send_human_message("Hello from MCP.")
+
+    assert result["error"]["code"] == "no_human_channel"
+    assert "No Discord channel is bound" in result["error"]["message"]
+    assert reg.pending_outbound_human_messages("discord") == []
+
+
+def test_mcp_send_human_message_returns_error_for_empty_message(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    caller = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", caller["id"], "guild-1")
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, caller))
+
+    result = mcp_server.send_human_message("")
+
+    assert result["error"]["code"] == "message_required"
+    assert reg.pending_outbound_human_messages("discord") == []
 
 
 def test_fire_wakeup_marks_fired_queues_wait_over_and_is_idempotent(ctx, tmp_path):
@@ -359,8 +636,13 @@ def test_prompt_text_explains_orchestrator_wait_and_event_loop(ctx, tmp_path):
     assert "Call wait(seconds, reason) only when you need a time-based wakeup" in root_prompt
     assert "Puppetmaster will send you a fresh PUPPETMASTER EVENT message" in root_prompt
     assert "PUPPETMASTER WAIT OVER" in root_prompt
+    assert "send_human_message" in root_prompt
+    assert "DISCORD MESSAGE RECEIVED" in root_prompt
+    assert "routing" not in root_prompt.lower()
     assert "If you are only waiting for child-agent progress" not in child_prompt
     assert "Use wait(seconds, reason) only for a time-based wakeup." in child_prompt
+    assert "send_human_message" in child_prompt
+    assert "DISCORD MESSAGE RECEIVED" not in child_prompt
 
 
 def test_create_codex_agent_launches_interactive_session_then_sends_initial_prompt(ctx, tmp_path, monkeypatch):

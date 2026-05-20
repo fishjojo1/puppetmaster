@@ -1,6 +1,6 @@
 # Spec Conformance Checklist
 
-This checklist maps the explicit v1 requirements from `SPEC.md` and the milestone validation plans to implementation artifacts.
+This checklist maps the explicit v1 requirements from `spec.md` and the milestone validation plans to implementation artifacts.
 
 ## Core Supervisor
 
@@ -39,6 +39,22 @@ This checklist maps the explicit v1 requirements from `SPEC.md` and the mileston
 - Compatibility aliases exist for milestone commands: `agent create-raw`, `agent create-codex`, `debug create-raw`.
 - JSON output exists for data-returning commands through `--json`.
 
+## Discord Integration
+
+- Discord config exists in local `.puppetmaster/config.toml`: `[discord]` in `Config`.
+- Discord state is durable in SQLite: `discord_channel_bindings` and `outbound_human_messages`.
+- The bot entrypoint exists: `puppet discord serve`, `run_discord_bot`.
+- Guild-scoped slash commands exist: `/puppet agents`, `/puppet bind`, `/puppet unbind`, `/puppet status`, `/puppet read`, `/puppet tree`.
+- `/puppet bind` accepts root orchestrators only: `handle_bind_command`.
+- Mention/reply-only inbound prompt routing exists: `DiscordRuntime.handle_message`.
+- Inbound Discord prompts use `DISCORD MESSAGE RECEIVED:\n<message>`.
+- Outbound human replies use frontend-neutral `send_human_message`.
+- Outbound Discord dispatch is durable and status-based: pending rows deliver, delivered/failed rows are not selected again.
+- Typing indicators start after inbound prompt delivery and stop on outbound delivery, root turn stop, or timeout.
+- Discord runtime errors are short and actionable, with setup hints for unbound channels and status/read hints for dead sessions.
+- Discord logging avoids full message bodies and records startup, slash sync, bind/unbind, inbound delivery, outbound delivery/failure, and typing timeout events.
+- Restart behavior is covered by persisted bindings and pending outbound message recovery; typing state is intentionally best-effort in memory.
+
 ## Recovery And Hardening
 
 - Reconcile detects missing tmux for nonterminal agents and marks dead.
@@ -50,5 +66,7 @@ This checklist maps the explicit v1 requirements from `SPEC.md` and the mileston
 ## Validation Evidence
 
 - Unit tests cover registry, cwd validation, completion delivery, event drain, Stop hook coalescing, and reconciliation.
-- `scripts/release-validate.sh` runs tests, doctor, and a tmux-backed raw smoke test.
+- Unit tests cover Discord config/schema, command helpers, inbound mention/reply routing, outbound queue dispatch, failure persistence, restart/idempotency behavior, and README documentation checks.
+- `scripts/release-validate.sh` runs tests, doctor, non-network Discord config/schema checks, and a tmux-backed raw smoke test.
 - Live Codex validation is intentionally separate because it consumes real Codex credentials/model sessions.
+- Live Discord validation is intentionally separate because it needs a real Discord token, guild, and network connection.

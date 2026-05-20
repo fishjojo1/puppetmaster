@@ -279,6 +279,46 @@ def prompt_agent(registry: Registry, tmux: Tmux, agent_id: str, prompt: str, sou
     return event
 
 
+def send_human_message(registry: Registry, agent_id: str, message: str, *, source: str = "mcp_tool") -> dict[str, Any]:
+    agent = registry.get_agent(agent_id)
+    root_id = agent["root_id"]
+    normalized = message.strip()
+    if not normalized:
+        raise PuppetError("message_required", "send_human_message requires a non-empty message.", "Pass the human-facing reply text.")
+    binding = registry.discord_binding_for_root(root_id)
+    if not binding:
+        raise PuppetError(
+            "no_human_channel",
+            "No Discord channel is bound for this root orchestrator.",
+            "Bind a Discord channel to this root orchestrator before sending human messages.",
+        )
+    outbound = registry.enqueue_outbound_human_message(
+        root_id,
+        agent_id,
+        "discord",
+        binding["channel_id"],
+        normalized,
+    )
+    registry.append_event(
+        agent_id,
+        "human.message.queued",
+        "Human message queued.",
+        {
+            "message_id": outbound["id"],
+            "transport": outbound["transport"],
+            "channel_id": outbound["channel_id"],
+            "message_length": len(normalized),
+        },
+        source=source,
+    )
+    return {
+        "queued": True,
+        "id": outbound["id"],
+        "transport": outbound["transport"],
+        "channel_id": outbound["channel_id"],
+    }
+
+
 def notify_agent_state_change(
     registry: Registry,
     agent_id: str,
@@ -633,6 +673,7 @@ Orchestrator event loop:
 - The wait tool does not sleep inside the tool call. It schedules a durable wakeup and returns immediately; after calling it, end your turn.
 - When a wait expires, Puppetmaster sends you a PUPPETMASTER WAIT OVER message.
 - After any PUPPETMASTER EVENT or PUPPETMASTER WAIT OVER message, inspect or read the relevant agent if you need more context before deciding the next action.
+- When you receive a DISCORD MESSAGE RECEIVED prompt, answer the human by calling send_human_message. Do not include Discord channel ids or transport details.
 """
     return f"""You are a Puppetmaster-managed Codex agent.
 
@@ -650,6 +691,7 @@ Puppetmaster tools:
 - Use create_agent to delegate work to child agents when that helps the task.
 - Use inspect_agent and read_agent to understand child state and recent output.
 - Use prompt_agent to send follow-up instructions to a live child agent.
+- Use send_human_message to send a concise response to the human operator when a human-facing reply is needed.
 - Use stop_agent or kill_agent only when a child should no longer continue.
 - Use wait(seconds, reason) only for a time-based wakeup. End your turn after calling wait.
 {orchestration}

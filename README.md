@@ -2,7 +2,7 @@
 
 Puppetmaster is a local supervisor for Codex agents. It starts the root orchestrator and child agents in managed tmux sessions, records durable SQLite metadata and terminal logs, exposes MCP tools for delegation, and uses Codex Stop hooks to deliver child-agent events back to the orchestrator.
 
-The v1 design is specified in [SPEC.md](SPEC.md). Implementation milestones are under [milestones](milestones).
+The v1 design is specified in [spec.md](spec.md). Implementation milestones are under [milestones](milestones).
 
 ## Safety
 
@@ -13,6 +13,8 @@ Managed Codex sessions intentionally launch with:
 ```
 
 This is powerful and dangerous. Use Puppetmaster only in local workspaces where full filesystem and command access is acceptable.
+
+If you bind Discord to Puppetmaster, the bound Discord channel becomes a remote control surface for local Codex sessions running with bypassed approvals and sandbox checks. Keep the bot token in local state, bind only trusted channels, and treat anyone who can post mention/reply prompts in that channel as able to control the local orchestrator.
 
 ## Prerequisites
 
@@ -72,6 +74,64 @@ Print the attach command without attaching:
 ```bash
 puppet agent attach <agent-id> --print
 ```
+
+## Discord Bot
+
+Configure Discord in local state:
+
+```toml
+# .puppetmaster/config.toml
+[discord]
+token = "your-discord-bot-token"
+guild_id = "123456789012345678"
+poll_interval_seconds = 1
+typing_timeout_seconds = 300
+chunk_size = 1900
+max_chunks = 3
+```
+
+`.puppetmaster/config.toml` contains the bot token and must stay local. `.puppetmaster/` is ignored by git.
+
+Start the bot after configuring the token and guild:
+
+```bash
+puppet discord serve
+```
+
+Start a root orchestrator, then bind a Discord text channel to it:
+
+```bash
+puppet orchestrator start \
+  --cwd /home/kek/Projects/puppetmaster \
+  --prompt "You are the root orchestrator. Reply to Discord prompts with send_human_message."
+```
+
+In Discord:
+
+```text
+/puppet agents
+/puppet bind agent_id:<root-agent-id>
+/puppet status
+```
+
+Slash commands:
+
+```text
+/puppet agents
+/puppet bind agent_id:<root-agent-id>
+/puppet unbind
+/puppet status
+/puppet read lines:<optional>
+/puppet tree
+```
+
+After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Attachments are ignored in v1.
+
+When an orchestrator or child calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound replies are chunked to fit Discord limits.
+
+Bindings and outbound messages are durable in SQLite. On restart, existing channel bindings still work, pending outbound messages are delivered once, and delivered or failed rows are not resent. Typing indicators are best-effort in-memory state and are reset by a bot restart.
+
+After an inbound prompt is delivered, the bot shows typing while the orchestrator is working. Typing stops when `send_human_message` is delivered, the root turn stops, or `typing_timeout_seconds` expires.
 
 Open the terminal UI to navigate the agent tree, view stats, and preview the selected agent's live tmux pane or saved log:
 
@@ -140,6 +200,7 @@ pause_agent
 resume_agent
 attach_agent
 wait
+send_human_message
 ```
 
 `create_agent` can start a child in goal mode with `goal: true`. `goal` is an optional boolean; when true, Puppetmaster prepends literal `/goal ` to the start of the child agent's initial `prompt`. It does nothing else. `create_agent` always requires an explicit absolute `cwd` and a `prompt`; v1 does not default to the caller's cwd and does not create worktrees.

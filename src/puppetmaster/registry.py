@@ -78,6 +78,32 @@ create table if not exists scheduled_wakeups(
 );
 create index if not exists scheduled_wakeups_due_idx
 on scheduled_wakeups(status, wake_at);
+create table if not exists discord_channel_bindings(
+  channel_id text primary key,
+  root_agent_id text not null,
+  guild_id text,
+  created_at text not null,
+  updated_at text not null
+);
+create unique index if not exists discord_channel_bindings_root_agent_id_idx
+on discord_channel_bindings(root_agent_id);
+create table if not exists outbound_human_messages(
+  id text primary key,
+  root_agent_id text not null,
+  agent_id text not null,
+  transport text not null check(transport in ('discord')),
+  channel_id text not null,
+  status text not null check(status in ('pending','delivered','failed')),
+  message text not null,
+  created_at text not null,
+  delivered_at text,
+  failed_at text,
+  error text
+);
+create index if not exists outbound_human_messages_transport_status_created_at_idx
+on outbound_human_messages(transport, status, created_at);
+create index if not exists outbound_human_messages_root_status_created_at_idx
+on outbound_human_messages(root_agent_id, status, created_at);
 """
 
 
@@ -448,6 +474,146 @@ class Registry:
             )
         return self.get_wakeup(wakeup_id)
 
+    def bind_discord_channel(
+        self,
+        channel_id: str,
+        root_agent_id: str,
+        guild_id: str | None = None,
+    ) -> dict[str, Any]:
+        ts = now()
+        binding = {
+            "channel_id": channel_id,
+            "root_agent_id": root_agent_id,
+            "guild_id": guild_id,
+            "created_at": ts,
+            "updated_at": ts,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                "delete from discord_channel_bindings where root_agent_id=? and channel_id<>?",
+                (root_agent_id, channel_id),
+            )
+            conn.execute(
+                """
+                insert into discord_channel_bindings(channel_id,root_agent_id,guild_id,created_at,updated_at)
+                values(:channel_id,:root_agent_id,:guild_id,:created_at,:updated_at)
+                on conflict(channel_id) do update set
+                  root_agent_id=excluded.root_agent_id,
+                  guild_id=excluded.guild_id,
+                  updated_at=excluded.updated_at
+                """,
+                binding,
+            )
+        found = self.discord_binding_for_channel(channel_id)
+        if not found:
+            raise PuppetError("not_found", f"discord binding not found for channel: {channel_id}")
+        return found
+
+    def unbind_discord_channel(self, channel_id: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("delete from discord_channel_bindings where channel_id=?", (channel_id,))
+        return cursor.rowcount > 0
+
+    def discord_binding_for_channel(self, channel_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("select * from discord_channel_bindings where channel_id=?", (channel_id,)).fetchone()
+        return self._discord_binding(row) if row else None
+
+    def discord_binding_for_root(self, root_agent_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "select * from discord_channel_bindings where root_agent_id=?",
+                (root_agent_id,),
+            ).fetchone()
+        return self._discord_binding(row) if row else None
+
+    def list_discord_bindings(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "select * from discord_channel_bindings order by created_at asc, channel_id asc"
+            ).fetchall()
+        return [self._discord_binding(row) for row in rows]
+
+    def enqueue_outbound_human_message(
+        self,
+        root_agent_id: str,
+        agent_id: str,
+        transport: str,
+        channel_id: str,
+        message: str,
+    ) -> dict[str, Any]:
+        if transport != "discord":
+            raise PuppetError("invalid_transport", f"unsupported outbound transport: {transport}")
+        outbound = {
+            "id": new_id("msg"),
+            "root_agent_id": root_agent_id,
+            "agent_id": agent_id,
+            "transport": transport,
+            "channel_id": channel_id,
+            "status": "pending",
+            "message": message,
+            "created_at": now(),
+            "delivered_at": None,
+            "failed_at": None,
+            "error": None,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into outbound_human_messages(
+                  id,root_agent_id,agent_id,transport,channel_id,status,message,created_at,delivered_at,failed_at,error
+                ) values(
+                  :id,:root_agent_id,:agent_id,:transport,:channel_id,:status,:message,:created_at,
+                  :delivered_at,:failed_at,:error
+                )
+                """,
+                outbound,
+            )
+        return self._get_outbound_human_message(outbound["id"])
+
+    def pending_outbound_human_messages(self, transport: str, limit: int = 20) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                select * from outbound_human_messages
+                where transport=? and status='pending'
+                order by created_at asc, rowid asc
+                limit ?
+                """,
+                (transport, int(limit)),
+            ).fetchall()
+        return [self._outbound_human_message(row) for row in rows]
+
+    def mark_outbound_human_message_delivered(self, message_id: str) -> dict[str, Any]:
+        ts = now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                update outbound_human_messages
+                set status='delivered', delivered_at=?, failed_at=null, error=null
+                where id=?
+                """,
+                (ts, message_id),
+            )
+        if cursor.rowcount != 1:
+            raise PuppetError("not_found", f"outbound human message not found: {message_id}")
+        return self._get_outbound_human_message(message_id)
+
+    def mark_outbound_human_message_failed(self, message_id: str, error: str) -> dict[str, Any]:
+        ts = now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                update outbound_human_messages
+                set status='failed', delivered_at=null, failed_at=?, error=?
+                where id=?
+                """,
+                (ts, error, message_id),
+            )
+        if cursor.rowcount != 1:
+            raise PuppetError("not_found", f"outbound human message not found: {message_id}")
+        return self._get_outbound_human_message(message_id)
+
     def children(self, agent_id: str) -> list[dict[str, Any]]:
         return self.list_agents(parent_id=agent_id)
 
@@ -505,3 +671,16 @@ class Registry:
         data = dict(row)
         data["payload"] = json_loads(data.pop("payload_json", "{}"))
         return data
+
+    def _discord_binding(self, row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def _get_outbound_human_message(self, message_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("select * from outbound_human_messages where id=?", (message_id,)).fetchone()
+        if not row:
+            raise PuppetError("not_found", f"outbound human message not found: {message_id}")
+        return self._outbound_human_message(row)
+
+    def _outbound_human_message(self, row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)

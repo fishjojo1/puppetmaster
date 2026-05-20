@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+from .errors import PuppetError
 
 
 @dataclass(frozen=True)
@@ -18,11 +21,22 @@ class Limits:
 
 
 @dataclass(frozen=True)
+class DiscordConfig:
+    token: str | None = None
+    guild_id: int | None = None
+    poll_interval_seconds: float = 1.0
+    typing_timeout_seconds: float = 300.0
+    chunk_size: int = 1900
+    max_chunks: int = 3
+
+
+@dataclass(frozen=True)
 class Config:
     repo_dir: Path
     state_dir: Path
     tmux_session_prefix: str
     limits: Limits
+    discord: DiscordConfig
     codex_no_alt_screen: bool = True
     codex_bypass_approvals_and_sandbox: bool = True
 
@@ -48,6 +62,70 @@ def _read_local_config(state_dir: Path) -> dict:
     if not config_path.exists():
         return {}
     return tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+
+def _positive_float(value: object, field: str) -> float:
+    if isinstance(value, bool):
+        raise PuppetError("invalid_config", f"discord.{field} must be positive")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PuppetError("invalid_config", f"discord.{field} must be positive") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise PuppetError("invalid_config", f"discord.{field} must be positive")
+    return parsed
+
+
+def _positive_int(value: object, field: str) -> int:
+    if isinstance(value, bool):
+        raise PuppetError("invalid_config", f"discord.{field} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise PuppetError("invalid_config", f"discord.{field} must be a positive integer") from exc
+    if str(value).strip() != str(parsed) and not isinstance(value, int):
+        raise PuppetError("invalid_config", f"discord.{field} must be a positive integer")
+    if parsed <= 0:
+        raise PuppetError("invalid_config", f"discord.{field} must be a positive integer")
+    return parsed
+
+
+def _parse_guild_id(value: object) -> int | None:
+    if value == "" or value is None:
+        return None
+    if isinstance(value, bool):
+        raise PuppetError("invalid_config", "discord.guild_id must be an integer or numeric string")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        if stripped.isdigit():
+            return int(stripped)
+    raise PuppetError("invalid_config", "discord.guild_id must be an integer or numeric string")
+
+
+def _parse_discord_config(raw: dict) -> DiscordConfig:
+    discord_raw = raw.get("discord", {})
+    if not isinstance(discord_raw, dict):
+        raise PuppetError("invalid_config", "discord config must be a table")
+    token_raw = discord_raw.get("token", "")
+    token = None if token_raw == "" else str(token_raw)
+    chunk_size = _positive_int(discord_raw.get("chunk_size", 1900), "chunk_size")
+    if chunk_size > 1900:
+        raise PuppetError("invalid_config", "discord.chunk_size must be no greater than 1900")
+    return DiscordConfig(
+        token=token,
+        guild_id=_parse_guild_id(discord_raw.get("guild_id", "")),
+        poll_interval_seconds=_positive_float(discord_raw.get("poll_interval_seconds", 1.0), "poll_interval_seconds"),
+        typing_timeout_seconds=_positive_float(
+            discord_raw.get("typing_timeout_seconds", 300.0),
+            "typing_timeout_seconds",
+        ),
+        chunk_size=chunk_size,
+        max_chunks=_positive_int(discord_raw.get("max_chunks", 3), "max_chunks"),
+    )
 
 
 def load_config() -> Config:
@@ -77,6 +155,7 @@ def load_config() -> Config:
         state_dir=state_dir,
         tmux_session_prefix=os.environ.get("PUPPETMASTER_TMUX_PREFIX", raw.get("tmux_session_prefix", "puppet_")),
         limits=limits,
+        discord=_parse_discord_config(raw),
         codex_no_alt_screen=bool(codex_raw.get("no_alt_screen", True)),
         codex_bypass_approvals_and_sandbox=bool(codex_raw.get("bypass_approvals_and_sandbox", True)),
     )
@@ -102,6 +181,29 @@ max_log_read_lines = 2000
 [codex]
 no_alt_screen = true
 bypass_approvals_and_sandbox = true
+
+[discord]
+token = ""
+guild_id = ""
+poll_interval_seconds = 1
+typing_timeout_seconds = 300
+chunk_size = 1900
+max_chunks = 3
 """,
             encoding="utf-8",
         )
+    else:
+        raw = tomllib.loads(default_config.read_text(encoding="utf-8"))
+        if "discord" not in raw:
+            with default_config.open("a", encoding="utf-8") as fh:
+                fh.write(
+                    """
+[discord]
+token = ""
+guild_id = ""
+poll_interval_seconds = 1
+typing_timeout_seconds = 300
+chunk_size = 1900
+max_chunks = 3
+"""
+                )
