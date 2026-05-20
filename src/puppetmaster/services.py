@@ -22,6 +22,7 @@ from .tmux import Tmux
 
 
 WAKEUP_REASON_MAX_LENGTH = 240
+INITIAL_PROMPT_SEND_DELAY_SECONDS = 0.5
 
 
 def agent_dir(config: Config, agent_id: str) -> Path:
@@ -621,6 +622,18 @@ def discover_codex() -> dict[str, Any]:
 
 
 def prompt_text(agent: dict[str, Any], user_prompt: str) -> str:
+    orchestration = ""
+    if agent["role"] == "orchestrator":
+        orchestration = """
+Orchestrator event loop:
+- You may create child agents with create_agent when parallel work is useful.
+- When a child completes, blocks, fails, stops, is killed, or finishes a turn, Puppetmaster queues a state-change event for you.
+- If you are only waiting for child-agent progress, do not call wait(). Simply end your turn. Puppetmaster will send you a fresh PUPPETMASTER EVENT message when a subagent changes state.
+- Call wait(seconds, reason) only when you need a time-based wakeup, such as polling after a backoff or checking something again at a specific interval.
+- The wait tool does not sleep inside the tool call. It schedules a durable wakeup and returns immediately; after calling it, end your turn.
+- When a wait expires, Puppetmaster sends you a PUPPETMASTER WAIT OVER message.
+- After any PUPPETMASTER EVENT or PUPPETMASTER WAIT OVER message, inspect or read the relevant agent if you need more context before deciding the next action.
+"""
     return f"""You are a Puppetmaster-managed Codex agent.
 
 Task:
@@ -633,9 +646,18 @@ Agent:
 - cwd: {agent['cwd']}
 - description: {agent['description']}
 
-Use Puppetmaster MCP tools for delegation and status. When the task is done, failed, or blocked,
-call complete_agent with status success, failed, or blocked and a concise summary. A human may
-attach to this tmux session at any time.
+Puppetmaster tools:
+- Use create_agent to delegate work to child agents when that helps the task.
+- Use inspect_agent and read_agent to understand child state and recent output.
+- Use prompt_agent to send follow-up instructions to a live child agent.
+- Use stop_agent or kill_agent only when a child should no longer continue.
+- Use wait(seconds, reason) only for a time-based wakeup. End your turn after calling wait.
+{orchestration}
+Completion:
+- When your assigned task is done, call complete_agent with status success and a concise summary.
+- If you cannot continue without input, call complete_agent with status blocked and explain what is needed.
+- If the task failed, call complete_agent with status failed and summarize the failure.
+- A human may attach to this tmux session at any time.
 """
 
 
@@ -811,7 +833,7 @@ export PUPPETMASTER_CONFIG_DIR={str(codex_home)!r}
 export PUPPETMASTER_ROLE={agent['role']!r}
 export PYTHONPATH={str(config.repo_dir / 'src')!r}${{PYTHONPATH:+:${{PYTHONPATH}}}}
 export CODEX_HOME={str(codex_home)!r}
-exec {codex!r} {' '.join(shlex_quote(flag) for flag in flags)} "$(cat {str(prompt_path)!r})"
+exec {codex!r} {' '.join(shlex_quote(flag) for flag in flags)}
 """,
         encoding="utf-8",
     )
@@ -875,6 +897,8 @@ def create_codex_agent(
     try:
         tmux.create_session(agent["tmux_session"], agent["cwd"], files["launch"])
         tmux.pipe_pane(agent["tmux_session"], agent["log_path"])
+        time.sleep(INITIAL_PROMPT_SEND_DELAY_SECONDS)
+        tmux.send_prompt(agent["tmux_session"], Path(files["prompt"]).read_text(encoding="utf-8"))
         updated = registry.update_agent(agent["id"], status="running", started_at=now())
         registry.append_event(agent["id"], "agent.started", "Codex agent started.", {"files": files})
         return updated

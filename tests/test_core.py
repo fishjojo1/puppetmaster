@@ -23,6 +23,7 @@ from puppetmaster.services import (
     inject_pending_prompt,
     kill_agent,
     pause_agent,
+    prompt_text,
     reconcile,
     resume_agent,
     schedule_wakeup,
@@ -336,11 +337,73 @@ def test_generated_codex_config_shape(ctx, tmp_path, monkeypatch):
     agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
     files = write_codex_files(cfg, agent, "hello", orchestrator=True)
     data = tomllib.loads(Path(files["config"]).read_text(encoding="utf-8"))
+    launch = Path(files["launch"]).read_text(encoding="utf-8")
     assert data["features"]["hooks"] is True
     state_key = f"{Path(files['config']).parent / 'hooks.json'}:stop:0:0"
     assert data["hooks"]["state"][state_key]["trusted_hash"].startswith("sha256:")
     assert data["projects"][str(tmp_path)]["trust_level"] == "trusted"
     assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_AGENT_ID"] == agent["id"]
+    assert "initial-prompt.md" not in launch
+    assert '"$(cat ' not in launch
+
+
+def test_prompt_text_explains_orchestrator_wait_and_event_loop(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+
+    root_prompt = prompt_text(root, "Coordinate the work.")
+    child_prompt = prompt_text(child, "Run the tests.")
+
+    assert "If you are only waiting for child-agent progress, do not call wait(). Simply end your turn." in root_prompt
+    assert "Call wait(seconds, reason) only when you need a time-based wakeup" in root_prompt
+    assert "Puppetmaster will send you a fresh PUPPETMASTER EVENT message" in root_prompt
+    assert "PUPPETMASTER WAIT OVER" in root_prompt
+    assert "If you are only waiting for child-agent progress" not in child_prompt
+    assert "Use wait(seconds, reason) only for a time-based wakeup." in child_prompt
+
+
+def test_create_codex_agent_launches_interactive_session_then_sends_initial_prompt(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    sleeps = []
+    monkeypatch.setattr(services.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    class FakeTmux:
+        def __init__(self):
+            self.created = []
+            self.piped = []
+            self.prompts = []
+
+        def create_session(self, session, cwd, command):
+            self.created.append((session, cwd, command))
+
+        def pipe_pane(self, session, log_path):
+            self.piped.append((session, log_path))
+
+        def send_prompt(self, session, prompt):
+            self.prompts.append((session, prompt))
+
+    fake = FakeTmux()
+
+    agent = services.create_codex_agent(
+        cfg,
+        reg,
+        fake,
+        cwd=str(tmp_path),
+        description="root",
+        prompt="Coordinate child work.",
+        role="orchestrator",
+    )
+
+    launch = Path(agent["metadata"]["generated_files"]["launch"]).read_text(encoding="utf-8")
+    assert '"$(cat ' not in launch
+    assert len(fake.created) == 1
+    assert len(fake.piped) == 1
+    assert fake.prompts[0][0] == agent["tmux_session"]
+    assert "Task:\nCoordinate child work." in fake.prompts[0][1]
+    assert "Orchestrator event loop:" in fake.prompts[0][1]
+    assert sleeps == [services.INITIAL_PROMPT_SEND_DELAY_SECONDS]
 
 
 def test_generated_codex_config_preserves_user_defaults(ctx, tmp_path, monkeypatch):
