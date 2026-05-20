@@ -113,6 +113,16 @@ puppet hook drain-events --agent-id <orchestrator-id>
 
 If events are pending, the hook returns a bounded continuation prompt beginning with `PUPPETMASTER EVENT` or `PUPPETMASTER EVENTS`.
 
+Managed agents can also schedule non-blocking wakeups:
+
+```text
+wait(seconds, reason?)
+```
+
+`wait` records a durable SQLite wakeup, returns immediately, and tells the agent to end its turn. When the timer expires, Puppetmaster queues an `agent.wait_over` event to that same agent and injects a prompt beginning with `PUPPETMASTER WAIT OVER` when the tmux session is available. Due wakeups are also reconciled by `puppet hook drain-events`, so expired timers still fire after process exits or missed helper processes.
+
+State changes from completion, Stop hooks, stop, kill, pause, resume, and status reconciliation are queued to the parent and root where applicable. Noisy nonterminal turn-stop/status events are coalesced; terminal or high-signal events such as completed, failed, blocked, killed, and stopped are not.
+
 ## MCP Tools
 
 Managed Codex sessions receive a per-agent MCP server named `puppetmaster`. V1 tools are:
@@ -129,9 +139,12 @@ kill_agent
 pause_agent
 resume_agent
 attach_agent
+wait
 ```
 
 `create_agent` can start a child in goal mode with `goal: true`. `goal` is an optional boolean; when true, Puppetmaster prepends literal `/goal ` to the start of the child agent's initial `prompt`. It does nothing else. `create_agent` always requires an explicit absolute `cwd` and a `prompt`; v1 does not default to the caller's cwd and does not create worktrees.
+
+`wait` accepts positive seconds up to `[limits].max_wait_seconds` in `.puppetmaster/config.toml` (default `3600`). It does not sleep inside the MCP call.
 
 ## State And Logs
 
@@ -168,6 +181,8 @@ puppet doctor --deep
 puppet debug tmux
 puppet debug registry --json
 puppet events pending <agent-id>
+puppet wakeup list --json
+puppet wakeup fire-due --json
 ```
 
 Human override with audit trail:

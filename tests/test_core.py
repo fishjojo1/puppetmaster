@@ -16,8 +16,17 @@ from puppetmaster.services import (
     complete_agent,
     create_agent_record,
     drain_events,
+    fire_due_wakeups,
+    fire_wakeup,
+    format_event_prompt,
     handle_stop_hook,
+    inject_pending_prompt,
+    kill_agent,
+    pause_agent,
     reconcile,
+    resume_agent,
+    schedule_wakeup,
+    stop_agent,
     write_codex_files,
 )
 from puppetmaster.tmux import Tmux
@@ -87,6 +96,193 @@ def test_drain_events_marks_delivered(ctx, tmp_path):
     result = drain_events(cfg, reg, root["id"])
     assert result["decision"] == "block"
     assert "PUPPETMASTER EVENT" in result["reason"]
+    assert reg.pending_deliveries(root["id"]) == []
+
+
+def test_schedule_wakeup_persists_and_spawns_helper(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    calls = []
+    sleeps = []
+    monkeypatch.setattr(services.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    def fake_popen(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Process:
+            pass
+
+        return Process()
+
+    monkeypatch.setattr(services.subprocess, "Popen", fake_popen)
+
+    wakeup = schedule_wakeup(cfg, reg, agent["id"], 30, "waiting for child agents")
+
+    assert wakeup["status"] == "scheduled"
+    assert wakeup["agent_id"] == agent["id"]
+    assert wakeup["reason"] == "waiting for child agents"
+    assert wakeup["payload"] == {"seconds": 30}
+    assert calls[0][0][-3:] == ["sleep-and-fire", "--wakeup-id", wakeup["id"]]
+    assert sleeps == []
+
+
+def test_schedule_wakeup_rejects_invalid_waits(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+
+    with pytest.raises(PuppetError) as zero:
+        schedule_wakeup(cfg, reg, agent["id"], 0, spawn_helper=False)
+    assert zero.value.code == "invalid_wait"
+
+    with pytest.raises(PuppetError) as too_large:
+        schedule_wakeup(cfg, reg, agent["id"], cfg.limits.max_wait_seconds + 1, spawn_helper=False)
+    assert too_large.value.code == "invalid_wait"
+
+
+def test_child_agent_can_schedule_wakeup(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+
+    wakeup = schedule_wakeup(cfg, reg, child["id"], 5, spawn_helper=False)
+
+    assert wakeup["agent_id"] == child["id"]
+    assert wakeup["root_id"] == root["id"]
+
+
+def test_mcp_wait_tool_schedules_for_caller_and_returns_instruction(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    caller = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, caller))
+    monkeypatch.setattr(services, "spawn_wakeup_helper", lambda config, wakeup_id: None)
+
+    result = mcp_server.wait_tool(10, "backoff")
+
+    assert result["scheduled"] is True
+    assert result["instruction"].startswith("End your turn.")
+    wakeup = reg.get_wakeup(result["wakeup_id"])
+    assert wakeup["agent_id"] == caller["id"]
+    assert wakeup["reason"] == "backoff"
+
+
+def test_fire_wakeup_marks_fired_queues_wait_over_and_is_idempotent(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    wakeup = schedule_wakeup(cfg, reg, agent["id"], 5, "poll again", spawn_helper=False)
+
+    first = fire_wakeup(cfg, reg, wakeup["id"])
+    second = fire_wakeup(cfg, reg, wakeup["id"])
+
+    assert first["fired"] is True
+    assert second["fired"] is False
+    assert reg.get_wakeup(wakeup["id"])["status"] == "fired"
+    events = reg.list_events(agent["id"], limit=10)
+    assert [event["type"] for event in events].count("agent.wait_over") == 1
+    delivery = reg.pending_deliveries(agent["id"])[0]
+    assert delivery["type"] == "agent.wait_over"
+    assert delivery["payload"]["reason"] == "poll again"
+
+
+def test_fire_due_wakeups_fires_overdue_scheduled_wakeups(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    wakeup = schedule_wakeup(cfg, reg, agent["id"], 300, spawn_helper=False)
+    with reg.connect() as conn:
+        conn.execute("update scheduled_wakeups set wake_at=? where id=?", ("2000-01-01T00:00:00Z", wakeup["id"]))
+
+    result = fire_due_wakeups(cfg, reg, agent_id=agent["id"])
+
+    assert result["count"] == 1
+    assert reg.get_wakeup(wakeup["id"])["status"] == "fired"
+
+
+def test_drain_events_fires_due_wakeup_before_delivery_lookup(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    wakeup = schedule_wakeup(cfg, reg, agent["id"], 300, "wake me", spawn_helper=False)
+    with reg.connect() as conn:
+        conn.execute("update scheduled_wakeups set wake_at=? where id=?", ("2000-01-01T00:00:00Z", wakeup["id"]))
+
+    result = drain_events(cfg, reg, agent["id"])
+
+    assert result["decision"] == "block"
+    assert "PUPPETMASTER WAIT OVER" in result["reason"]
+    assert "Wait over for agent" in result["reason"]
+    assert reg.pending_deliveries(agent["id"]) == []
+
+
+def test_format_event_prompt_renders_state_change_and_wait_over(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    complete_agent(reg, child["id"], status="blocked", summary="need input")
+
+    state_prompt = format_event_prompt(reg, reg.pending_deliveries(root["id"]), 0)
+
+    assert f"{child['id']} has new state blocked." in state_prompt
+    reg.mark_delivered([delivery["id"] for delivery in reg.pending_deliveries(root["id"])])
+
+    wakeup = schedule_wakeup(cfg, reg, root["id"], 5, "retry", spawn_helper=False)
+    fire_wakeup(cfg, reg, wakeup["id"])
+    wait_prompt = format_event_prompt(reg, reg.pending_deliveries(root["id"]), 0)
+
+    assert wait_prompt.startswith("PUPPETMASTER WAIT OVER")
+    assert "Reason: retry" in wait_prompt
+
+
+def test_stop_kill_pause_resume_queue_parent_and_root_notifications(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    parent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="parent", parent_id=root["id"])
+    children = [
+        create_agent_record(cfg, reg, cwd=str(tmp_path), description=f"child {index}", parent_id=parent["id"])
+        for index in range(4)
+    ]
+
+    class FakeTmux:
+        def stop_session(self, session):
+            pass
+
+        def kill_session(self, session):
+            pass
+
+        def session_exists(self, session):
+            return False
+
+    fake = FakeTmux()
+    stop_agent(reg, fake, children[0]["id"], config=cfg)
+    kill_agent(reg, fake, children[1]["id"], config=cfg)
+    pause_agent(reg, children[2]["id"], config=cfg, tmux=fake)
+    resume_agent(reg, children[3]["id"], config=cfg, tmux=fake)
+
+    parent_types = [delivery["type"] for delivery in reg.pending_deliveries(parent["id"])]
+    root_types = [delivery["type"] for delivery in reg.pending_deliveries(root["id"])]
+    for event_type in ("agent.stopped", "agent.killed", "agent.paused", "agent.resumed"):
+        assert event_type in parent_types
+        assert event_type in root_types
+
+
+def test_inject_pending_prompt_does_not_require_idle_status(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    reg.update_agent(root["id"], status="running")
+    complete_agent(reg, child["id"], status="success", summary="done")
+
+    class FakeTmux:
+        prompts = []
+
+        def session_exists(self, session):
+            return True
+
+        def send_prompt(self, session, prompt):
+            self.prompts.append((session, prompt))
+
+    fake = FakeTmux()
+
+    assert inject_pending_prompt(cfg, reg, fake, root["id"]) is True
+    assert fake.prompts[0][0] == root["tmux_session"]
+    assert "PUPPETMASTER EVENT" in fake.prompts[0][1]
     assert reg.pending_deliveries(root["id"]) == []
 
 

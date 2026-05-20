@@ -432,10 +432,12 @@ class Registry:
                 raise PuppetError("not_found", f"wakeup not found: {wakeup_id}")
             if row["status"] != "scheduled":
                 return None
-            conn.execute(
+            cursor = conn.execute(
                 "update scheduled_wakeups set status='fired', fired_at=? where id=? and status='scheduled'",
                 (ts, wakeup_id),
             )
+            if cursor.rowcount != 1:
+                return None
         return self.get_wakeup(wakeup_id)
 
     def cancel_wakeup(self, wakeup_id: str) -> dict[str, Any]:

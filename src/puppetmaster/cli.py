@@ -540,7 +540,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_w.add_argument("--status", choices=["scheduled", "fired", "cancelled"])
     add_json(list_w)
     list_w.set_defaults(func=cmd_wakeup_list)
-    sleep_fire = w.add_parser("sleep-and-fire", help=argparse.SUPPRESS)
+    sleep_fire = w.add_parser("sleep-and-fire", help="Internal helper used by scheduled wakeups.")
     sleep_fire.add_argument("--wakeup-id", required=True)
     sleep_fire.set_defaults(func=cmd_wakeup_sleep_and_fire)
 
