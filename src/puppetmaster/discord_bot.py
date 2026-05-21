@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import logging
 import re
 import time
@@ -14,6 +15,7 @@ from .logging import log as supervisor_log
 from .model import now
 from .registry import Registry
 from .services import prompt_agent, read_agent
+from .terminal_image import render_terminal_png
 from .tmux import Tmux
 
 try:  # pragma: no cover - exercised through CLI-friendly import handling.
@@ -47,13 +49,13 @@ def validate_discord_config(config: Config | DiscordConfig) -> DiscordConfig:
         raise PuppetError(
             "discord_token_required",
             "discord.token is required.",
-            "Set discord.token in .puppetmaster/config.toml.",
+            "Set discord.token in ~/.puppetmaster/config.toml or set PUPPETMASTER_STATE_DIR for isolated state.",
         )
     if discord_config.guild_id is None:
         raise PuppetError(
             "discord_guild_required",
             "discord.guild_id is required.",
-            "Set discord.guild_id in .puppetmaster/config.toml.",
+            "Set discord.guild_id in ~/.puppetmaster/config.toml or set PUPPETMASTER_STATE_DIR for isolated state.",
         )
     return discord_config
 
@@ -152,6 +154,30 @@ class TypingState:
     task: asyncio.Task[None] | None = None
 
 
+@dataclass
+class ScreenshotResult:
+    root_agent_id: str
+    filename: str
+    png: bytes
+
+
+@dataclass
+class CompactResult:
+    root_agent_id: str
+    channel_id: str
+    requested_at: str
+    turn_stop_count: int
+
+
+@dataclass
+class CompactState:
+    root_agent_id: str
+    channel_id: str
+    channel: Any
+    requested_at: str
+    turn_stop_count: int
+
+
 def _user_id(user: Any) -> str | None:
     user_id = getattr(user, "id", None)
     return str(user_id) if user_id is not None else None
@@ -228,6 +254,7 @@ class DiscordRuntime:
         self.bot = bot
         self.prompt_func = prompt_func
         self.active_typing: dict[str, TypingState] = {}
+        self.active_compactions: dict[str, CompactState] = {}
         self._poll_task: asyncio.Task[None] | None = None
 
     def _log(self, level: str, event: str, message: str, **fields: Any) -> None:
@@ -452,9 +479,44 @@ class DiscordRuntime:
             if stopped_at is not None and stopped_at > state.prompt_delivered_at:
                 self.stop_typing(root_agent_id)
 
+    def request_compact(self, channel: Any) -> str:
+        result = handle_compact_command(self.registry, self.tmux, channel)
+        self.active_compactions[result.root_agent_id] = CompactState(
+            root_agent_id=result.root_agent_id,
+            channel_id=result.channel_id,
+            channel=channel,
+            requested_at=result.requested_at,
+            turn_stop_count=result.turn_stop_count,
+        )
+        self._log(
+            "info",
+            "discord.compact.requested",
+            "Discord compact command delivered to root orchestrator.",
+            root_agent_id=result.root_agent_id,
+            channel_id=result.channel_id,
+        )
+        return f"Sent /compact to {result.root_agent_id}. I will post an update when that turn stops."
+
+    async def dispatch_completed_compactions_once(self) -> None:
+        for root_agent_id, state in list(self.active_compactions.items()):
+            turn_stop_count = self.registry.count_events(root_agent_id, "agent.turn_stopped")
+            if turn_stop_count <= state.turn_stop_count:
+                continue
+            await send_plain_chunks(state.channel, f"Compact completed for {root_agent_id}.", self.config)
+            self.active_compactions.pop(root_agent_id, None)
+            self.stop_typing(root_agent_id)
+            self._log(
+                "info",
+                "discord.compact.completed",
+                "Discord compact command completed after root turn stopped.",
+                root_agent_id=root_agent_id,
+                channel_id=state.channel_id,
+            )
+
     async def poll_once(self) -> None:
         await self.dispatch_pending_outbound_once()
         self.stop_typing_for_turn_stops()
+        await self.dispatch_completed_compactions_once()
         self.stop_expired_typing()
 
     def start(self) -> None:
@@ -601,6 +663,41 @@ def handle_read_command(config: Config, registry: Registry, tmux: Tmux, channel:
     return output or "(no output)"
 
 
+def handle_screenshot_command(registry: Registry, tmux: Tmux, channel: Any) -> ScreenshotResult:
+    root = _require_bound_root(registry, channel)
+    if not tmux.session_exists(root["tmux_session"]):
+        raise PuppetError(
+            "tmux_missing_session",
+            f"tmux session is not live for bound root: {root['id']}",
+            "Start or reconcile the root orchestrator before taking a screenshot.",
+        )
+    pane_text = tmux.capture_visible_pane(root["tmux_session"])
+    return ScreenshotResult(
+        root_agent_id=root["id"],
+        filename=f"puppet-{root['id']}-screenshot.png",
+        png=render_terminal_png(pane_text),
+    )
+
+
+def handle_compact_command(registry: Registry, tmux: Tmux, channel: Any) -> CompactResult:
+    channel_id, _guild_id = _text_channel_ids(channel)
+    root = _require_bound_root(registry, channel)
+    if not tmux.session_exists(root["tmux_session"]):
+        raise PuppetError(
+            "tmux_missing_session",
+            f"tmux session is not live for bound root: {root['id']}",
+            "Start or reconcile the root orchestrator before compacting.",
+        )
+    turn_stop_count = registry.count_events(root["id"], "agent.turn_stopped")
+    tmux.send_prompt(root["tmux_session"], "/compact")
+    return CompactResult(
+        root_agent_id=root["id"],
+        channel_id=channel_id,
+        requested_at=now(),
+        turn_stop_count=turn_stop_count,
+    )
+
+
 def handle_tree_command(registry: Registry, channel: Any) -> str:
     root = _require_bound_root(registry, channel)
     agents = registry.list_agents(root_id=root["id"])
@@ -639,6 +736,20 @@ async def _run_interaction_command(
     await send_interaction_chunks(interaction, text, config)
 
 
+async def _run_screenshot_interaction(interaction: Any, config: Config, registry: Registry, tmux: Tmux) -> None:
+    try:
+        screenshot = handle_screenshot_command(registry, tmux, interaction.channel)
+    except PuppetError as exc:
+        await send_interaction_chunks(interaction, format_error(exc), config)
+        return
+    file = discord.File(io.BytesIO(screenshot.png), filename=screenshot.filename)
+    content = f"Terminal pane snapshot for {screenshot.root_agent_id}."
+    if interaction.response.is_done():
+        await interaction.followup.send(content=content, file=file)
+    else:
+        await interaction.response.send_message(content=content, file=file)
+
+
 def _require_discord_dependency() -> None:
     if discord is None or app_commands is None or commands is None:
         raise PuppetError(
@@ -646,6 +757,41 @@ def _require_discord_dependency() -> None:
             "discord.py is not installed.",
             "Install project dependencies with `uv sync` and retry.",
         )
+
+
+def _raise_discord_command_sync_error(exc: Exception, guild_id: int) -> None:
+    status = getattr(exc, "status", None)
+    code = getattr(exc, "code", None)
+    text = getattr(exc, "text", None)
+    detail = f"Discord rejected slash command sync for guild {guild_id}"
+    if status is not None or code is not None:
+        detail += f" (status={status or 'unknown'}, code={code or 'unknown'})"
+    if text:
+        detail += f": {text}"
+    else:
+        detail += "."
+
+    if status == 403 and code == 50001:
+        raise PuppetError(
+            "discord_guild_access_denied",
+            detail,
+            "Check discord.guild_id and re-invite the bot to that server with the bot and applications.commands scopes.",
+        ) from exc
+
+    raise PuppetError(
+        "discord_command_sync_failed",
+        detail,
+        "Check the Discord bot token, configured guild id, and bot application permissions.",
+    ) from exc
+
+
+async def _sync_discord_commands(bot: Any, guild: Any, guild_id: int) -> list[Any]:
+    try:
+        return await bot.tree.sync(guild=guild)
+    except Exception as exc:
+        if discord is not None and isinstance(exc, discord.HTTPException):
+            _raise_discord_command_sync_error(exc, guild_id)
+        raise
 
 
 def build_discord_bot(config: Config | None = None, registry: Registry | None = None, tmux: Tmux | None = None) -> Any:
@@ -688,10 +834,18 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
     async def tree(interaction: discord.Interaction) -> None:
         await _run_interaction_command(interaction, cfg, handle_tree_command, reg, interaction.channel)
 
+    @group.command(name="screenshot", description="Send a PNG snapshot of the bound root terminal pane.")
+    async def screenshot(interaction: discord.Interaction) -> None:
+        await _run_screenshot_interaction(interaction, cfg, reg, tmux_client)
+
+    @group.command(name="compact", description="Compact the bound root orchestrator context.")
+    async def compact(interaction: discord.Interaction) -> None:
+        await _run_interaction_command(interaction, cfg, runtime.request_compact, interaction.channel)
+
     @bot.event
     async def setup_hook() -> None:
         bot.tree.add_command(group, guild=guild)
-        synced = await bot.tree.sync(guild=guild)
+        synced = await _sync_discord_commands(bot, guild, discord_config.guild_id)
         LOGGER.info(
             "Synced %s Discord slash command group(s) to guild %s.",
             len(synced),

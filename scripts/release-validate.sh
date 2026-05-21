@@ -30,11 +30,17 @@ PUPPETMASTER_STATE_DIR="$doctor_state_dir" PYTHONPATH="$repo/src" python3 -m pup
 
 discord_state_dir="$(mktemp -d)"
 echo "Running non-network Discord config and registry checks."
+PUPPETMASTER_STATE_DIR="$discord_state_dir" PYTHONPATH="$repo/src" python3 -m puppetmaster.cli init --no-input --json
+PUPPETMASTER_STATE_DIR="$discord_state_dir" PYTHONPATH="$repo/src" python3 -m puppetmaster.cli discord status --json
 PUPPETMASTER_STATE_DIR="$discord_state_dir" PYTHONPATH="$repo/src" python3 - <<'PY'
+from pathlib import Path
+import tempfile
+
 from puppetmaster.config import load_config
 from puppetmaster.discord_bot import validate_discord_config
 from puppetmaster.errors import PuppetError
 from puppetmaster.registry import Registry
+from puppetmaster.services import create_agent_record
 
 cfg = load_config()
 reg = Registry(cfg)
@@ -54,7 +60,19 @@ except PuppetError as exc:
     assert ".puppetmaster/config.toml" in (exc.hint or "")
 else:
     raise AssertionError("default Discord config unexpectedly validated without a token")
-print("Discord config loads and schema initializes; live puppet discord serve is intentionally skipped.")
+with tempfile.TemporaryDirectory() as tmp:
+    project_a = Path(tmp) / "project-a"
+    project_b = Path(tmp) / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    root_a = create_agent_record(cfg, reg, cwd=str(project_a), description="root A", role="orchestrator")
+    root_b = create_agent_record(cfg, reg, cwd=str(project_b), description="root B", role="orchestrator")
+    assert root_a["id"] != root_b["id"]
+    assert root_a["root_id"] == root_a["id"]
+    assert root_b["root_id"] == root_b["id"]
+    assert root_a["cwd"] == str(project_a)
+    assert root_b["cwd"] == str(project_b)
+print("Discord config/schema and two-root registry checks passed; live puppet discord serve is intentionally skipped.")
 PY
 
 state_dir="$(mktemp -d)"

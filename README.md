@@ -25,6 +25,24 @@ If you bind Discord to Puppetmaster, the bound Discord channel becomes a remote 
 
 ## Setup
 
+Install Puppetmaster once as a global local tool:
+
+```bash
+uv tool install /path/to/pupptermaster
+```
+
+If you prefer pipx:
+
+```bash
+pipx install /path/to/pupptermaster
+```
+
+Then initialize the shared state directory:
+
+```bash
+puppet init
+```
+
 For development from this repository:
 
 ```bash
@@ -44,12 +62,34 @@ The executable name is `puppet`. A repository-local `./puppet` wrapper is also p
 
 ## Quickstart
 
-Start a root orchestrator:
+Start root orchestrators from any directory. By default they share the global registry in `~/.puppetmaster`:
 
 ```bash
 puppet orchestrator start \
-  --cwd /home/kek/Projects/pupptermaster \
-  --prompt "You are the root Puppetmaster orchestrator. Create child agents only when asked."
+  --cwd /home/kek/Projects/project-a \
+  --prompt "Manage project A."
+
+puppet orchestrator start \
+  --cwd /home/kek/Projects/project-b \
+  --prompt "Manage project B."
+```
+
+You can choose a predictable id for a root orchestrator:
+
+```bash
+puppet orchestrator start \
+  --agent-id project-a \
+  --cwd /home/kek/Projects/project-a \
+  --prompt "Manage project A."
+```
+
+Custom root ids must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` and must not contain `..`. Duplicate ids, existing agent directories, and existing derived tmux sessions are rejected before Puppetmaster creates the root. When `--agent-id` is omitted, Puppetmaster keeps generating `agt_...` ids.
+
+When you run from the project directory, `--cwd` is optional and defaults to the current directory:
+
+```bash
+cd /home/kek/Projects/project-a
+puppet orchestrator start --prompt "Manage this project."
 ```
 
 List and inspect agents:
@@ -77,10 +117,27 @@ puppet agent attach <agent-id> --print
 
 ## Discord Bot
 
-Configure Discord in local state:
+Create or update global state:
+
+```bash
+puppet init
+```
+
+For scripted setup, pass values without prompting:
+
+```bash
+puppet init \
+  --discord-token "$DISCORD_BOT_TOKEN" \
+  --discord-guild-id 123456789012345678 \
+  --no-input
+```
+
+`puppet init --start-discord` writes config first, then starts the same background bot used by `puppet discord serve --background`. Command output reports whether a token is configured, but never prints the token.
+
+Discord config is stored in global state:
 
 ```toml
-# .puppetmaster/config.toml
+# ~/.puppetmaster/config.toml
 [discord]
 token = "your-discord-bot-token"
 guild_id = "123456789012345678"
@@ -90,29 +147,42 @@ chunk_size = 1900
 max_chunks = 3
 ```
 
-`.puppetmaster/config.toml` contains the bot token and must stay local. `.puppetmaster/` is ignored by git.
+`~/.puppetmaster/config.toml` contains the bot token and must stay local.
 
-Start the bot after configuring the token and guild:
+One background bot serves the active state directory. Start it once after configuring the token and guild:
 
 ```bash
-puppet discord serve
+puppet discord serve --background
+puppet discord status
+puppet discord stop
 ```
 
-Start a root orchestrator, then bind a Discord text channel to it:
+For foreground debugging, use `puppet discord serve`.
+
+Start one or more root orchestrators, then bind each Discord text channel to the root it should control:
 
 ```bash
 puppet orchestrator start \
-  --cwd /home/kek/Projects/puppetmaster \
-  --prompt "You are the root orchestrator. Reply to Discord prompts with send_human_message."
+  --agent-id project-a \
+  --cwd /home/kek/Projects/project-a \
+  --prompt "You are the project A orchestrator. Reply to Discord prompts with send_human_message."
+
+puppet orchestrator start \
+  --agent-id project-b \
+  --cwd /home/kek/Projects/project-b \
+  --prompt "You are the project B orchestrator. Reply to Discord prompts with send_human_message."
 ```
 
 In Discord:
 
 ```text
 /puppet agents
-/puppet bind agent_id:<root-agent-id>
+/puppet bind agent_id:project-a
 /puppet status
+/puppet screenshot
 ```
+
+For multi-project use, bind channel A to the project A root and channel B to the project B root. Custom root ids make these bindings stable and easy to type. A channel can have one active root binding, and a root can have one active channel binding. Rebinding a channel changes that channel only; rebinding a root moves that root from its previous channel.
 
 Slash commands:
 
@@ -123,9 +193,12 @@ Slash commands:
 /puppet status
 /puppet read lines:<optional>
 /puppet tree
+/puppet screenshot
 ```
 
 After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Attachments are ignored in v1.
+
+`/puppet screenshot` captures the bound root orchestrator's current tmux pane, renders the visible terminal text as a PNG, and posts it as an attachment. This is not a GUI screenshot and does not process user-uploaded images. ANSI color fidelity and cursor rendering are intentionally limited in the current renderer.
 
 When an orchestrator or child calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound replies are chunked to fit Discord limits.
 
@@ -205,26 +278,51 @@ send_human_message
 
 `create_agent` can start a child in goal mode with `goal: true`. `goal` is an optional boolean; when true, Puppetmaster prepends literal `/goal ` to the start of the child agent's initial `prompt`. It does nothing else. `create_agent` always requires an explicit absolute `cwd` and a `prompt`; v1 does not default to the caller's cwd and does not create worktrees.
 
-`wait` accepts positive seconds up to `[limits].max_wait_seconds` in `.puppetmaster/config.toml` (default `3600`). It does not sleep inside the MCP call.
+`wait` accepts positive seconds up to `[limits].max_wait_seconds` in `~/.puppetmaster/config.toml` (default `3600`). It does not sleep inside the MCP call.
 
 ## State And Logs
 
-By default Puppetmaster writes state in `.puppetmaster/`:
+By default Puppetmaster writes state in `~/.puppetmaster/`:
 
 ```text
-.puppetmaster/config.toml
-.puppetmaster/registry.sqlite
-.puppetmaster/puppetmaster.log.jsonl
-.puppetmaster/agents/<agent-id>/initial-prompt.md
-.puppetmaster/agents/<agent-id>/terminal.log
-.puppetmaster/agents/<agent-id>/events.jsonl
-.puppetmaster/agents/<agent-id>/launch.sh
-.puppetmaster/agents/<agent-id>/codex-config/
+~/.puppetmaster/config.toml
+~/.puppetmaster/registry.sqlite
+~/.puppetmaster/puppetmaster.log.jsonl
+~/.puppetmaster/discord-bot.pid
+~/.puppetmaster/discord-bot.log
+~/.puppetmaster/agents/<agent-id>/initial-prompt.md
+~/.puppetmaster/agents/<agent-id>/terminal.log
+~/.puppetmaster/agents/<agent-id>/events.jsonl
+~/.puppetmaster/agents/<agent-id>/launch.sh
+~/.puppetmaster/agents/<agent-id>/codex-config/
 ```
 
 Each generated `codex-config/config.toml` starts from `~/.codex/config.toml` and overlays the per-agent hooks, project trust, and Puppetmaster MCP server settings. `CODEX_HOME` is still per-agent so Puppetmaster can avoid mutating your global Codex config while giving each managed session its own hook trust and runtime state.
 
-Override the state directory with `PUPPETMASTER_STATE_DIR`.
+Override the state directory with `PUPPETMASTER_STATE_DIR` when you want an isolated registry, config, logs, and Discord PID file:
+
+```bash
+PUPPETMASTER_STATE_DIR="$(mktemp -d)" puppet init --no-input
+PUPPETMASTER_STATE_DIR=/tmp/puppetmaster-test puppet discord status
+```
+
+This is useful for tests and experiments because a bot started with one state directory does not share registry rows, channel bindings, PID files, or logs with another state directory.
+
+Existing project-local `.puppetmaster/` directories are not migrated automatically. New default commands use `~/.puppetmaster`, while old local state remains untouched. To inspect an old project-local state directory temporarily:
+
+```bash
+PUPPETMASTER_STATE_DIR=/path/to/project/.puppetmaster puppet agent list
+```
+
+Manual migration is intentionally explicit:
+
+1. Install Puppetmaster globally.
+2. Run `puppet init`.
+3. Copy any needed Discord config values from the old project-local config.
+4. Restart the Discord bot from the global state.
+5. Recreate or rebind active orchestrators as needed.
+
+Automatic migration is not provided because merging registries, tmux sessions, process state, and Discord bindings can create ambiguous ownership.
 
 ## Recovery
 

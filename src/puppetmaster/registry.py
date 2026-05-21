@@ -643,6 +643,14 @@ class Registry:
             ).fetchone()
         return row["created_at"] if row else None
 
+    def count_events(self, agent_id: str, event_type: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "select count(*) c from events where agent_id=? and type=?",
+                (agent_id, event_type),
+            ).fetchone()
+        return int(row["c"])
+
     def _append_agent_event_file(self, agent: dict[str, Any], event: dict[str, Any]) -> None:
         path = agent.get("events_path")
         if not path:

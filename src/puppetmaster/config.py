@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
 import tomllib
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .errors import PuppetError
+
+DEFAULT_STATE_DIR = Path("~/.puppetmaster")
+_TOML_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 @dataclass(frozen=True)
@@ -57,11 +64,134 @@ def _repo_dir() -> Path:
     return Path.cwd().resolve()
 
 
+def default_state_dir() -> Path:
+    return DEFAULT_STATE_DIR.expanduser().resolve()
+
+
+def inherited_pythonpath() -> str | None:
+    raw = os.environ.get("PYTHONPATH")
+    if raw is None:
+        return None
+    base = Path.cwd()
+    entries = []
+    for entry in raw.split(os.pathsep):
+        if not entry:
+            entries.append(entry)
+            continue
+        path = Path(entry).expanduser()
+        if not path.is_absolute():
+            path = (base / path).resolve()
+        entries.append(str(path))
+    return os.pathsep.join(entries)
+
+
+def puppetmaster_subprocess_env(config: "Config") -> dict[str, str]:
+    env = os.environ.copy()
+    env["PUPPETMASTER_STATE_DIR"] = str(config.state_dir)
+    pythonpath = inherited_pythonpath()
+    if pythonpath is not None:
+        env["PYTHONPATH"] = pythonpath
+    return env
+
+
 def _read_local_config(state_dir: Path) -> dict:
     config_path = state_dir / "config.toml"
     if not config_path.exists():
         return {}
     return tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+
+def default_config_data() -> dict[str, Any]:
+    return {
+        "limits": {
+            "max_depth": 3,
+            "max_concurrent_children_per_agent": 5,
+            "max_total_agents": 30,
+            "max_event_prompt_events": 5,
+            "max_wait_seconds": 3600,
+            "default_log_lines": 120,
+            "max_log_read_lines": 2000,
+        },
+        "codex": {
+            "no_alt_screen": True,
+            "bypass_approvals_and_sandbox": True,
+        },
+        "discord": {
+            "token": "",
+            "guild_id": "",
+            "poll_interval_seconds": 1,
+            "typing_timeout_seconds": 300,
+            "chunk_size": 1900,
+            "max_chunks": 3,
+        },
+    }
+
+
+def _deep_merge_config_defaults(defaults: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(defaults)
+    for key, value in existing.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_config_defaults(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _toml_key(key: str) -> str:
+    if _TOML_BARE_KEY.match(key):
+        return key
+    return json.dumps(key)
+
+
+def _toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        items = ", ".join(f"{_toml_key(str(key))} = {_toml_value(item)}" for key, item in value.items())
+        return "{ " + items + " }"
+    return json.dumps(str(value))
+
+
+def _toml_table_path(parts: list[str]) -> str:
+    return ".".join(_toml_key(part) for part in parts)
+
+
+def _config_toml_dumps(data: dict[str, Any]) -> str:
+    lines: list[str] = []
+
+    def scalar_items(table: dict[str, Any]) -> list[tuple[str, Any]]:
+        return [(key, value) for key, value in table.items() if not isinstance(value, dict)]
+
+    def child_items(table: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+        return [(key, value) for key, value in table.items() if isinstance(value, dict)]
+
+    for key, value in scalar_items(data):
+        lines.append(f"{_toml_key(str(key))} = {_toml_value(value)}")
+    if lines:
+        lines.append("")
+
+    def emit_table(path: list[str], table: dict[str, Any]) -> None:
+        scalars = scalar_items(table)
+        children = child_items(table)
+        if scalars or not children:
+            lines.append(f"[{_toml_table_path(path)}]")
+            for key, value in scalars:
+                lines.append(f"{_toml_key(str(key))} = {_toml_value(value)}")
+            lines.append("")
+        for key, value in children:
+            emit_table([*path, str(key)], value)
+
+    for key, value in child_items(data):
+        emit_table([str(key)], value)
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _positive_float(value: object, field: str) -> float:
@@ -128,9 +258,31 @@ def _parse_discord_config(raw: dict) -> DiscordConfig:
     )
 
 
+def write_init_config(discord_token: str | None = None, discord_guild_id: str | None = None) -> Config:
+    state_dir = Path(os.environ.get("PUPPETMASTER_STATE_DIR", default_state_dir())).expanduser().resolve()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    raw = _read_local_config(state_dir)
+    data = _deep_merge_config_defaults(default_config_data(), raw)
+
+    for section in ("limits", "codex", "discord"):
+        if not isinstance(data.get(section), dict):
+            raise PuppetError("invalid_config", f"{section} config must be a table")
+
+    discord_data = data["discord"]
+    if discord_token is not None:
+        discord_data["token"] = discord_token
+    if discord_guild_id is not None:
+        parsed_guild_id = _parse_guild_id(discord_guild_id)
+        discord_data["guild_id"] = "" if parsed_guild_id is None else str(parsed_guild_id)
+
+    _parse_discord_config(data)
+    (state_dir / "config.toml").write_text(_config_toml_dumps(data), encoding="utf-8")
+    return load_config()
+
+
 def load_config() -> Config:
     repo = _repo_dir()
-    state_dir = Path(os.environ.get("PUPPETMASTER_STATE_DIR", repo / ".puppetmaster")).expanduser().resolve()
+    state_dir = Path(os.environ.get("PUPPETMASTER_STATE_DIR", default_state_dir())).expanduser().resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
     raw = _read_local_config(state_dir)
     limit_raw = raw.get("limits", {})

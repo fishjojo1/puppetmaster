@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
-from .config import load_config
+from .config import load_config, puppetmaster_subprocess_env, write_init_config
 from .errors import PuppetError
 from .registry import Registry
 from .services import (
@@ -33,6 +37,9 @@ from .services import (
     stop_agent,
 )
 from .tmux import Tmux
+
+DISCORD_PID_FILE = "discord-bot.pid"
+DISCORD_LOG_FILE = "discord-bot.log"
 
 
 def build_context():
@@ -107,6 +114,90 @@ def read_prompt(args: argparse.Namespace) -> str:
 
 def add_json(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Render machine-readable JSON.")
+
+
+def _input_or_none(prompt: str) -> str | None:
+    value = input(prompt).strip()
+    return value if value else None
+
+
+def _yes(prompt: str) -> bool:
+    return input(prompt).strip().lower() in {"y", "yes"}
+
+
+def _init_result(cfg, *, started_discord: bool, discord_status: dict[str, Any] | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "state_dir": str(cfg.state_dir),
+        "config_path": str(cfg.state_dir / "config.toml"),
+        "discord_token_configured": bool(cfg.discord.token),
+        "discord_guild_id": cfg.discord.guild_id,
+        "started_discord": started_discord,
+    }
+    if discord_status:
+        result["discord"] = discord_status
+    return result
+
+
+def _render_init_result(result: dict[str, Any]) -> str:
+    token_status = "configured" if result["discord_token_configured"] else "not configured"
+    guild = result["discord_guild_id"]
+    guild_status = str(guild) if guild is not None else "not configured"
+    rows = [
+        f"Puppetmaster home: {result['state_dir']}",
+        f"Config: {result['config_path']}",
+        f"Discord token: {token_status}",
+        f"Discord guild: {guild_status}",
+    ]
+    discord_status = result.get("discord")
+    if discord_status:
+        if discord_status.get("already_running"):
+            rows.append(f"Discord bot: already running pid {discord_status['pid']}")
+        elif result["started_discord"]:
+            rows.append(f"Discord bot: started pid {discord_status['pid']}")
+        rows.append(f"Discord log: {discord_status['log_path']}")
+    elif not result["started_discord"]:
+        rows.append("Discord bot: not started")
+    rows.append("")
+    rows.append("Next: puppet discord serve --background")
+    return "\n".join(rows)
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    existing_cfg = load_config()
+    discord_token = args.discord_token
+    discord_guild_id = args.discord_guild_id
+    start_discord = args.start_discord
+
+    if not args.no_input:
+        print(f"Puppetmaster home: {existing_cfg.state_dir}")
+        print()
+        if discord_token is None:
+            token_prompt = "Discord bot token [hidden, leave blank to keep existing]: "
+            discord_token = getpass.getpass(token_prompt) or None
+        if discord_guild_id is None:
+            discord_guild_id = _input_or_none("Discord guild ID [leave blank to keep existing]: ")
+        if not start_discord:
+            start_discord = _yes("Start Discord bot in background now? [y/N]: ")
+
+    cfg = write_init_config(discord_token=discord_token, discord_guild_id=discord_guild_id)
+    discord_status = None
+    started_discord = False
+    if start_discord:
+        status = discord_background_status(cfg)
+        if status["running"]:
+            discord_status = {**status, "already_running": True}
+        else:
+            if status.get("stale_pid_file"):
+                _discord_pid_path(cfg).unlink(missing_ok=True)
+            discord_status = start_discord_background_process(cfg)
+            started_discord = True
+
+    result = _init_result(cfg, started_discord=started_discord, discord_status=discord_status)
+    if args.json:
+        emit(result, True)
+    else:
+        print(_render_init_result(result))
+    return 0
 
 
 def cmd_agent_create(args: argparse.Namespace) -> int:
@@ -288,7 +379,17 @@ def cmd_agent_cleanup_completed(args: argparse.Namespace) -> int:
 
 def cmd_orchestrator_start(args: argparse.Namespace) -> int:
     cfg, reg, tmux = build_context()
-    agent = start_orchestrator(cfg, reg, tmux, cwd=args.cwd, prompt=read_prompt(args), name=args.name, new_root=args.new_root)
+    cwd = args.cwd or str(Path.cwd())
+    agent = start_orchestrator(
+        cfg,
+        reg,
+        tmux,
+        cwd=cwd,
+        prompt=read_prompt(args),
+        name=args.name,
+        new_root=args.new_root,
+        agent_id=args.agent_id,
+    )
     emit({"agent": agent, "attach_command": tmux.attach_command(agent["tmux_session"])}, args.json)
     return 0
 
@@ -385,7 +486,108 @@ def cmd_mcp_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _discord_pid_path(cfg) -> Path:
+    return cfg.state_dir / DISCORD_PID_FILE
+
+
+def _discord_log_path(cfg) -> Path:
+    return cfg.state_dir / DISCORD_LOG_FILE
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_matches_discord_process(pid: int) -> bool:
+    cmdline_path = Path("/proc") / str(pid) / "cmdline"
+    if not cmdline_path.exists():
+        return True
+    try:
+        raw = cmdline_path.read_bytes()
+    except OSError:
+        return False
+    parts = [part.decode(errors="ignore") for part in raw.split(b"\0") if part]
+    if not parts:
+        return False
+    joined = " ".join(parts)
+    return "puppetmaster.cli" in joined and "discord" in parts and "serve" in parts
+
+
+def discord_background_status(cfg) -> dict[str, Any]:
+    pid_path = _discord_pid_path(cfg)
+    log_path = _discord_log_path(cfg)
+    pid = _read_pid(pid_path)
+    if pid is None:
+        return {"running": False, "pid": None, "pid_file": str(pid_path), "log_path": str(log_path)}
+
+    running = _pid_is_running(pid) and _pid_matches_discord_process(pid)
+    return {
+        "running": running,
+        "pid": pid,
+        "pid_file": str(pid_path),
+        "log_path": str(log_path),
+        "stale_pid_file": not running,
+    }
+
+
+def start_discord_background_process(cfg) -> dict[str, Any]:
+    status = discord_background_status(cfg)
+    if status["running"]:
+        raise PuppetError(
+            "discord_bot_already_running",
+            f"discord bot is already running with pid {status['pid']}",
+            "Use `puppet discord status` or `puppet discord stop`.",
+        )
+    if status.get("stale_pid_file"):
+        _discord_pid_path(cfg).unlink(missing_ok=True)
+
+    from .discord_bot import validate_discord_config
+
+    validate_discord_config(cfg)
+
+    log_path = _discord_log_path(cfg)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = log_path.open("ab")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "puppetmaster.cli", "discord", "serve"],
+            env=puppetmaster_subprocess_env(cfg),
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_fh.close()
+
+    result = {"running": True, "pid": proc.pid, "pid_file": str(_discord_pid_path(cfg)), "log_path": str(log_path)}
+    _discord_pid_path(cfg).write_text(f"{proc.pid}\n", encoding="utf-8")
+    return result
+
+
+def start_discord_background(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    emit(start_discord_background_process(cfg), args.json)
+    return 0
+
+
 def cmd_discord_serve(args: argparse.Namespace) -> int:
+    if args.background:
+        return start_discord_background(args)
+
     try:
         from .discord_bot import run_discord_bot
     except ImportError as exc:
@@ -396,6 +598,43 @@ def cmd_discord_serve(args: argparse.Namespace) -> int:
         ) from exc
 
     return run_discord_bot()
+
+
+def cmd_discord_status(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    emit(discord_background_status(cfg), args.json)
+    return 0
+
+
+def cmd_discord_stop(args: argparse.Namespace) -> int:
+    cfg = load_config()
+    if args.timeout <= 0:
+        raise PuppetError(
+            "invalid_timeout",
+            "stop timeout must be positive.",
+            "Pass --timeout with a positive number of seconds.",
+        )
+    status = discord_background_status(cfg)
+    pid = status["pid"]
+    if not status["running"] or pid is None:
+        _discord_pid_path(cfg).unlink(missing_ok=True)
+        emit({**status, "stopped": False}, args.json)
+        return 0
+
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + args.timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_running(pid) or not _pid_matches_discord_process(pid):
+            _discord_pid_path(cfg).unlink(missing_ok=True)
+            emit({**status, "running": False, "stopped": True}, args.json)
+            return 0
+        time.sleep(0.1)
+
+    raise PuppetError(
+        "discord_bot_stop_timeout",
+        f"discord bot pid {pid} did not stop within {args.timeout:.1f}s",
+        "Stop it manually or retry after checking the log.",
+    )
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
@@ -409,14 +648,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="puppet", description="Puppetmaster local Codex agent supervisor.")
     sub = parser.add_subparsers(required=True)
 
+    init_p = sub.add_parser("init", help="Create or update the Puppetmaster global config.")
+    init_p.add_argument("--discord-token", help="Set or replace the Discord bot token.")
+    init_p.add_argument("--discord-guild-id", help="Set or replace the Discord guild id.")
+    init_p.add_argument("--start-discord", action="store_true", help="Start the Discord bot in the background after writing config.")
+    init_p.add_argument("--no-input", action="store_true", help="Do not prompt; preserve existing values unless flags replace them.")
+    add_json(init_p)
+    init_p.set_defaults(func=cmd_init)
+
     orch = sub.add_parser("orchestrator", help="Manage the root orchestrator.")
     orch_sub = orch.add_subparsers(required=True)
-    start = orch_sub.add_parser("start", help="Start a managed Codex orchestrator.")
-    start.add_argument("--cwd", required=True)
+    start = orch_sub.add_parser("start", help="Start a managed Codex root orchestrator.")
+    start.add_argument("--cwd", help="Workspace directory for the orchestrator. Defaults to the current directory.")
     start.add_argument("--prompt")
     start.add_argument("--prompt-file")
     start.add_argument("--name", default="root")
-    start.add_argument("--new-root", action="store_true")
+    start.add_argument("--agent-id", help="Use this exact safe id for the new root orchestrator.")
+    start.add_argument("--new-root", action="store_true", help="Deprecated compatibility flag; start always creates a root.")
     add_json(start)
     start.set_defaults(func=cmd_orchestrator_start)
     inspect = orch_sub.add_parser("inspect", help="Inspect the most recent orchestrator.")
@@ -574,7 +822,20 @@ def build_parser() -> argparse.ArgumentParser:
     discord_p = sub.add_parser("discord", help="Discord bot commands.")
     discord_sub = discord_p.add_subparsers(required=True)
     discord_serve = discord_sub.add_parser("serve", help="Run the Discord bot.")
+    discord_serve.add_argument(
+        "--background",
+        action="store_true",
+        help="Run the Discord bot as a detached background process.",
+    )
+    add_json(discord_serve)
     discord_serve.set_defaults(func=cmd_discord_serve)
+    discord_status = discord_sub.add_parser("status", help="Show background Discord bot status.")
+    add_json(discord_status)
+    discord_status.set_defaults(func=cmd_discord_status)
+    discord_stop = discord_sub.add_parser("stop", help="Stop the background Discord bot.")
+    discord_stop.add_argument("--timeout", type=float, default=10.0, help="Seconds to wait for graceful shutdown.")
+    add_json(discord_stop)
+    discord_stop.set_defaults(func=cmd_discord_stop)
 
     tui = sub.add_parser("tui", help="Navigate agents and preview live output.")
     tui.add_argument("--root", help="Limit the view to one root_id.")

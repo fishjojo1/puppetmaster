@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import Config
+from .config import Config, inherited_pythonpath, puppetmaster_subprocess_env
 from .errors import PuppetError, require
 from .logging import log
 from .model import COMPLETION_STATUSES, TERMINAL_STATUSES, json_dumps, new_id, now, validate_cwd
@@ -22,7 +22,9 @@ from .tmux import Tmux
 
 
 WAKEUP_REASON_MAX_LENGTH = 240
-INITIAL_PROMPT_SEND_DELAY_SECONDS = 0.5
+INITIAL_PROMPT_SEND_DELAY_SECONDS = 10.0
+AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+AGENT_ID_FORMAT_HINT = "Agent ids must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63} and must not contain '..'."
 
 
 def agent_dir(config: Config, agent_id: str) -> Path:
@@ -31,6 +33,32 @@ def agent_dir(config: Config, agent_id: str) -> Path:
 
 def make_tmux_session(config: Config, agent_id: str) -> str:
     return f"{config.tmux_session_prefix}{agent_id}"
+
+
+def validate_agent_id(agent_id: str) -> str:
+    if not isinstance(agent_id, str) or not AGENT_ID_PATTERN.fullmatch(agent_id) or ".." in agent_id:
+        raise PuppetError("invalid_agent_id", f"invalid agent id: {agent_id!r}", AGENT_ID_FORMAT_HINT)
+    return agent_id
+
+
+def ensure_agent_id_available(config: Config, registry: Registry, tmux: Tmux, agent_id: str) -> None:
+    validate_agent_id(agent_id)
+    if registry.maybe_agent(agent_id):
+        raise PuppetError("duplicate_agent_id", f"agent id already exists: {agent_id}", "Choose a different --agent-id.")
+    directory = agent_dir(config, agent_id)
+    if directory.exists():
+        raise PuppetError(
+            "duplicate_agent_id",
+            f"agent directory already exists for id: {agent_id}",
+            f"Remove or inspect {directory} before reusing this id.",
+        )
+    session = make_tmux_session(config, agent_id)
+    if tmux.session_exists(session):
+        raise PuppetError(
+            "duplicate_agent_id",
+            f"tmux session already exists for id {agent_id}: {session}",
+            "Stop or rename the existing tmux session before reusing this id.",
+        )
 
 
 def create_agent_record(
@@ -44,13 +72,22 @@ def create_agent_record(
     root_id: str | None = None,
     name: str | None = None,
     metadata: dict[str, Any] | None = None,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     cwd = validate_cwd(cwd)
-    agent_id = new_id("agt")
+    agent_id = validate_agent_id(agent_id) if agent_id is not None else new_id("agt")
+    if registry.maybe_agent(agent_id):
+        raise PuppetError("duplicate_agent_id", f"agent id already exists: {agent_id}", "Choose a different agent id.")
     parent = registry.maybe_agent(parent_id) if parent_id else None
     depth = (parent["depth"] + 1) if parent else 0
     root_id = root_id or (parent["root_id"] if parent else agent_id)
     directory = agent_dir(config, agent_id)
+    if directory.exists():
+        raise PuppetError(
+            "duplicate_agent_id",
+            f"agent directory already exists for id: {agent_id}",
+            f"Remove or inspect {directory} before reusing this id.",
+        )
     directory.mkdir(parents=True, exist_ok=True)
     log_path = directory / "terminal.log"
     events_path = directory / "events.jsonl"
@@ -479,13 +516,9 @@ def schedule_wakeup(
 
 
 def spawn_wakeup_helper(config: Config, wakeup_id: str) -> None:
-    env = os.environ.copy()
-    env["PUPPETMASTER_STATE_DIR"] = str(config.state_dir)
-    env["PYTHONPATH"] = str(config.repo_dir / "src") + os.pathsep + env.get("PYTHONPATH", "")
     subprocess.Popen(
         [sys.executable, "-m", "puppetmaster.cli", "wakeup", "sleep-and-fire", "--wakeup-id", wakeup_id],
-        cwd=str(config.repo_dir),
-        env=env,
+        env=puppetmaster_subprocess_env(config),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -811,8 +844,10 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         "PUPPETMASTER_STATE_DIR": str(config.state_dir),
         "PUPPETMASTER_CONFIG_DIR": str(codex_home),
         "PUPPETMASTER_ROLE": agent["role"],
-        "PYTHONPATH": str(config.repo_dir / "src") + os.pathsep + os.environ.get("PYTHONPATH", ""),
     }
+    pythonpath = inherited_pythonpath()
+    if pythonpath is not None:
+        env["PYTHONPATH"] = pythonpath
     hooks_json = codex_home / "hooks.json"
     hook_hash = codex_hook_trust_hash(str(stop_hook), "Reporting Puppetmaster turn stop", 30)
     config_toml = codex_home / "config.toml"
@@ -864,6 +899,7 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         flags.insert(0, "--no-alt-screen")
     if config.codex_bypass_approvals_and_sandbox:
         flags.insert(1, "--dangerously-bypass-approvals-and-sandbox")
+    pythonpath_export = f"export PYTHONPATH={pythonpath!r}\n" if pythonpath is not None else ""
     launch.write_text(
         f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -873,7 +909,7 @@ export PUPPETMASTER_ROOT_AGENT_ID={agent['root_id']!r}
 export PUPPETMASTER_STATE_DIR={str(config.state_dir)!r}
 export PUPPETMASTER_CONFIG_DIR={str(codex_home)!r}
 export PUPPETMASTER_ROLE={agent['role']!r}
-export PYTHONPATH={str(config.repo_dir / 'src')!r}${{PYTHONPATH:+:${{PYTHONPATH}}}}
+{pythonpath_export}\
 export CODEX_HOME={str(codex_home)!r}
 exec {codex!r} {' '.join(shlex_quote(flag) for flag in flags)}
 """,
@@ -915,9 +951,12 @@ def create_codex_agent(
     name: str | None = None,
     role: str = "subagent",
     metadata: dict[str, Any] | None = None,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
     parent = registry.maybe_agent(parent_id) if parent_id else None
     enforce_create_limits(config, registry, parent)
+    if agent_id is not None:
+        ensure_agent_id_available(config, registry, tmux, agent_id)
     discover_codex()
     agent = create_agent_record(
         config,
@@ -929,6 +968,7 @@ def create_codex_agent(
         root_id=parent["root_id"] if parent else None,
         name=name,
         metadata={"runtime": "codex", **(metadata or {})},
+        agent_id=agent_id,
     )
     files = write_codex_files(config, agent, prompt, orchestrator=role == "orchestrator")
     agent = registry.update_agent(
@@ -959,11 +999,8 @@ def start_orchestrator(
     prompt: str,
     name: str | None = "root",
     new_root: bool = False,
+    agent_id: str | None = None,
 ) -> dict[str, Any]:
-    if not new_root:
-        for agent in registry.list_agents():
-            if agent["role"] == "orchestrator" and agent["status"] in {"starting", "running", "idle", "awaiting_input"}:
-                raise PuppetError("orchestrator_exists", f"running orchestrator already exists: {agent['id']}", "Use --new-root to start another.")
     return create_codex_agent(
         config,
         registry,
@@ -974,6 +1011,7 @@ def start_orchestrator(
         parent_id=None,
         name=name,
         role="orchestrator",
+        agent_id=agent_id,
     )
 
 
