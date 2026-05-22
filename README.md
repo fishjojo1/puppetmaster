@@ -4,10 +4,6 @@
 
 Puppetmaster is a local supervisor for Codex agents. It starts the root orchestrator and child agents in managed tmux sessions, records durable SQLite metadata and terminal logs, exposes MCP tools for delegation, and uses Codex Stop hooks to deliver child-agent events back to the orchestrator.
 
-The v1 design is specified in [spec.md](spec.md). Implementation milestones are under [milestones](milestones).
-
-> Status: alpha. Puppetmaster is useful for local automation experiments, but it intentionally grants managed Codex sessions broad local permissions. Read the safety notes before binding Discord or running it in a sensitive workspace.
-
 ## License
 
 Puppetmaster is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). Noncommercial use, modification, and distribution are permitted under that license.
