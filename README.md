@@ -1,7 +1,5 @@
 # Puppetmaster
 
-[![CI](https://github.com/fishjojo1/puppetmaster/actions/workflows/ci.yml/badge.svg)](https://github.com/fishjojo1/puppetmaster/actions/workflows/ci.yml)
-
 Puppetmaster is a local supervisor for Codex agents. It starts the root orchestrator and child agents in managed tmux sessions, records durable SQLite metadata and terminal logs, exposes MCP tools for delegation, and uses Codex Stop hooks to deliver child-agent events back to the orchestrator.
 
 ## License
