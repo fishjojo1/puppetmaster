@@ -8,8 +8,6 @@ Puppetmaster is source-available under the [PolyForm Noncommercial License 1.0.0
 
 Commercial use requires a separate commercial license from the repository owner. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
 
-Because commercial use is restricted, Puppetmaster is not OSI open source. Describe it as source-available unless the license changes.
-
 ## Safety
 
 Managed Codex sessions intentionally launch with:
