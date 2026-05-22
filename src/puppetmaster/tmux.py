@@ -61,6 +61,17 @@ class Tmux:
             raise PuppetError("tmux_capture_failed", f"tmux capture-pane failed: {proc.stderr.strip()}")
         return proc.stdout
 
+    def capture_visible_pane(self, session: str) -> str:
+        self.require_tmux()
+        proc = subprocess.run(
+            ["tmux", "capture-pane", "-ep", "-t", session],
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise PuppetError("tmux_capture_failed", f"tmux capture-pane failed: {proc.stderr.strip()}")
+        return proc.stdout
+
     def send_prompt(self, session: str, prompt: str) -> None:
         self.require_tmux()
         buffer_name = f"puppet_prompt_{os.getpid()}"

@@ -19,6 +19,7 @@ from puppetmaster.discord_bot import (
     code_block,
     handle_agents_command,
     handle_bind_command,
+    handle_clear_command,
     handle_compact_command,
     handle_read_command,
     handle_screenshot_command,
@@ -166,6 +167,48 @@ class FakeTmux:
 
     def send_prompt(self, session: str, prompt: str) -> None:
         self.sent_prompts.append((session, prompt))
+
+
+class FakeDiscordFile:
+    def __init__(self, fp, filename: str):
+        self.fp = fp
+        self.filename = filename
+
+
+class FakeDiscordModuleWithFile:
+    File = FakeDiscordFile
+    TextChannel = FakeTextChannel
+
+
+class FakeInteractionResponse:
+    def __init__(self):
+        self.deferred = False
+        self.sent: list[dict] = []
+
+    def is_done(self) -> bool:
+        return self.deferred or bool(self.sent)
+
+    async def defer(self, *, thinking: bool = False) -> None:
+        self.deferred = True
+        self.thinking = thinking
+
+    async def send_message(self, *args, **kwargs) -> None:
+        self.sent.append({"args": args, "kwargs": kwargs})
+
+
+class FakeInteractionFollowup:
+    def __init__(self):
+        self.sent: list[dict] = []
+
+    async def send(self, *args, **kwargs) -> None:
+        self.sent.append({"args": args, "kwargs": kwargs})
+
+
+class FakeInteraction:
+    def __init__(self, channel: object):
+        self.channel = channel
+        self.response = FakeInteractionResponse()
+        self.followup = FakeInteractionFollowup()
 
 
 class FakeDiscordUser:
@@ -961,6 +1004,72 @@ def test_screenshot_captures_bound_root_visible_pane_as_png_without_events(ctx, 
     assert reg.pending_deliveries(root["id"]) == []
 
 
+def test_screenshot_native_mode_returns_native_png(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    fake_tmux = FakeTmux(live=False)
+
+    monkeypatch.setattr(
+        discord_bot_module,
+        "capture_native_screenshot",
+        lambda mode: ("window", b"\x89PNG\r\n\x1a\nnative"),
+    )
+
+    result = handle_screenshot_command(reg, fake_tmux, FakeTextChannel(), "native-window")
+
+    assert result.root_agent_id == root["id"]
+    assert result.filename == f"puppet-{root['id']}-native-window.png"
+    assert result.source == "native-window"
+    assert result.png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert fake_tmux.checked == []
+
+
+def test_screenshot_native_mode_falls_back_to_terminal_when_unavailable(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    fake_tmux = FakeTmux(live=True, pane_text="fallback")
+
+    def fake_native(_mode):
+        raise PuppetError("native_screenshot_unavailable", "no native tool")
+
+    monkeypatch.setattr(discord_bot_module, "capture_native_screenshot", fake_native)
+
+    result = handle_screenshot_command(reg, fake_tmux, FakeTextChannel(), "native-window")
+
+    assert result.source == "terminal"
+    assert result.note == "no native tool"
+    assert fake_tmux.checked == [root["tmux_session"]]
+    assert fake_tmux.captured == [root["tmux_session"]]
+
+
+def test_screenshot_interaction_defers_before_capturing_pane(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    interaction = FakeInteraction(FakeTextChannel())
+
+    class DeferralCheckingTmux(FakeTmux):
+        def capture_visible_pane(self, session: str) -> str:
+            assert interaction.response.deferred is True
+            return super().capture_visible_pane(session)
+
+    monkeypatch.setattr(discord_bot_module, "discord", FakeDiscordModuleWithFile)
+    fake_tmux = DeferralCheckingTmux(live=True, pane_text="root line")
+
+    asyncio.run(discord_bot_module._run_screenshot_interaction(interaction, cfg, reg, fake_tmux))
+
+    assert interaction.response.deferred is True
+    assert interaction.response.thinking is True
+    assert interaction.response.sent == []
+    assert len(interaction.followup.sent) == 1
+    sent = interaction.followup.sent[0]
+    assert sent["kwargs"]["content"] == f"Terminal pane snapshot for {root['id']}."
+    assert sent["kwargs"]["file"].filename == f"puppet-{root['id']}-screenshot.png"
+    assert fake_tmux.captured == [root["tmux_session"]]
+
+
 def test_compact_requires_a_binding(ctx):
     _cfg, reg, _tmux = ctx
 
@@ -1001,7 +1110,7 @@ def test_compact_sends_literal_command_to_bound_root_without_prompt_events(ctx, 
     assert reg.pending_deliveries(root["id"]) == []
 
 
-def test_compact_done_update_posts_after_root_stop_hook(ctx, tmp_path):
+def test_compact_does_not_treat_future_stop_hooks_as_completion(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
     handle_bind_command(reg, FakeTextChannel(), root["id"])
@@ -1012,20 +1121,56 @@ def test_compact_done_update_posts_after_root_stop_hook(ctx, tmp_path):
         runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
         try:
             acknowledgement = runtime.request_compact(channel)
-            await runtime.dispatch_completed_compactions_once()
-            assert channel.sent == []
             handle_stop_hook(reg, root["id"], "{}")
-            await runtime.dispatch_completed_compactions_once()
+            await runtime.poll_once()
             return acknowledgement
         finally:
             await runtime.close()
 
     acknowledgement = asyncio.run(run())
 
-    assert acknowledgement == f"Sent /compact to {root['id']}. I will post an update when that turn stops."
+    assert acknowledgement == f"Sent /compact to {root['id']}."
     assert fake_tmux.sent_prompts == [(root["tmux_session"], "/compact")]
-    assert channel.sent == [f"Compact completed for {root['id']}."]
+    assert channel.sent == []
     assert reg.count_events(root["id"], "agent.turn_stopped") == 1
+    prompted_events = [event for event in reg.list_events(root["id"]) if event["type"] == "agent.prompted"]
+    assert prompted_events == []
+
+
+def test_compact_queues_post_compact_orchestration_prompt(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    channel = FakeDiscordChannel("channel-1", FakeDiscordGuild("guild-1"))
+    fake_tmux = FakeTmux(live=True)
+    monkeypatch.setattr(discord_bot_module, "POST_COMPACT_PROMPT_DELAY_SECONDS", 0)
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
+        try:
+            acknowledgement = runtime.request_compact(channel)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return acknowledgement
+        finally:
+            await runtime.close()
+
+    acknowledgement = asyncio.run(run())
+
+    assert acknowledgement == f"Sent /compact to {root['id']}."
+    assert fake_tmux.sent_prompts[0] == (root["tmux_session"], "/compact")
+    assert len(fake_tmux.sent_prompts) == 2
+    session, prompt = fake_tmux.sent_prompts[1]
+    assert session == root["tmux_session"]
+    assert "You are a Puppetmaster-managed Codex agent." in prompt
+    assert "Your context has just been compacted." in prompt
+    assert "Use the send message tool to inform the user that you are now ready to receive tasks." in prompt
+    assert f"- id: {root['id']}" in prompt
+    assert "Orchestrator event loop:" in prompt
+    assert "create_agent" in prompt
+    assert "send_human_message" in prompt
+    assert "complete_agent" in prompt
+    assert "spawn_agent" in prompt
 
 
 def test_compact_ignores_stop_hooks_that_precede_request(ctx, tmp_path):
@@ -1040,13 +1185,91 @@ def test_compact_ignores_stop_hooks_that_precede_request(ctx, tmp_path):
         runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
         try:
             runtime.request_compact(channel)
-            await runtime.dispatch_completed_compactions_once()
+            await runtime.poll_once()
         finally:
             await runtime.close()
 
     asyncio.run(run())
 
     assert channel.sent == []
+    assert fake_tmux.sent_prompts == [(root["tmux_session"], "/compact")]
+
+
+def test_clear_requires_a_binding(ctx):
+    _cfg, reg, _tmux = ctx
+
+    with pytest.raises(PuppetError) as exc:
+        handle_clear_command(reg, FakeTmux(live=True), FakeTextChannel())
+
+    assert exc.value.code == "not_bound"
+
+
+def test_clear_reports_missing_tmux_session(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+
+    with pytest.raises(PuppetError) as exc:
+        handle_clear_command(reg, FakeTmux(live=False), FakeTextChannel())
+
+    assert exc.value.code == "tmux_missing_session"
+    assert root["id"] in exc.value.message
+    assert "before clearing" in exc.value.hint
+
+
+def test_clear_sends_literal_command_to_bound_root_without_prompt_events(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    fake_tmux = FakeTmux(live=True)
+
+    result = handle_clear_command(reg, fake_tmux, FakeTextChannel())
+
+    assert result.root_agent_id == root["id"]
+    assert result.channel_id == "channel-1"
+    assert result.command == "/clear"
+    assert fake_tmux.checked == [root["tmux_session"]]
+    assert fake_tmux.sent_prompts == [(root["tmux_session"], "/clear")]
+    assert child["tmux_session"] not in [session for session, _prompt in fake_tmux.sent_prompts]
+    assert reg.list_events(root["id"]) == []
+    assert reg.pending_deliveries(root["id"]) == []
+
+
+def test_runtime_clear_queues_post_clear_orchestration_prompt(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    channel = FakeDiscordChannel("channel-1", FakeDiscordGuild("guild-1"))
+    fake_tmux = FakeTmux(live=True)
+    monkeypatch.setattr(discord_bot_module, "POST_COMPACT_PROMPT_DELAY_SECONDS", 0)
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
+        try:
+            acknowledgement = runtime.request_clear(channel)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return acknowledgement
+        finally:
+            await runtime.close()
+
+    acknowledgement = asyncio.run(run())
+
+    assert acknowledgement == f"Sent /clear to {root['id']}."
+    assert fake_tmux.sent_prompts[0] == (root["tmux_session"], "/clear")
+    assert len(fake_tmux.sent_prompts) == 2
+    session, prompt = fake_tmux.sent_prompts[1]
+    assert session == root["tmux_session"]
+    assert "You are a Puppetmaster-managed Codex agent." in prompt
+    assert "Your context has just been cleared." in prompt
+    assert "Use the send message tool to inform the user that you are now ready to receive tasks." in prompt
+    assert f"- id: {root['id']}" in prompt
+    assert "Orchestrator event loop:" in prompt
+    assert "create_agent" in prompt
+    assert "send_human_message" in prompt
+    assert "complete_agent" in prompt
+    assert "spawn_agent" in prompt
 
 
 def test_agents_lists_roots_only(ctx, tmp_path):
@@ -1056,16 +1279,47 @@ def test_agents_lists_roots_only(ctx, tmp_path):
 
     output = handle_agents_command(reg)
 
+    assert output.startswith("Root orchestrators:")
+    assert f"**root** `{root['status']}`" in output
+    assert f"```text\n{root['id']}\n```" in output
+    assert f"`cwd:` {tmp_path}" in output
     assert root["id"] in output
     assert child["id"] not in output
     assert "root" in output
     assert "child" not in output
 
 
+def test_agents_interaction_sends_plain_markdown_for_individual_id_copy(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator", name="root")
+    interaction = FakeInteraction(FakeTextChannel())
+
+    asyncio.run(discord_bot_module._run_plain_interaction_command(interaction, cfg, handle_agents_command, reg))
+
+    assert len(interaction.response.sent) == 1
+    content = interaction.response.sent[0]["args"][0]
+    assert content.startswith("Root orchestrators:")
+    assert f"```text\n{root['id']}\n```" in content
+    assert not content.startswith("```\n")
+    assert interaction.followup.sent == []
+
+
 def test_tree_requires_binding_and_renders_descendants(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator", name="root")
     child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"], name="child")
+    nested_cwd = tmp_path / "nested"
+    nested_cwd.mkdir()
+    grandchild = create_agent_record(
+        cfg,
+        reg,
+        cwd=str(nested_cwd),
+        description="grandchild",
+        parent_id=child["id"],
+        name="grandchild",
+    )
+    reg.update_agent(child["id"], status="running")
+    reg.update_agent(grandchild["id"], status="completed")
 
     with pytest.raises(PuppetError) as exc:
         handle_tree_command(reg, FakeTextChannel())
@@ -1075,8 +1329,20 @@ def test_tree_requires_binding_and_renders_descendants(ctx, tmp_path):
     handle_bind_command(reg, FakeTextChannel(), root["id"])
     output = handle_tree_command(reg, FakeTextChannel())
 
-    assert f"{root['id']} orchestrator" in output
-    assert f"  {child['id']} subagent" in output
+    assert output.startswith("Agent tree: root\n")
+    assert f"Root: {root['id']}" in output
+    assert f"Cwd: {tmp_path}" in output
+    assert "Agents: 3" in output
+    assert "completed=1" in output
+    assert "running=1" in output
+    assert "starting=1" in output
+    assert "root  [orchestrator | starting]" in output
+    assert f"id={root['id']}" in output
+    assert "`-- child  [subagent | running]" in output
+    assert f"    id={child['id']}" in output
+    assert "    `-- grandchild  [subagent | completed]" in output
+    assert f"        id={grandchild['id']}" in output
+    assert f"        cwd={nested_cwd}" in output
 
 
 def test_validate_discord_config_requires_token_and_guild_id(ctx):
@@ -1111,6 +1377,7 @@ def test_build_discord_bot_reports_missing_guild_access(ctx, monkeypatch):
     group = bot.tree.added[0][0]
     assert "screenshot" in {name for name, _description, _func in group.commands}
     assert "compact" in {name for name, _description, _func in group.commands}
+    assert "clear" in {name for name, _description, _func in group.commands}
     assert exc.value.code == "discord_guild_access_denied"
     assert "guild 123" in exc.value.message
     assert "Missing Access" in exc.value.message

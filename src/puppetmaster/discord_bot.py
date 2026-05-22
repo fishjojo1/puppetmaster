@@ -13,8 +13,9 @@ from .config import Config, DiscordConfig, load_config
 from .errors import PuppetError
 from .logging import log as supervisor_log
 from .model import now
+from .native_screenshot import capture_native_screenshot
 from .registry import Registry
-from .services import prompt_agent, read_agent
+from .services import prompt_agent, prompt_text, read_agent
 from .terminal_image import render_terminal_png
 from .tmux import Tmux
 
@@ -36,6 +37,13 @@ NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents,
 PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound root."
 PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
 PROMPT_DELIVERED_REACTION = "\N{WHITE HEAVY CHECK MARK}"
+POST_COMPACT_PROMPT_DELAY_SECONDS = 5.0
+POST_CLEAR_TASK_PROMPT = (
+    "Your context has just been cleared. Use the send message tool to inform the user that you are now ready to receive tasks."
+)
+POST_COMPACT_TASK_PROMPT = (
+    "Your context has just been compacted. Use the send message tool to inform the user that you are now ready to receive tasks."
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -130,6 +138,21 @@ async def send_interaction_chunks(interaction: Any, text: str, config: Config | 
         await interaction.followup.send(chunk)
 
 
+async def send_plain_interaction_chunks(interaction: Any, text: str, config: Config | DiscordConfig) -> None:
+    discord_config = _discord_config(config)
+    chunks = chunk_text(text, discord_config.chunk_size, discord_config.max_chunks)
+    if not chunks:
+        chunks = [""]
+    response = interaction.response
+    if response.is_done():
+        for chunk in chunks:
+            await interaction.followup.send(chunk)
+        return
+    await response.send_message(chunks[0])
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk)
+
+
 def format_error(exc: PuppetError) -> str:
     lines = [f"error[{exc.code}]: {exc.message}"]
     if exc.hint:
@@ -159,6 +182,8 @@ class ScreenshotResult:
     root_agent_id: str
     filename: str
     png: bytes
+    source: str = "terminal"
+    note: str | None = None
 
 
 @dataclass
@@ -170,12 +195,11 @@ class CompactResult:
 
 
 @dataclass
-class CompactState:
+class SlashCommandResult:
     root_agent_id: str
     channel_id: str
-    channel: Any
     requested_at: str
-    turn_stop_count: int
+    command: str
 
 
 def _user_id(user: Any) -> str | None:
@@ -254,8 +278,8 @@ class DiscordRuntime:
         self.bot = bot
         self.prompt_func = prompt_func
         self.active_typing: dict[str, TypingState] = {}
-        self.active_compactions: dict[str, CompactState] = {}
         self._poll_task: asyncio.Task[None] | None = None
+        self._post_reset_tasks: set[asyncio.Task[None]] = set()
 
     def _log(self, level: str, event: str, message: str, **fields: Any) -> None:
         log_method = getattr(LOGGER, level, LOGGER.info)
@@ -481,12 +505,11 @@ class DiscordRuntime:
 
     def request_compact(self, channel: Any) -> str:
         result = handle_compact_command(self.registry, self.tmux, channel)
-        self.active_compactions[result.root_agent_id] = CompactState(
-            root_agent_id=result.root_agent_id,
-            channel_id=result.channel_id,
-            channel=channel,
-            requested_at=result.requested_at,
-            turn_stop_count=result.turn_stop_count,
+        self._schedule_post_reset_prompt(
+            result.root_agent_id,
+            result.channel_id,
+            "compact",
+            POST_COMPACT_TASK_PROMPT,
         )
         self._log(
             "info",
@@ -495,28 +518,103 @@ class DiscordRuntime:
             root_agent_id=result.root_agent_id,
             channel_id=result.channel_id,
         )
-        return f"Sent /compact to {result.root_agent_id}. I will post an update when that turn stops."
+        return f"Sent /compact to {result.root_agent_id}."
 
-    async def dispatch_completed_compactions_once(self) -> None:
-        for root_agent_id, state in list(self.active_compactions.items()):
-            turn_stop_count = self.registry.count_events(root_agent_id, "agent.turn_stopped")
-            if turn_stop_count <= state.turn_stop_count:
-                continue
-            await send_plain_chunks(state.channel, f"Compact completed for {root_agent_id}.", self.config)
-            self.active_compactions.pop(root_agent_id, None)
-            self.stop_typing(root_agent_id)
+    def request_clear(self, channel: Any) -> str:
+        result = handle_clear_command(self.registry, self.tmux, channel)
+        self._schedule_post_reset_prompt(
+            result.root_agent_id,
+            result.channel_id,
+            "clear",
+            POST_CLEAR_TASK_PROMPT,
+        )
+        self._log(
+            "info",
+            "discord.clear.requested",
+            "Discord clear command delivered to root orchestrator.",
+            root_agent_id=result.root_agent_id,
+            channel_id=result.channel_id,
+        )
+        return f"Sent /clear to {result.root_agent_id}."
+
+    def _schedule_post_reset_prompt(
+        self,
+        root_agent_id: str,
+        channel_id: str,
+        reset_command: str,
+        user_prompt: str,
+    ) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._log(
+                "warning",
+                f"discord.{reset_command}.resume_prompt_not_scheduled",
+                f"Post-{reset_command} orchestration prompt could not be scheduled without a running event loop.",
+                root_agent_id=root_agent_id,
+                channel_id=channel_id,
+            )
+            return
+
+        task = loop.create_task(
+            self._send_post_reset_prompt_later(root_agent_id, channel_id, reset_command, user_prompt)
+        )
+        self._post_reset_tasks.add(task)
+        task.add_done_callback(self._post_reset_tasks.discard)
+
+    async def _send_post_reset_prompt_later(
+        self,
+        root_agent_id: str,
+        channel_id: str,
+        reset_command: str,
+        user_prompt: str,
+    ) -> None:
+        try:
+            await asyncio.sleep(POST_COMPACT_PROMPT_DELAY_SECONDS)
+            root = self.registry.maybe_agent(root_agent_id)
+            if root is None:
+                self._log(
+                    "warning",
+                    f"discord.{reset_command}.resume_prompt_skipped",
+                    f"Post-{reset_command} orchestration prompt skipped because the root agent no longer exists.",
+                    root_agent_id=root_agent_id,
+                    channel_id=channel_id,
+                )
+                return
+            if not self.tmux.session_exists(root["tmux_session"]):
+                self._log(
+                    "warning",
+                    f"discord.{reset_command}.resume_prompt_skipped",
+                    f"Post-{reset_command} orchestration prompt skipped because the root tmux session is not live.",
+                    root_agent_id=root_agent_id,
+                    channel_id=channel_id,
+                    tmux_session=root["tmux_session"],
+                )
+                return
+            self.tmux.send_prompt(root["tmux_session"], prompt_text(root, user_prompt))
             self._log(
                 "info",
-                "discord.compact.completed",
-                "Discord compact command completed after root turn stopped.",
+                f"discord.{reset_command}.resume_prompt_sent",
+                f"Post-{reset_command} orchestration prompt sent to root orchestrator.",
                 root_agent_id=root_agent_id,
-                channel_id=state.channel_id,
+                channel_id=channel_id,
+                tmux_session=root["tmux_session"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log(
+                "warning",
+                f"discord.{reset_command}.resume_prompt_failed",
+                f"Post-{reset_command} orchestration prompt failed.",
+                root_agent_id=root_agent_id,
+                channel_id=channel_id,
+                error_message=_short_exception(exc),
             )
 
     async def poll_once(self) -> None:
         await self.dispatch_pending_outbound_once()
         self.stop_typing_for_turn_stops()
-        await self.dispatch_completed_compactions_once()
         self.stop_expired_typing()
 
     def start(self) -> None:
@@ -536,6 +634,12 @@ class DiscordRuntime:
             self._poll_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self._poll_task
+        for task in list(self._post_reset_tasks):
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._post_reset_tasks.clear()
         typing_tasks = [state.task for state in self.active_typing.values() if state.task is not None]
         for root_agent_id in list(self.active_typing):
             self.stop_typing(root_agent_id)
@@ -557,8 +661,19 @@ def handle_agents_command(registry: Registry) -> str:
     roots = root_agents(registry)
     if not roots:
         return "No root orchestrators found."
-    rows = ["ID STATUS NAME CWD"]
-    rows.extend(f"{agent['id']} {agent['status']} {agent.get('name') or '-'} {agent['cwd']}" for agent in roots)
+    rows = ["Root orchestrators:"]
+    for agent in roots:
+        name = agent.get("name") or "-"
+        rows.extend(
+            [
+                "",
+                f"**{name}** `{agent['status']}`",
+                "```text",
+                str(agent["id"]),
+                "```",
+                f"`cwd:` {agent['cwd']}",
+            ]
+        )
     return "\n".join(rows)
 
 
@@ -663,8 +778,25 @@ def handle_read_command(config: Config, registry: Registry, tmux: Tmux, channel:
     return output or "(no output)"
 
 
-def handle_screenshot_command(registry: Registry, tmux: Tmux, channel: Any) -> ScreenshotResult:
+def handle_screenshot_command(registry: Registry, tmux: Tmux, channel: Any, mode: str | None = None) -> ScreenshotResult:
     root = _require_bound_root(registry, channel)
+    requested_mode = (mode or "terminal").strip().lower()
+    if requested_mode != "terminal":
+        try:
+            scope, png = capture_native_screenshot(requested_mode)
+            return ScreenshotResult(
+                root_agent_id=root["id"],
+                filename=f"puppet-{root['id']}-native-{scope}.png",
+                png=png,
+                source=f"native-{scope}",
+            )
+        except PuppetError as exc:
+            if exc.code != "native_screenshot_unavailable":
+                raise
+            native_note = exc.message
+    else:
+        native_note = None
+
     if not tmux.session_exists(root["tmux_session"]):
         raise PuppetError(
             "tmux_missing_session",
@@ -676,26 +808,108 @@ def handle_screenshot_command(registry: Registry, tmux: Tmux, channel: Any) -> S
         root_agent_id=root["id"],
         filename=f"puppet-{root['id']}-screenshot.png",
         png=render_terminal_png(pane_text),
+        note=native_note,
     )
 
 
-def handle_compact_command(registry: Registry, tmux: Tmux, channel: Any) -> CompactResult:
+def _send_bound_root_slash_command(
+    registry: Registry,
+    tmux: Tmux,
+    channel: Any,
+    command: str,
+    missing_session_hint: str,
+) -> SlashCommandResult:
     channel_id, _guild_id = _text_channel_ids(channel)
     root = _require_bound_root(registry, channel)
     if not tmux.session_exists(root["tmux_session"]):
         raise PuppetError(
             "tmux_missing_session",
             f"tmux session is not live for bound root: {root['id']}",
-            "Start or reconcile the root orchestrator before compacting.",
+            missing_session_hint,
         )
-    turn_stop_count = registry.count_events(root["id"], "agent.turn_stopped")
-    tmux.send_prompt(root["tmux_session"], "/compact")
-    return CompactResult(
+    tmux.send_prompt(root["tmux_session"], command)
+    return SlashCommandResult(
         root_agent_id=root["id"],
         channel_id=channel_id,
         requested_at=now(),
+        command=command,
+    )
+
+
+def handle_compact_command(registry: Registry, tmux: Tmux, channel: Any) -> CompactResult:
+    root = _require_bound_root(registry, channel)
+    turn_stop_count = registry.count_events(root["id"], "agent.turn_stopped")
+    result = _send_bound_root_slash_command(
+        registry,
+        tmux,
+        channel,
+        "/compact",
+        "Start or reconcile the root orchestrator before compacting.",
+    )
+    return CompactResult(
+        root_agent_id=result.root_agent_id,
+        channel_id=result.channel_id,
+        requested_at=result.requested_at,
         turn_stop_count=turn_stop_count,
     )
+
+
+def handle_clear_command(registry: Registry, tmux: Tmux, channel: Any) -> SlashCommandResult:
+    return _send_bound_root_slash_command(
+        registry,
+        tmux,
+        channel,
+        "/clear",
+        "Start or reconcile the root orchestrator before clearing.",
+    )
+
+
+def _agent_tree_label(agent: dict[str, Any]) -> str:
+    label = agent.get("name") or agent.get("description") or "-"
+    return str(label)
+
+
+def _agent_tree_sort_key(agent: dict[str, Any]) -> tuple[str, str, str]:
+    return (str(agent.get("created_at") or ""), _agent_tree_label(agent), str(agent["id"]))
+
+
+def _format_agent_tree(root: dict[str, Any], agents: list[dict[str, Any]]) -> str:
+    by_parent: dict[str | None, list[dict[str, Any]]] = {}
+    for agent in agents:
+        by_parent.setdefault(agent["parent_id"], []).append(agent)
+    for siblings in by_parent.values():
+        siblings.sort(key=_agent_tree_sort_key)
+
+    status_counts: dict[str, int] = {}
+    for agent in agents:
+        status = str(agent["status"])
+        status_counts[status] = status_counts.get(status, 0) + 1
+    status_summary = ", ".join(f"{status}={count}" for status, count in sorted(status_counts.items()))
+
+    lines = [
+        f"Agent tree: {_agent_tree_label(root)}",
+        f"Root: {root['id']}",
+        f"Cwd: {root['cwd']}",
+        f"Agents: {len(agents)} ({status_summary})",
+        "",
+    ]
+
+    def append_agent(agent: dict[str, Any], prefix: str = "", connector: str = "") -> None:
+        label = _agent_tree_label(agent)
+        lines.append(f"{prefix}{connector}{label}  [{agent['role']} | {agent['status']}]")
+        detail_prefix = prefix + ("    " if connector == "`-- " else "|   " if connector else "")
+        lines.append(f"{detail_prefix}id={agent['id']}")
+        if agent["cwd"] != root["cwd"]:
+            lines.append(f"{detail_prefix}cwd={agent['cwd']}")
+
+        children = by_parent.get(agent["id"], [])
+        for index, child in enumerate(children):
+            child_connector = "`-- " if index == len(children) - 1 else "|-- "
+            child_prefix = detail_prefix
+            append_agent(child, child_prefix, child_connector)
+
+    append_agent(root)
+    return "\n".join(lines)
 
 
 def handle_tree_command(registry: Registry, channel: Any) -> str:
@@ -703,21 +917,7 @@ def handle_tree_command(registry: Registry, channel: Any) -> str:
     agents = registry.list_agents(root_id=root["id"])
     if not agents:
         return "No agents found."
-    by_parent: dict[str | None, list[dict[str, Any]]] = {}
-    for agent in agents:
-        by_parent.setdefault(agent["parent_id"], []).append(agent)
-
-    def walk(parent_id: str | None, depth: int) -> list[str]:
-        rows: list[str] = []
-        for agent in by_parent.get(parent_id, []):
-            rows.append(
-                "  " * depth
-                + f"{agent['id']} {agent['role']} {agent['status']} {agent.get('name') or '-'} {agent['cwd']}"
-            )
-            rows.extend(walk(agent["id"], depth + 1))
-        return rows
-
-    return "\n".join(walk(root["parent_id"], 0))
+    return _format_agent_tree(root, agents)
 
 
 CommandFunc = Callable[..., str]
@@ -736,14 +936,40 @@ async def _run_interaction_command(
     await send_interaction_chunks(interaction, text, config)
 
 
-async def _run_screenshot_interaction(interaction: Any, config: Config, registry: Registry, tmux: Tmux) -> None:
+async def _run_plain_interaction_command(
+    interaction: Any,
+    config: Config,
+    func: CommandFunc,
+    *args: Any,
+) -> None:
     try:
-        screenshot = handle_screenshot_command(registry, tmux, interaction.channel)
+        text = func(*args)
+    except PuppetError as exc:
+        text = format_error(exc)
+    await send_plain_interaction_chunks(interaction, text, config)
+
+
+async def _run_screenshot_interaction(
+    interaction: Any,
+    config: Config,
+    registry: Registry,
+    tmux: Tmux,
+    mode: str | None = None,
+) -> None:
+    if not interaction.response.is_done():
+        await interaction.response.defer(thinking=True)
+    try:
+        screenshot = handle_screenshot_command(registry, tmux, interaction.channel, mode)
     except PuppetError as exc:
         await send_interaction_chunks(interaction, format_error(exc), config)
         return
     file = discord.File(io.BytesIO(screenshot.png), filename=screenshot.filename)
-    content = f"Terminal pane snapshot for {screenshot.root_agent_id}."
+    if screenshot.source.startswith("native-"):
+        content = f"Native {screenshot.source.removeprefix('native-')} screenshot for {screenshot.root_agent_id}."
+    else:
+        content = f"Terminal pane snapshot for {screenshot.root_agent_id}."
+        if screenshot.note:
+            content += f" Native screenshot unavailable: {screenshot.note}."
     if interaction.response.is_done():
         await interaction.followup.send(content=content, file=file)
     else:
@@ -810,7 +1036,7 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
 
     @group.command(name="agents", description="List root orchestrators.")
     async def agents(interaction: discord.Interaction) -> None:
-        await _run_interaction_command(interaction, cfg, handle_agents_command, reg)
+        await _run_plain_interaction_command(interaction, cfg, handle_agents_command, reg)
 
     @group.command(name="bind", description="Bind this channel to a root orchestrator.")
     @app_commands.describe(agent_id="Root orchestrator agent id.")
@@ -834,13 +1060,18 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
     async def tree(interaction: discord.Interaction) -> None:
         await _run_interaction_command(interaction, cfg, handle_tree_command, reg, interaction.channel)
 
-    @group.command(name="screenshot", description="Send a PNG snapshot of the bound root terminal pane.")
-    async def screenshot(interaction: discord.Interaction) -> None:
-        await _run_screenshot_interaction(interaction, cfg, reg, tmux_client)
+    @group.command(name="screenshot", description="Send a PNG snapshot for the bound root.")
+    @app_commands.describe(mode="terminal, native-window, or native-screen.")
+    async def screenshot(interaction: discord.Interaction, mode: str | None = None) -> None:
+        await _run_screenshot_interaction(interaction, cfg, reg, tmux_client, mode)
 
     @group.command(name="compact", description="Compact the bound root orchestrator context.")
     async def compact(interaction: discord.Interaction) -> None:
         await _run_interaction_command(interaction, cfg, runtime.request_compact, interaction.channel)
+
+    @group.command(name="clear", description="Clear the bound root orchestrator context.")
+    async def clear(interaction: discord.Interaction) -> None:
+        await _run_interaction_command(interaction, cfg, runtime.request_clear, interaction.channel)
 
     @bot.event
     async def setup_hook() -> None:
