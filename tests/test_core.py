@@ -1352,15 +1352,23 @@ def test_prompt_text_explains_orchestrator_wait_and_event_loop(ctx, tmp_path):
     child_prompt = prompt_text(child, "Run the tests.")
 
     assert "If you are only waiting for child-agent progress, do not call wait(). Simply end your turn." in root_prompt
+    assert "Use the Puppetmaster create_agent() tool to create child agents" in root_prompt
+    assert "Do not use Codex's default spawn_agent tool" in root_prompt
     assert "Call wait(seconds, reason) only when you need a time-based wakeup" in root_prompt
     assert "Puppetmaster will send you a fresh PUPPETMASTER EVENT message" in root_prompt
     assert "PUPPETMASTER WAIT OVER" in root_prompt
     assert "send_human_message" in root_prompt
+    assert "Always use send_human_message for every human-facing message" in root_prompt
+    assert "Regularly update the human with send_human_message during longer work" in root_prompt
     assert "DISCORD MESSAGE RECEIVED" in root_prompt
+    assert "always answer the human by calling send_human_message" in root_prompt
     assert "routing" not in root_prompt.lower()
     assert "If you are only waiting for child-agent progress" not in child_prompt
+    assert "Do not use Codex's default spawn_agent tool" not in child_prompt
     assert "Use wait(seconds, reason) only for a time-based wakeup." in child_prompt
     assert "send_human_message" in child_prompt
+    assert "Always use send_human_message for every human-facing message" in child_prompt
+    assert "Regularly update the human with send_human_message during longer work" in child_prompt
     assert "DISCORD MESSAGE RECEIVED" not in child_prompt
 
 
@@ -1483,6 +1491,34 @@ def test_tmux_send_prompt_pastes_and_confirms_with_second_enter(ctx, monkeypatch
     assert sleeps == [
         tmux_module.PROMPT_PASTE_SETTLE_DELAY_SECONDS,
         tmux_module.PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS,
+    ]
+
+
+def test_tmux_capture_visible_pane_uses_current_view(ctx, monkeypatch):
+    _cfg, _reg, tmux = ctx
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+
+        class Result:
+            returncode = 0
+            stdout = "visible output\n"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(tmux, "require_tmux", lambda: "/usr/bin/tmux")
+    monkeypatch.setattr(tmux_module.subprocess, "run", fake_run)
+
+    output = tmux.capture_visible_pane("puppet_agt_root")
+
+    assert output == "visible output\n"
+    assert calls == [
+        (
+            ["tmux", "capture-pane", "-ep", "-t", "puppet_agt_root"],
+            {"text": True, "capture_output": True},
+        )
     ]
 
 

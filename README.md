@@ -1,8 +1,20 @@
 # Puppetmaster
 
+[![CI](https://github.com/fishjojo1/puppetmaster/actions/workflows/ci.yml/badge.svg)](https://github.com/fishjojo1/puppetmaster/actions/workflows/ci.yml)
+
 Puppetmaster is a local supervisor for Codex agents. It starts the root orchestrator and child agents in managed tmux sessions, records durable SQLite metadata and terminal logs, exposes MCP tools for delegation, and uses Codex Stop hooks to deliver child-agent events back to the orchestrator.
 
 The v1 design is specified in [spec.md](spec.md). Implementation milestones are under [milestones](milestones).
+
+> Status: alpha. Puppetmaster is useful for local automation experiments, but it intentionally grants managed Codex sessions broad local permissions. Read the safety notes before binding Discord or running it in a sensitive workspace.
+
+## License
+
+Puppetmaster is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md). Noncommercial use, modification, and distribution are permitted under that license.
+
+Commercial use requires a separate commercial license from the repository owner. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+
+Because commercial use is restricted, Puppetmaster is not OSI open source. Describe it as source-available unless the license changes.
 
 ## Safety
 
@@ -46,16 +58,18 @@ puppet init
 For development from this repository:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -e .
-puppet doctor --deep
+uv sync --extra dev
+uv run puppet doctor --deep
+uv run pytest
 ```
 
-Without installing, run commands with:
+If you prefer a standard virtual environment:
 
 ```bash
-PYTHONPATH=src python3 -m puppetmaster.cli doctor
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e ".[dev]"
+puppet doctor --deep
 ```
 
 The executable name is `puppet`. A repository-local `./puppet` wrapper is also provided.
@@ -193,12 +207,28 @@ Slash commands:
 /puppet status
 /puppet read lines:<optional>
 /puppet tree
-/puppet screenshot
+/puppet screenshot mode:<optional>
+/puppet compact
+/puppet clear
 ```
 
 After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Attachments are ignored in v1.
 
-`/puppet screenshot` captures the bound root orchestrator's current tmux pane, renders the visible terminal text as a PNG, and posts it as an attachment. This is not a GUI screenshot and does not process user-uploaded images. ANSI color fidelity and cursor rendering are intentionally limited in the current renderer.
+`/puppet agents` formats each root id in its own copy-friendly code block so Discord users can copy one id at a time.
+
+`/puppet screenshot` captures the bound root orchestrator's current tmux pane, renders the visible terminal text as a PNG, and posts it as an attachment. The renderer preserves common ANSI colors and handles wide Unicode, emoji, combining marks, variation selectors, and Nerd Font symbols. This default mode is headless and avoids capturing unrelated desktop content.
+
+Screenshot modes:
+
+```text
+terminal        Render the tmux pane as a PNG. This is the default.
+native-window   Try to capture the focused native desktop window, then fall back to terminal rendering.
+native-screen   Try to capture the focused native desktop screen, then fall back to terminal rendering.
+```
+
+Native screenshot backends are best-effort and environment-dependent. Puppetmaster currently tries niri, gnome-screenshot, scrot, and ImageMagick import on X11 where available.
+
+`/puppet compact` sends Codex `/compact` to the bound root and then queues the generated orchestrator prompt with a compacted-context task. `/puppet clear` sends Codex `/clear` to the bound root and then queues the generated orchestrator prompt with a cleared-context task. These recovery prompts tell the root to report readiness through `send_human_message`.
 
 When an orchestrator or child calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound replies are chunked to fit Discord limits.
 
@@ -408,10 +438,17 @@ scripts/release-validate.sh
 Run unit tests only:
 
 ```bash
-PYTHONPATH=src python3 -m pytest
+uv run --extra dev pytest
 ```
 
 Live Codex workflow validation requires working Codex credentials and may start real model sessions.
+
+Build package artifacts locally:
+
+```bash
+uv run --extra dev python -m build
+uv run --extra dev twine check dist/*
+```
 
 ## Known Limitations
 
@@ -419,5 +456,6 @@ Live Codex workflow validation requires working Codex credentials and may start 
 - Codex only; no runtime abstraction in v1.
 - No filesystem isolation or automatic worktrees.
 - Uses tmux and Codex hooks; both must work on the host.
+- Native screenshots depend on local compositor or screenshot tooling and may fall back to terminal rendering.
 - Idle detection is conservative and hook-based, not a perfect terminal parser.
 - No browser dashboard or multi-user authentication.

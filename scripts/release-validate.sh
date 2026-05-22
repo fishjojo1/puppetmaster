@@ -19,10 +19,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if python3 -c 'import pytest' >/dev/null 2>&1; then
+if command -v uv >/dev/null 2>&1; then
+  uv run --extra dev pytest
+  rm -rf dist
+  uv run --extra dev python -m build
+  uv run --extra dev twine check dist/*
+elif python3 -c 'import pytest' >/dev/null 2>&1; then
   python3 -m pytest
 else
-  uv run --with pytest python -m pytest
+  echo "pytest is not installed and uv is unavailable." >&2
+  exit 1
 fi
 
 doctor_state_dir="$(mktemp -d)"

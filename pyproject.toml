@@ -8,11 +8,37 @@ version = "0.1.0"
 description = "Local tmux supervisor and MCP control plane for Codex agents"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "PolyForm-Noncommercial-1.0.0"
+keywords = ["codex", "tmux", "mcp", "automation", "discord"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+  "Topic :: System :: Systems Administration",
+]
 dependencies = [
   "discord-py>=2.4",
   "mcp>=1.0",
   "pillow>=10.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=9.0",
+  "twine>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/fishjojo1/puppetmaster"
+Repository = "https://github.com/fishjojo1/puppetmaster"
+Issues = "https://github.com/fishjojo1/puppetmaster/issues"
 
 [project.scripts]
 puppet = "puppetmaster.cli:main"
