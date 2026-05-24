@@ -26,6 +26,7 @@ from .services import (
     handle_stop_hook,
     inspect_agent,
     kill_agent,
+    kill_root_tree,
     notify_agent_state_change,
     pause_agent,
     prompt_agent,
@@ -295,6 +296,12 @@ def cmd_agent_kill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_kill_tree(args: argparse.Namespace) -> int:
+    _cfg, reg, tmux = build_context()
+    emit(kill_root_tree(reg, tmux, args.root_agent_id, dry_run=args.dry_run), args.json)
+    return 0
+
+
 def cmd_agent_prompt(args: argparse.Namespace) -> int:
     _cfg, reg, tmux = build_context()
     emit(prompt_agent(reg, tmux, args.agent_id, read_prompt(args)), args.json)
@@ -379,6 +386,9 @@ def cmd_agent_cleanup_completed(args: argparse.Namespace) -> int:
 
 def cmd_orchestrator_start(args: argparse.Namespace) -> int:
     cfg, reg, tmux = build_context()
+    codex_home = getattr(args, "codex_home", None)
+    if codex_home:
+        cfg = cfg.with_codex_home(codex_home)
     cwd = args.cwd or str(Path.cwd())
     agent = start_orchestrator(
         cfg,
@@ -389,6 +399,7 @@ def cmd_orchestrator_start(args: argparse.Namespace) -> int:
         name=args.name,
         new_root=args.new_root,
         agent_id=args.agent_id,
+        goal=args.goal,
     )
     emit({"agent": agent, "attach_command": tmux.attach_command(agent["tmux_session"])}, args.json)
     return 0
@@ -664,6 +675,8 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--prompt-file")
     start.add_argument("--name", default="root")
     start.add_argument("--agent-id", help="Use this exact safe id for the new root orchestrator.")
+    start.add_argument("--codex-home", help="Source CODEX_HOME for Codex config and auth inherited by this root tree.")
+    start.add_argument("--goal", action="store_true", help="Start the orchestrator in Codex goal mode by prepending /goal to the initial prompt.")
     start.add_argument("--new-root", action="store_true", help="Deprecated compatibility flag; start always creates a root.")
     add_json(start)
     start.set_defaults(func=cmd_orchestrator_start)
@@ -737,6 +750,11 @@ def build_parser() -> argparse.ArgumentParser:
     kill.add_argument("agent_id")
     add_json(kill)
     kill.set_defaults(func=cmd_agent_kill)
+    kill_tree = a.add_parser("kill-tree", help="Kill all live tmux sessions for one root orchestrator tree.")
+    kill_tree.add_argument("root_agent_id")
+    kill_tree.add_argument("--dry-run", action="store_true", help="Preview matching live sessions without killing them.")
+    add_json(kill_tree)
+    kill_tree.set_defaults(func=cmd_agent_kill_tree)
     complete = a.add_parser("complete", help="Mark an agent complete, failed, blocked, or cancelled.")
     complete.add_argument("agent_id")
     complete.add_argument("--status", required=True, choices=["success", "failed", "blocked", "cancelled"])

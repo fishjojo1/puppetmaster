@@ -37,7 +37,8 @@ NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents,
 PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound root."
 PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
 PROMPT_DELIVERED_REACTION = "\N{WHITE HEAVY CHECK MARK}"
-POST_COMPACT_PROMPT_DELAY_SECONDS = 5.0
+SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+POST_RESET_PROMPT_DELAY_SECONDS = 3.0
 POST_CLEAR_TASK_PROMPT = (
     "Your context has just been cleared. Use the send message tool to inform the user that you are now ready to receive tasks."
 )
@@ -184,14 +185,6 @@ class ScreenshotResult:
     png: bytes
     source: str = "terminal"
     note: str | None = None
-
-
-@dataclass
-class CompactResult:
-    root_agent_id: str
-    channel_id: str
-    requested_at: str
-    turn_stop_count: int
 
 
 @dataclass
@@ -569,39 +562,19 @@ class DiscordRuntime:
         reset_command: str,
         user_prompt: str,
     ) -> None:
+        await asyncio.sleep(POST_RESET_PROMPT_DELAY_SECONDS)
+        self._send_post_reset_prompt(root_agent_id, channel_id, reset_command, user_prompt)
+
+    def _send_post_reset_prompt(
+        self,
+        root_agent_id: str,
+        channel_id: str,
+        reset_command: str,
+        user_prompt: str,
+    ) -> None:
+        root = self.registry.get_agent(root_agent_id)
         try:
-            await asyncio.sleep(POST_COMPACT_PROMPT_DELAY_SECONDS)
-            root = self.registry.maybe_agent(root_agent_id)
-            if root is None:
-                self._log(
-                    "warning",
-                    f"discord.{reset_command}.resume_prompt_skipped",
-                    f"Post-{reset_command} orchestration prompt skipped because the root agent no longer exists.",
-                    root_agent_id=root_agent_id,
-                    channel_id=channel_id,
-                )
-                return
-            if not self.tmux.session_exists(root["tmux_session"]):
-                self._log(
-                    "warning",
-                    f"discord.{reset_command}.resume_prompt_skipped",
-                    f"Post-{reset_command} orchestration prompt skipped because the root tmux session is not live.",
-                    root_agent_id=root_agent_id,
-                    channel_id=channel_id,
-                    tmux_session=root["tmux_session"],
-                )
-                return
             self.tmux.send_prompt(root["tmux_session"], prompt_text(root, user_prompt))
-            self._log(
-                "info",
-                f"discord.{reset_command}.resume_prompt_sent",
-                f"Post-{reset_command} orchestration prompt sent to root orchestrator.",
-                root_agent_id=root_agent_id,
-                channel_id=channel_id,
-                tmux_session=root["tmux_session"],
-            )
-        except asyncio.CancelledError:
-            raise
         except Exception as exc:
             self._log(
                 "warning",
@@ -611,6 +584,15 @@ class DiscordRuntime:
                 channel_id=channel_id,
                 error_message=_short_exception(exc),
             )
+            return
+        self._log(
+            "info",
+            f"discord.{reset_command}.resume_prompt_sent",
+            f"Post-{reset_command} orchestration prompt sent to root orchestrator.",
+            root_agent_id=root_agent_id,
+            channel_id=channel_id,
+            tmux_session=root["tmux_session"],
+        )
 
     async def poll_once(self) -> None:
         await self.dispatch_pending_outbound_once()
@@ -836,21 +818,13 @@ def _send_bound_root_slash_command(
     )
 
 
-def handle_compact_command(registry: Registry, tmux: Tmux, channel: Any) -> CompactResult:
-    root = _require_bound_root(registry, channel)
-    turn_stop_count = registry.count_events(root["id"], "agent.turn_stopped")
-    result = _send_bound_root_slash_command(
+def handle_compact_command(registry: Registry, tmux: Tmux, channel: Any) -> SlashCommandResult:
+    return _send_bound_root_slash_command(
         registry,
         tmux,
         channel,
         "/compact",
         "Start or reconcile the root orchestrator before compacting.",
-    )
-    return CompactResult(
-        root_agent_id=result.root_agent_id,
-        channel_id=result.channel_id,
-        requested_at=result.requested_at,
-        turn_stop_count=turn_stop_count,
     )
 
 
@@ -862,6 +836,74 @@ def handle_clear_command(registry: Registry, tmux: Tmux, channel: Any) -> SlashC
         "/clear",
         "Start or reconcile the root orchestrator before clearing.",
     )
+
+
+def _normalize_skill_name(skill_name: str | None) -> str | None:
+    normalized = (skill_name or "").strip().lower()
+    if not normalized:
+        return None
+    if not SKILL_NAME_PATTERN.match(normalized):
+        raise PuppetError(
+            "invalid_skill_name",
+            "skill-name must start with a letter or number and contain only letters, numbers, dot, underscore, or hyphen.",
+            "Use a short name like review, release-check, or test.plan.",
+        )
+    return normalized
+
+
+def _format_skill_list(skills: list[dict[str, Any]]) -> str:
+    if not skills:
+        return "No skills saved. Create one with /skills skill-name:<name> prompt:<prompt>."
+    lines = ["Saved skills:"]
+    lines.extend(f"- {skill['name']}" for skill in skills)
+    return "\n".join(lines)
+
+
+def handle_skills_command(
+    registry: Registry,
+    tmux: Tmux,
+    channel: Any,
+    skill_name: str | None = None,
+    prompt: str | None = None,
+    forget: bool | None = False,
+) -> str:
+    normalized_name = _normalize_skill_name(skill_name)
+    prompt_text_value = (prompt or "").strip()
+
+    if normalized_name is None:
+        if prompt_text_value or forget:
+            raise PuppetError("skill_name_required", "skill-name is required.", "Pass a skill-name to create, run, or forget a skill.")
+        return _format_skill_list(registry.list_discord_skills())
+
+    if forget:
+        deleted = registry.delete_discord_skill(normalized_name)
+        if not deleted:
+            return f"Skill not found: {normalized_name}"
+        return f"Forgot skill: {normalized_name}"
+
+    if prompt is not None:
+        if not prompt_text_value:
+            raise PuppetError("skill_prompt_required", "prompt must be non-empty.", "Pass the reusable prompt text for this skill.")
+        registry.upsert_discord_skill(normalized_name, prompt_text_value)
+        return f"Saved skill: {normalized_name}"
+
+    skill = registry.discord_skill(normalized_name)
+    if not skill:
+        raise PuppetError(
+            "skill_not_found",
+            f"skill not found: {normalized_name}",
+            "Create it with /skills skill-name:<name> prompt:<prompt>.",
+        )
+
+    root = _require_bound_root(registry, channel)
+    prompt_agent(
+        registry,
+        tmux,
+        root["id"],
+        f"{DISCORD_PROMPT_PREFIX}Run Discord skill `{normalized_name}`:\n\n{skill['prompt']}",
+        "discord",
+    )
+    return f"Sent skill to {root['id']}: {normalized_name}"
 
 
 def _agent_tree_label(agent: dict[str, Any]) -> str:
@@ -1073,12 +1115,37 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
     async def clear(interaction: discord.Interaction) -> None:
         await _run_interaction_command(interaction, cfg, runtime.request_clear, interaction.channel)
 
+    @app_commands.command(name="skills", description="Create, list, forget, or run reusable prompts.")
+    @app_commands.describe(
+        skill_name="Skill name to run, create, or forget.",
+        prompt="Reusable prompt text. Omit this to run the skill.",
+        forget="Delete this skill instead of running it.",
+    )
+    async def skills(
+        interaction: discord.Interaction,
+        skill_name: str | None = None,
+        prompt: str | None = None,
+        forget: bool | None = False,
+    ) -> None:
+        await _run_interaction_command(
+            interaction,
+            cfg,
+            handle_skills_command,
+            reg,
+            tmux_client,
+            interaction.channel,
+            skill_name,
+            prompt,
+            forget,
+        )
+
     @bot.event
     async def setup_hook() -> None:
         bot.tree.add_command(group, guild=guild)
+        bot.tree.add_command(skills, guild=guild)
         synced = await _sync_discord_commands(bot, guild, discord_config.guild_id)
         LOGGER.info(
-            "Synced %s Discord slash command group(s) to guild %s.",
+            "Synced %s Discord slash command object(s) to guild %s.",
             len(synced),
             discord_config.guild_id,
             extra={"event": "discord.commands.synced", "guild_id": str(discord_config.guild_id), "command_count": len(synced)},
@@ -1091,7 +1158,7 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
             guild_id=str(discord_config.guild_id),
             command_count=len(synced),
         )
-        print(f"Synced {len(synced)} Discord slash command group(s) to guild {discord_config.guild_id}.")
+        print(f"Synced {len(synced)} Discord slash command object(s) to guild {discord_config.guild_id}.")
 
     @bot.event
     async def on_ready() -> None:

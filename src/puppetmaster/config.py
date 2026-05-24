@@ -6,7 +6,7 @@ import os
 import re
 import tomllib
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ class DiscordConfig:
 class Config:
     repo_dir: Path
     state_dir: Path
+    codex_home: Path
     tmux_session_prefix: str
     limits: Limits
     discord: DiscordConfig
@@ -59,6 +60,9 @@ class Config:
     def log_path(self) -> Path:
         return self.state_dir / "puppetmaster.log.jsonl"
 
+    def with_codex_home(self, value: str | os.PathLike[str]) -> "Config":
+        return replace(self, codex_home=resolve_codex_home(value))
+
 
 def _repo_dir() -> Path:
     return Path.cwd().resolve()
@@ -66,6 +70,34 @@ def _repo_dir() -> Path:
 
 def default_state_dir() -> Path:
     return DEFAULT_STATE_DIR.expanduser().resolve()
+
+
+def default_codex_home() -> Path:
+    return Path("~/.codex").expanduser().resolve()
+
+
+def resolve_codex_home(value: str | os.PathLike[str] | None) -> Path:
+    if value is None:
+        return default_codex_home()
+    try:
+        raw = os.fspath(value)
+    except TypeError as exc:
+        raise PuppetError("invalid_config", "codex.home must be a path string") from exc
+    if not isinstance(raw, str):
+        raise PuppetError("invalid_config", "codex.home must be a path string")
+    text = raw.strip()
+    if not text:
+        return default_codex_home()
+    return Path(text).expanduser().resolve()
+
+
+def _codex_home_from_env() -> str | None:
+    explicit = os.environ.get("PUPPETMASTER_CODEX_HOME")
+    if explicit is not None:
+        return explicit
+    if os.environ.get("PUPPETMASTER_AGENT_ID"):
+        return None
+    return os.environ.get("CODEX_HOME")
 
 
 def inherited_pythonpath() -> str | None:
@@ -88,6 +120,7 @@ def inherited_pythonpath() -> str | None:
 def puppetmaster_subprocess_env(config: "Config") -> dict[str, str]:
     env = os.environ.copy()
     env["PUPPETMASTER_STATE_DIR"] = str(config.state_dir)
+    env["PUPPETMASTER_CODEX_HOME"] = str(config.codex_home)
     pythonpath = inherited_pythonpath()
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
@@ -113,6 +146,7 @@ def default_config_data() -> dict[str, Any]:
             "max_log_read_lines": 2000,
         },
         "codex": {
+            "home": "",
             "no_alt_screen": True,
             "bypass_approvals_and_sandbox": True,
         },
@@ -287,6 +321,9 @@ def load_config() -> Config:
     raw = _read_local_config(state_dir)
     limit_raw = raw.get("limits", {})
     codex_raw = raw.get("codex", {})
+    if not isinstance(codex_raw, dict):
+        raise PuppetError("invalid_config", "codex config must be a table")
+    codex_home = resolve_codex_home(_codex_home_from_env() or codex_raw.get("home", ""))
     max_concurrent_children = (
         os.environ.get("PUPPETMASTER_MAX_CONCURRENT_CHILDREN")
         or os.environ.get("PUPPETMASTER_MAX_CHILDREN")
@@ -305,6 +342,7 @@ def load_config() -> Config:
     cfg = Config(
         repo_dir=repo,
         state_dir=state_dir,
+        codex_home=codex_home,
         tmux_session_prefix=os.environ.get("PUPPETMASTER_TMUX_PREFIX", raw.get("tmux_session_prefix", "puppet_")),
         limits=limits,
         discord=_parse_discord_config(raw),
@@ -331,6 +369,7 @@ default_log_lines = 120
 max_log_read_lines = 2000
 
 [codex]
+home = ""
 no_alt_screen = true
 bypass_approvals_and_sandbox = true
 

@@ -172,7 +172,22 @@ def read_log_file(path: str, lines: int) -> str:
     p = Path(path)
     if not p.exists():
         return ""
-    data = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    if lines <= 0:
+        return ""
+    chunks: list[bytes] = []
+    newline_count = 0
+    chunk_size = 64 * 1024
+    with p.open("rb") as fh:
+        fh.seek(0, 2)
+        remaining = fh.tell()
+        while remaining > 0 and newline_count <= lines:
+            size = min(chunk_size, remaining)
+            remaining -= size
+            fh.seek(remaining)
+            chunk = fh.read(size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    data = b"".join(reversed(chunks)).decode("utf-8", errors="replace").splitlines()
     return "\n".join(data[-lines:])
 
 
@@ -251,6 +266,52 @@ def kill_agent(
         tmux=tmux,
     )
     return updated
+
+
+def kill_root_tree(
+    registry: Registry,
+    tmux: Tmux,
+    root_agent_id: str,
+    *,
+    source: str = "human_cli",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    root = registry.get_agent(root_agent_id)
+    if root["role"] != "orchestrator" or root["id"] != root["root_id"]:
+        raise PuppetError(
+            "invalid_agent",
+            f"agent is not a root orchestrator: {root_agent_id}",
+            "Pass the root orchestrator id whose tmux tree should be killed.",
+        )
+
+    agents = sorted(registry.list_agents(root_id=root_agent_id, include_dead=True), key=lambda item: int(item["depth"]), reverse=True)
+    killed: list[str] = []
+    not_live: list[str] = []
+    for agent in agents:
+        if not tmux.session_exists(agent["tmux_session"]):
+            not_live.append(agent["id"])
+            continue
+        if not dry_run:
+            tmux.kill_session(agent["tmux_session"])
+            registry.update_agent(agent["id"], status="killed", stopped_at=now(), termination_reason="killed")
+            registry.append_event(
+                agent["id"],
+                "agent.killed",
+                "Agent killed by root tree command.",
+                {"root_agent_id": root_agent_id, "tmux_session": agent["tmux_session"]},
+                severity="warning",
+                source=source,
+            )
+        killed.append(agent["id"])
+
+    return {
+        "root_agent_id": root_agent_id,
+        "dry_run": dry_run,
+        "candidates": agents,
+        "killed": killed if not dry_run else [],
+        "would_kill": killed if dry_run else [],
+        "not_live": not_live,
+    }
 
 
 def cleanup_completed_agents(
@@ -631,6 +692,7 @@ def format_event_prompt(registry: Registry, deliveries: list[dict[str, Any]], re
                     f'- read_agent({{"agent_id":"{agent["id"]}","lines":120}})',
                     f'- prompt_agent({{"agent_id":"{agent["id"]}","prompt":"..."}})',
                     f'- stop_agent({{"agent_id":"{agent["id"]}"}})',
+                    f'- kill_agent({{"agent_id":"{agent["id"]}"}}) after final output is consumed and the agent is no longer useful',
                 ]
             )
         )
@@ -696,12 +758,22 @@ def discover_codex() -> dict[str, Any]:
 
 def prompt_text(agent: dict[str, Any], user_prompt: str) -> str:
     orchestration = ""
+    human_message_tools = ""
     if agent["role"] == "orchestrator":
+        human_message_tools = """
+- Always use send_human_message for every human-facing message, including answers, status updates, readiness notices, and blockers.
+- Regularly update the human with send_human_message during longer work, after meaningful progress, and before waiting on child agents or external events.
+"""
         orchestration = """
 Orchestrator event loop:
-- Use the Puppetmaster create_agent() tool to create child agents when parallel work is useful.
+- Your primary role is orchestration: break down work, delegate execution, monitor progress, integrate results, and keep the human informed.
+- Do small, low-risk tasks yourself when delegation would add more overhead than value.
+- Delegate larger, multi-step, research-heavy, test-heavy, or parallelizable tasks to Puppetmaster child agents with create_agent().
+- Do not take on the main implementation or investigation yourself when a task is large enough for child-agent execution.
 - Do not use Codex's default spawn_agent tool for Puppetmaster child-agent delegation; those agents are outside the Puppetmaster event loop.
 - When a child completes, blocks, fails, stops, is killed, or finishes a turn, Puppetmaster queues a state-change event for you.
+- When a child is complete, failed, cancelled, or otherwise no longer useful, inspect/read any final output you need, then call kill_agent(child_id) to close its tmux session and prevent stale Codex processes from accumulating.
+- Do not kill a child you still expect to prompt, resume, or inspect for more work.
 - If you are only waiting for child-agent progress, do not call wait(). Simply end your turn. Puppetmaster will send you a fresh PUPPETMASTER EVENT message when a subagent changes state.
 - Call wait(seconds, reason) only when you need a time-based wakeup, such as polling after a backoff or checking something again at a specific interval.
 - The wait tool does not sleep inside the tool call. It schedules a durable wakeup and returns immediately; after calling it, end your turn.
@@ -725,9 +797,9 @@ Puppetmaster tools:
 - Use create_agent to delegate work to child agents when that helps the task.
 - Use inspect_agent and read_agent to understand child state and recent output.
 - Use prompt_agent to send follow-up instructions to a live child agent.
-- Always use send_human_message for every human-facing message, including answers, status updates, readiness notices, and blockers.
-- Regularly update the human with send_human_message during longer work, after meaningful progress, and before waiting on child agents or external events.
-- Use stop_agent or kill_agent only when a child should no longer continue.
+- Child agents do not have direct human-message tools. Report results through complete_agent, blockers through complete_agent with status blocked, or ask your parent/root agent to contact the human.
+{human_message_tools.rstrip()}
+- Use kill_agent after consuming final child output when a child is no longer useful; this closes the tmux session and Codex process. Use stop_agent when you want a gentler interrupt.
 - Use wait(seconds, reason) only for a time-based wakeup. End your turn after calling wait.
 {orchestration}
 Completion:
@@ -808,8 +880,8 @@ def deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def user_codex_config() -> dict[str, Any]:
-    config_path = Path.home() / ".codex" / "config.toml"
+def user_codex_config(codex_home: Path) -> dict[str, Any]:
+    config_path = codex_home / "config.toml"
     if not config_path.exists():
         return {}
     try:
@@ -844,6 +916,7 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         "PUPPETMASTER_PARENT_AGENT_ID": agent.get("parent_id") or "",
         "PUPPETMASTER_ROOT_AGENT_ID": agent["root_id"],
         "PUPPETMASTER_STATE_DIR": str(config.state_dir),
+        "PUPPETMASTER_CODEX_HOME": str(config.codex_home),
         "PUPPETMASTER_CONFIG_DIR": str(codex_home),
         "PUPPETMASTER_ROLE": agent["role"],
     }
@@ -865,7 +938,10 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
             }
         },
     }
-    config_toml.write_text(toml_dumps(deep_merge(user_codex_config(), generated_codex_config)), encoding="utf-8")
+    config_toml.write_text(
+        toml_dumps(deep_merge(user_codex_config(config.codex_home), generated_codex_config)),
+        encoding="utf-8",
+    )
     hooks_json.write_text(
         json.dumps(
             {
@@ -888,7 +964,7 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         ),
         encoding="utf-8",
     )
-    auth_json = Path.home() / ".codex" / "auth.json"
+    auth_json = config.codex_home / "auth.json"
     if auth_json.exists() and not (codex_home / "auth.json").exists():
         try:
             (codex_home / "auth.json").symlink_to(auth_json)
@@ -909,6 +985,7 @@ export PUPPETMASTER_AGENT_ID={agent['id']!r}
 export PUPPETMASTER_PARENT_AGENT_ID={agent.get('parent_id') or ''}
 export PUPPETMASTER_ROOT_AGENT_ID={agent['root_id']!r}
 export PUPPETMASTER_STATE_DIR={str(config.state_dir)!r}
+export PUPPETMASTER_CODEX_HOME={str(config.codex_home)!r}
 export PUPPETMASTER_CONFIG_DIR={str(codex_home)!r}
 export PUPPETMASTER_ROLE={agent['role']!r}
 {pythonpath_export}\
@@ -918,7 +995,14 @@ exec {codex!r} {' '.join(shlex_quote(flag) for flag in flags)}
         encoding="utf-8",
     )
     launch.chmod(0o755)
-    return {"prompt": str(prompt_path), "launch": str(launch), "config": str(config_toml), "hook": str(stop_hook)}
+    return {
+        "prompt": str(prompt_path),
+        "launch": str(launch),
+        "config": str(config_toml),
+        "hook": str(stop_hook),
+        "codex_home": str(codex_home),
+        "source_codex_home": str(config.codex_home),
+    }
 
 
 def codex_hook_trust_hash(command: str, status_message: str | None, timeout: int) -> str:
@@ -1002,14 +1086,18 @@ def start_orchestrator(
     name: str | None = "root",
     new_root: bool = False,
     agent_id: str | None = None,
+    goal: bool = False,
+    codex_home: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
+    config = config.with_codex_home(codex_home) if codex_home is not None else config
+    task = f"/goal {prompt.strip()}" if goal and prompt.strip() else prompt
     return create_codex_agent(
         config,
         registry,
         tmux,
         cwd=cwd,
         description="Root Puppetmaster orchestrator",
-        prompt=prompt,
+        prompt=task,
         parent_id=None,
         name=name,
         role="orchestrator",

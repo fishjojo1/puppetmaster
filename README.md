@@ -25,7 +25,7 @@ If you bind Discord to Puppetmaster, the bound Discord channel becomes a remote 
 - Python 3.11+
 - tmux
 - Codex CLI on `PATH`
-- Codex authentication available in `~/.codex/auth.json`
+- Codex authentication available in `~/.codex/auth.json` or in the configured source `CODEX_HOME`
 
 ## Setup
 
@@ -91,6 +91,17 @@ puppet orchestrator start \
 
 Custom root ids must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}` and must not contain `..`. Duplicate ids, existing agent directories, and existing derived tmux sessions are rejected before Puppetmaster creates the root. When `--agent-id` is omitted, Puppetmaster keeps generating `agt_...` ids.
 
+To start a root tree from a non-default Codex home, pass `--codex-home` or set `CODEX_HOME` for the `puppet orchestrator start` command:
+
+```bash
+puppet orchestrator start \
+  --cwd /home/kek/Projects/project-a \
+  --codex-home /path/to/codex-home \
+  --prompt "Manage project A."
+```
+
+Puppetmaster still gives every managed agent its own generated `CODEX_HOME`; the configured source home is used for Codex config/auth and is inherited by child agents spawned through the root's MCP tools.
+
 When you run from the project directory, `--cwd` is optional and defaults to the current directory:
 
 ```bash
@@ -119,6 +130,13 @@ Print the attach command without attaching:
 
 ```bash
 puppet agent attach <agent-id> --print
+```
+
+Kill all live tmux sessions for one root tree while leaving other roots alone:
+
+```bash
+puppet agent kill-tree <root-agent-id>
+puppet agent kill-tree <root-agent-id> --dry-run
 ```
 
 ## Discord Bot
@@ -202,11 +220,14 @@ Slash commands:
 /puppet screenshot mode:<optional>
 /puppet compact
 /puppet clear
+/skills skill-name:<optional> prompt:<optional> forget:<optional>
 ```
 
 After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Attachments are ignored in v1.
 
 `/puppet agents` formats each root id in its own copy-friendly code block so Discord users can copy one id at a time.
+
+`/skills` manages reusable Discord prompts. With no arguments it lists saved skills. With `skill-name` and `prompt`, it creates or updates a skill. With only `skill-name`, it sends that saved prompt to the channel's bound root orchestrator. With `skill-name` and `forget:true`, it deletes the skill.
 
 `/puppet screenshot` captures the bound root orchestrator's current tmux pane, renders the visible terminal text as a PNG, and posts it as an attachment. The renderer preserves common ANSI colors and handles wide Unicode, emoji, combining marks, variation selectors, and Nerd Font symbols. This default mode is headless and avoids capturing unrelated desktop content.
 
@@ -220,11 +241,11 @@ native-screen   Try to capture the focused native desktop screen, then fall back
 
 Native screenshot backends are best-effort and environment-dependent. Puppetmaster currently tries niri, gnome-screenshot, scrot, and ImageMagick import on X11 where available.
 
-`/puppet compact` sends Codex `/compact` to the bound root and then queues the generated orchestrator prompt with a compacted-context task. `/puppet clear` sends Codex `/clear` to the bound root and then queues the generated orchestrator prompt with a cleared-context task. These recovery prompts tell the root to report readiness through `send_human_message`.
+`/puppet compact` sends Codex `/compact` to the bound root and then, after a short delay, queues the generated orchestrator prompt with a compacted-context task. `/puppet clear` sends Codex `/clear` to the bound root and then, after a short delay, queues the generated orchestrator prompt with a cleared-context task. These recovery prompts tell the root to report readiness through `send_human_message`.
 
-When an orchestrator or child calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound replies are chunked to fit Discord limits.
+When a root orchestrator calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound replies are chunked to fit Discord limits.
 
-Bindings and outbound messages are durable in SQLite. On restart, existing channel bindings still work, pending outbound messages are delivered once, and delivered or failed rows are not resent. Typing indicators are best-effort in-memory state and are reset by a bot restart.
+Bindings, reusable skills, and outbound messages are durable in SQLite. On restart, existing channel bindings still work, saved skills remain available, pending outbound messages are delivered once, and delivered or failed rows are not resent. Typing indicators are best-effort in-memory state and are reset by a bot restart.
 
 After an inbound prompt is delivered, the bot shows typing while the orchestrator is working. Typing stops when `send_human_message` is delivered, the root turn stops, or `typing_timeout_seconds` expires.
 
@@ -295,10 +316,18 @@ pause_agent
 resume_agent
 attach_agent
 wait
-send_human_message
+send_human_message  # root orchestrators only
 ```
 
 `create_agent` can start a child in goal mode with `goal: true`. `goal` is an optional boolean; when true, Puppetmaster prepends literal `/goal ` to the start of the child agent's initial `prompt`. It does nothing else. `create_agent` always requires an explicit absolute `cwd` and a `prompt`; v1 does not default to the caller's cwd and does not create worktrees.
+
+`puppet orchestrator start --goal` applies the same literal `/goal ` prefix to the root orchestrator's initial prompt.
+
+Generated root orchestrator prompts frame the root as a coordinator. Roots can handle small, low-risk work directly, but larger, multi-step, research-heavy, test-heavy, or parallelizable tasks should be delegated to child agents with `create_agent`.
+
+When a child is complete or no longer useful, roots are instructed to inspect/read any final output they need and then call `kill_agent(agent_id)`. That force-kills the child's tmux session and Codex process so completed work does not leave hundreds of idle Codex binaries behind.
+
+Child agents do not receive `send_human_message` in their MCP tool surface. They should report results with `complete_agent`, mark blockers with `complete_agent status:blocked`, or ask the parent/root to contact the human.
 
 `wait` accepts positive seconds up to `[limits].max_wait_seconds` in `~/.puppetmaster/config.toml` (default `3600`). It does not sleep inside the MCP call.
 
@@ -319,7 +348,7 @@ By default Puppetmaster writes state in `~/.puppetmaster/`:
 ~/.puppetmaster/agents/<agent-id>/codex-config/
 ```
 
-Each generated `codex-config/config.toml` starts from `~/.codex/config.toml` and overlays the per-agent hooks, project trust, and Puppetmaster MCP server settings. `CODEX_HOME` is still per-agent so Puppetmaster can avoid mutating your global Codex config while giving each managed session its own hook trust and runtime state.
+Each generated `codex-config/config.toml` starts from the configured source Codex home and overlays the per-agent hooks, project trust, and Puppetmaster MCP server settings. The source defaults to `~/.codex`, can be set globally with `[codex].home` in `~/.puppetmaster/config.toml`, can be overridden for a root tree with `puppet orchestrator start --codex-home`, and honors `CODEX_HOME` when starting a root from the shell. Runtime `CODEX_HOME` is still per-agent so Puppetmaster can avoid mutating your global Codex config while giving each managed session its own hook trust and runtime state.
 
 Override the state directory with `PUPPETMASTER_STATE_DIR` when you want an isolated registry, config, logs, and Discord PID file:
 

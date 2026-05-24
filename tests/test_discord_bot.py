@@ -23,6 +23,7 @@ from puppetmaster.discord_bot import (
     handle_compact_command,
     handle_read_command,
     handle_screenshot_command,
+    handle_skills_command,
     handle_status_command,
     handle_tree_command,
     handle_unbind_command,
@@ -107,6 +108,15 @@ class FakeAppCommandGroup:
 
 class FakeAppCommandsModule:
     Group = FakeAppCommandGroup
+
+    @staticmethod
+    def command(name: str, description: str):
+        def decorator(func):
+            func.command_name = name
+            func.command_description = description
+            return func
+
+        return decorator
 
     @staticmethod
     def describe(**_kwargs):
@@ -913,6 +923,69 @@ def test_unbind_removes_binding(ctx, tmp_path):
     assert handle_unbind_command(reg, FakeTextChannel()) == "This channel was not bound."
 
 
+def test_skills_lists_saved_skill_names(ctx):
+    _cfg, reg, _tmux = ctx
+    reg.upsert_discord_skill("review", "Review the diff.")
+    reg.upsert_discord_skill("test-plan", "Write a test plan.")
+
+    output = handle_skills_command(reg, FakeTmux(), FakeTextChannel())
+
+    assert output.splitlines() == ["Saved skills:", "- review", "- test-plan"]
+
+
+def test_skills_saves_updates_and_forgets_prompts(ctx):
+    _cfg, reg, _tmux = ctx
+
+    saved = handle_skills_command(reg, FakeTmux(), FakeTextChannel(), "Review", "  Review the current diff.  ")
+    updated = handle_skills_command(reg, FakeTmux(), FakeTextChannel(), "review", "Review staged changes.")
+    forgotten = handle_skills_command(reg, FakeTmux(), FakeTextChannel(), "review", forget=True)
+
+    assert saved == "Saved skill: review"
+    assert updated == "Saved skill: review"
+    assert forgotten == "Forgot skill: review"
+    assert reg.discord_skill("review") is None
+
+
+def test_skills_rejects_invalid_names(ctx):
+    _cfg, reg, _tmux = ctx
+
+    with pytest.raises(PuppetError) as exc:
+        handle_skills_command(reg, FakeTmux(), FakeTextChannel(), "../secret", "Do work.")
+
+    assert exc.value.code == "invalid_skill_name"
+
+
+def test_skills_runs_saved_prompt_against_bound_root(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    reg.upsert_discord_skill("release-check", "Check release readiness.")
+    tmux = FakeTmux(live=True)
+
+    output = handle_skills_command(reg, tmux, FakeTextChannel(), "release-check")
+
+    assert output == f"Sent skill to {root['id']}: release-check"
+    assert tmux.sent_prompts == [
+        (
+            root["tmux_session"],
+            f"{DISCORD_PROMPT_PREFIX}Run Discord skill `release-check`:\n\nCheck release readiness.",
+        )
+    ]
+    event = reg.list_events(root["id"], limit=1)[0]
+    assert event["type"] == "agent.prompted"
+    assert event["source"] == "discord"
+
+
+def test_skills_run_requires_channel_binding(ctx):
+    _cfg, reg, _tmux = ctx
+    reg.upsert_discord_skill("review", "Review the diff.")
+
+    with pytest.raises(PuppetError) as exc:
+        handle_skills_command(reg, FakeTmux(live=True), FakeTextChannel(), "review")
+
+    assert exc.value.code == "not_bound"
+
+
 def test_status_requires_a_binding(ctx):
     _cfg, reg, _tmux = ctx
 
@@ -1102,7 +1175,7 @@ def test_compact_sends_literal_command_to_bound_root_without_prompt_events(ctx, 
 
     assert result.root_agent_id == root["id"]
     assert result.channel_id == "channel-1"
-    assert result.turn_stop_count == 0
+    assert result.command == "/compact"
     assert fake_tmux.checked == [root["tmux_session"]]
     assert fake_tmux.sent_prompts == [(root["tmux_session"], "/compact")]
     assert child["tmux_session"] not in [session for session, _prompt in fake_tmux.sent_prompts]
@@ -1110,29 +1183,35 @@ def test_compact_sends_literal_command_to_bound_root_without_prompt_events(ctx, 
     assert reg.pending_deliveries(root["id"]) == []
 
 
-def test_compact_does_not_treat_future_stop_hooks_as_completion(ctx, tmp_path):
+def test_compact_delays_post_compact_prompt_without_waiting_for_turn_stop(ctx, tmp_path, monkeypatch):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
     handle_bind_command(reg, FakeTextChannel(), root["id"])
     channel = FakeDiscordChannel("channel-1", FakeDiscordGuild("guild-1"))
     fake_tmux = FakeTmux(live=True)
+    monkeypatch.setattr(discord_bot_module, "POST_RESET_PROMPT_DELAY_SECONDS", 0)
 
     async def run():
         runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
         try:
             acknowledgement = runtime.request_compact(channel)
-            handle_stop_hook(reg, root["id"], "{}")
-            await runtime.poll_once()
-            return acknowledgement
+            before_delay = list(fake_tmux.sent_prompts)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return acknowledgement, before_delay
         finally:
             await runtime.close()
 
-    acknowledgement = asyncio.run(run())
+    acknowledgement, before_delay = asyncio.run(run())
 
     assert acknowledgement == f"Sent /compact to {root['id']}."
-    assert fake_tmux.sent_prompts == [(root["tmux_session"], "/compact")]
+    assert before_delay == [(root["tmux_session"], "/compact")]
+    assert len(fake_tmux.sent_prompts) == 2
+    session, prompt = fake_tmux.sent_prompts[1]
+    assert session == root["tmux_session"]
+    assert "Your context has just been compacted." in prompt
     assert channel.sent == []
-    assert reg.count_events(root["id"], "agent.turn_stopped") == 1
+    assert reg.count_events(root["id"], "agent.turn_stopped") == 0
     prompted_events = [event for event in reg.list_events(root["id"]) if event["type"] == "agent.prompted"]
     assert prompted_events == []
 
@@ -1143,7 +1222,7 @@ def test_compact_queues_post_compact_orchestration_prompt(ctx, tmp_path, monkeyp
     handle_bind_command(reg, FakeTextChannel(), root["id"])
     channel = FakeDiscordChannel("channel-1", FakeDiscordGuild("guild-1"))
     fake_tmux = FakeTmux(live=True)
-    monkeypatch.setattr(discord_bot_module, "POST_COMPACT_PROMPT_DELAY_SECONDS", 0)
+    monkeypatch.setattr(discord_bot_module, "POST_RESET_PROMPT_DELAY_SECONDS", 0)
 
     async def run():
         runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
@@ -1173,26 +1252,30 @@ def test_compact_queues_post_compact_orchestration_prompt(ctx, tmp_path, monkeyp
     assert "spawn_agent" in prompt
 
 
-def test_compact_ignores_stop_hooks_that_precede_request(ctx, tmp_path):
+def test_compact_queues_post_compact_prompt_even_with_previous_stop_hooks(ctx, tmp_path, monkeypatch):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
     handle_bind_command(reg, FakeTextChannel(), root["id"])
     channel = FakeDiscordChannel("channel-1", FakeDiscordGuild("guild-1"))
     fake_tmux = FakeTmux(live=True)
     handle_stop_hook(reg, root["id"], "{}")
+    monkeypatch.setattr(discord_bot_module, "POST_RESET_PROMPT_DELAY_SECONDS", 0)
 
     async def run():
         runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
         try:
             runtime.request_compact(channel)
-            await runtime.poll_once()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
         finally:
             await runtime.close()
 
     asyncio.run(run())
 
     assert channel.sent == []
-    assert fake_tmux.sent_prompts == [(root["tmux_session"], "/compact")]
+    assert fake_tmux.sent_prompts[0] == (root["tmux_session"], "/compact")
+    assert len(fake_tmux.sent_prompts) == 2
+    assert "Your context has just been compacted." in fake_tmux.sent_prompts[1][1]
 
 
 def test_clear_requires_a_binding(ctx):
@@ -1242,7 +1325,7 @@ def test_runtime_clear_queues_post_clear_orchestration_prompt(ctx, tmp_path, mon
     handle_bind_command(reg, FakeTextChannel(), root["id"])
     channel = FakeDiscordChannel("channel-1", FakeDiscordGuild("guild-1"))
     fake_tmux = FakeTmux(live=True)
-    monkeypatch.setattr(discord_bot_module, "POST_COMPACT_PROMPT_DELAY_SECONDS", 0)
+    monkeypatch.setattr(discord_bot_module, "POST_RESET_PROMPT_DELAY_SECONDS", 0)
 
     async def run():
         runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, fake_tmux)
@@ -1378,6 +1461,7 @@ def test_build_discord_bot_reports_missing_guild_access(ctx, monkeypatch):
     assert "screenshot" in {name for name, _description, _func in group.commands}
     assert "compact" in {name for name, _description, _func in group.commands}
     assert "clear" in {name for name, _description, _func in group.commands}
+    assert bot.tree.added[1][0].command_name == "skills"
     assert exc.value.code == "discord_guild_access_denied"
     assert "guild 123" in exc.value.message
     assert "Missing Access" in exc.value.message

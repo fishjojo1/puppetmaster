@@ -13,6 +13,10 @@ from .services import read_agent
 from .tmux import Tmux
 
 
+PREVIEW_DEBOUNCE_SECONDS = 0.15
+INPUT_POLL_SECONDS = 0.1
+
+
 def short_id(agent_id: str) -> str:
     return agent_id.split("_", 1)[-1][:8]
 
@@ -37,6 +41,29 @@ def build_tree_rows(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     walk(None, 0)
     return rows
+
+
+def summarize_agent_relationships(agents: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]:
+    by_parent: dict[str | None, list[str]] = {}
+    agent_ids = {agent["id"] for agent in agents}
+    for agent in agents:
+        by_parent.setdefault(agent["parent_id"], []).append(agent["id"])
+
+    child_counts = {agent_id: len(by_parent.get(agent_id, [])) for agent_id in agent_ids}
+    descendant_counts: dict[str, int] = {}
+
+    def count_descendants(agent_id: str) -> int:
+        if agent_id in descendant_counts:
+            return descendant_counts[agent_id]
+        total = 0
+        for child_id in by_parent.get(agent_id, []):
+            total += 1 + count_descendants(child_id)
+        descendant_counts[agent_id] = total
+        return total
+
+    for agent_id in agent_ids:
+        count_descendants(agent_id)
+    return child_counts, descendant_counts
 
 
 def format_tree_row(row: dict[str, Any], live: bool) -> str:
@@ -111,8 +138,12 @@ class TuiApp:
         self.preview_source = "-"
         self.tree_stats: dict[str, Any] = {}
         self.agent_stats: dict[str, Any] = {}
+        self.child_counts: dict[str, int] = {}
+        self.descendant_counts: dict[str, int] = {}
         self.message = ""
         self.last_refresh = 0.0
+        self.preview_refresh_due_at: float | None = None
+        self.preview_reset_pending = False
 
     def run(self, stdscr: Any) -> None:
         try:
@@ -120,7 +151,7 @@ class TuiApp:
         except curses.error:
             pass
         stdscr.keypad(True)
-        stdscr.timeout(int(self.refresh * 1000))
+        stdscr.timeout(self.input_timeout_ms())
         try:
             curses.mousemask(curses.ALL_MOUSE_EVENTS)
             curses.mouseinterval(0)
@@ -137,8 +168,11 @@ class TuiApp:
 
         self.reload(force_preview=True)
         while True:
-            if time.monotonic() - self.last_refresh >= self.refresh:
-                self.reload(force_preview=True)
+            current_time = time.monotonic()
+            if current_time - self.last_refresh >= self.refresh:
+                self.reload(force_preview=self.preview_refresh_due_at is None)
+                current_time = time.monotonic()
+            self.maybe_refresh_debounced_preview(current_time)
             self.draw(stdscr)
             key = stdscr.getch()
             if key == -1:
@@ -154,6 +188,7 @@ class TuiApp:
             self.live_sessions = {item["session"] for item in sessions}
             self.rows = build_tree_rows(agents)
             self.tree_stats = summarize_tree(agents, self.live_sessions)
+            self.child_counts, self.descendant_counts = summarize_agent_relationships(agents)
             if self.selected >= len(self.rows):
                 self.selected = max(0, len(self.rows) - 1)
             if force_preview:
@@ -166,8 +201,30 @@ class TuiApp:
             self.preview_source = "error"
             self.tree_stats = {}
             self.agent_stats = {}
+            self.child_counts = {}
+            self.descendant_counts = {}
+
+    def input_timeout_ms(self) -> int:
+        return max(10, int(min(self.refresh, INPUT_POLL_SECONDS) * 1000))
+
+    def schedule_preview_refresh(self, *, reset_scroll: bool = False) -> None:
+        self.preview_refresh_due_at = time.monotonic() + PREVIEW_DEBOUNCE_SECONDS
+        self.preview_reset_pending = self.preview_reset_pending or reset_scroll
+
+    def maybe_refresh_debounced_preview(self, current_time: float | None = None) -> bool:
+        if self.preview_refresh_due_at is None:
+            return False
+        if (current_time if current_time is not None else time.monotonic()) < self.preview_refresh_due_at:
+            return False
+        reset_scroll = self.preview_reset_pending
+        self.preview_refresh_due_at = None
+        self.preview_reset_pending = False
+        self.refresh_preview(reset_scroll=reset_scroll)
+        return True
 
     def refresh_preview(self, *, reset_scroll: bool = False) -> None:
+        self.preview_refresh_due_at = None
+        self.preview_reset_pending = False
         agent = self.current_agent()
         if not agent:
             self.preview = "No agents found."
@@ -187,16 +244,13 @@ class TuiApp:
             self.preview_scroll = 0
 
     def collect_agent_stats(self, agent: dict[str, Any]) -> dict[str, Any]:
-        children = self.registry.children(agent["id"])
-        pending = self.registry.pending_deliveries(agent["id"], limit=None)
-        events = self.registry.list_events(agent["id"], limit=10_000)
         log_path = Path(agent["log_path"])
         context_left = parse_context_left(self.preview)
         return {
-            "children": len(children),
-            "descendants": len(self.registry.descendants(agent["id"])),
-            "pending": len(pending),
-            "events": len(events),
+            "children": self.child_counts.get(agent["id"], 0),
+            "descendants": self.descendant_counts.get(agent["id"], 0),
+            "pending": self.registry.count_pending_deliveries(agent["id"]),
+            "events": self.registry.count_events(agent["id"]),
             "log_bytes": log_path.stat().st_size if log_path.exists() else 0,
             "log_lines": count_log_lines(agent["log_path"]),
             "context_left": context_left or "unknown",
@@ -228,11 +282,15 @@ class TuiApp:
         elif key == curses.KEY_MOUSE:
             self.handle_mouse(stdscr)
         elif key == ord("g"):
+            previous = self.selected
             self.selected = 0
-            self.refresh_preview(reset_scroll=True)
+            if self.selected != previous:
+                self.schedule_preview_refresh(reset_scroll=True)
         elif key == ord("G"):
+            previous = self.selected
             self.selected = max(0, len(self.rows) - 1)
-            self.refresh_preview(reset_scroll=True)
+            if self.selected != previous:
+                self.schedule_preview_refresh(reset_scroll=True)
         elif key == ord("r"):
             self.reload(force_preview=True)
         elif key in {10, 13, curses.KEY_ENTER, ord("a")}:
@@ -242,9 +300,11 @@ class TuiApp:
     def move_selection(self, delta: int, stdscr: Any) -> None:
         if not self.rows:
             return
+        previous = self.selected
         self.selected = min(max(self.selected + delta, 0), len(self.rows) - 1)
         self.ensure_selected_visible(stdscr)
-        self.refresh_preview(reset_scroll=True)
+        if self.selected != previous:
+            self.schedule_preview_refresh(reset_scroll=True)
 
     def preview_page_size(self, stdscr: Any) -> int:
         height, _width = stdscr.getmaxyx()
@@ -312,7 +372,7 @@ class TuiApp:
         finally:
             stdscr.clear()
             stdscr.keypad(True)
-            stdscr.timeout(int(self.refresh * 1000))
+            stdscr.timeout(self.input_timeout_ms())
             self.reload(force_preview=True)
 
     def draw(self, stdscr: Any) -> None:

@@ -8,6 +8,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - Any managed agent can create children through MCP: `create_agent` MCP tool.
 - Every managed session runs in tmux: `Tmux.create_session`.
 - Codex no-sandbox/no-approval mode is generated: `write_codex_files` launch flags.
+- Configurable source Codex homes are supported for root trees: `puppet orchestrator start --codex-home`, `[codex].home`, `CODEX_HOME`, and `PUPPETMASTER_CODEX_HOME`; runtime `CODEX_HOME` remains per-agent.
 - Durable registry exists: `~/.puppetmaster/registry.sqlite`, `Registry`.
 - Durable terminal logs exist: per-agent `terminal.log`, tmux `pipe-pane`.
 - Agent inspection works: `puppet agent inspect`, `inspect_agent`.
@@ -20,7 +21,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - Subagent Stop hook records `agent.turn_stopped`: `handle_stop_hook`.
 - Orchestrator Stop hook drains events: `puppet hook drain-events`.
 - MCP server command exists: `puppet mcp serve`.
-- Required MCP tools are registered: `src/puppetmaster/mcp_server.py`.
+- Required MCP tools are registered: `src/puppetmaster/mcp_server.py`. `send_human_message` is root-orchestrator only and is removed from child-agent MCP tool listings. Orchestrator prompts and event prompts surface `kill_agent` as the cleanup action after final child output has been consumed.
 
 ## Completion And Events
 
@@ -38,23 +39,26 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - `puppet init` creates or updates global config, supports interactive hidden token entry, non-interactive Discord flags, JSON output, and optional background Discord startup.
 - `puppet orchestrator start` can create multiple root orchestrators in one global registry; roots remain distinct by `id`, `root_id`, and `cwd`.
 - `puppet orchestrator start --agent-id <id>` creates a root with an exact safe id; unsafe ids, duplicate registry ids, existing agent directories, and existing derived tmux sessions fail before root creation.
-- `agent create`, `agent list`, `agent tree`, `agent inspect`, `agent read`, `agent prompt`, `agent attach`, `agent stop`, `agent kill`, `agent complete` exist.
+- `puppet orchestrator start --codex-home <path>` uses that Codex home as the root tree's source config/auth home and propagates it to MCP-spawned child agents.
+- `puppet orchestrator start --goal` prepends literal `/goal ` to the root orchestrator's initial prompt.
+- `agent create`, `agent list`, `agent tree`, `agent inspect`, `agent read`, `agent prompt`, `agent attach`, `agent stop`, `agent kill`, `agent kill-tree`, `agent complete` exist.
 - Compatibility aliases exist for milestone commands: `agent create-raw`, `agent create-codex`, `debug create-raw`.
 - JSON output exists for data-returning commands through `--json`.
 
 ## Discord Integration
 
 - Discord config exists in global `~/.puppetmaster/config.toml`: `[discord]` in `Config`.
-- Discord state is durable in SQLite: `discord_channel_bindings` and `outbound_human_messages`.
+- Discord state is durable in SQLite: `discord_channel_bindings`, `discord_skills`, and `outbound_human_messages`.
 - The bot entrypoint exists: `puppet discord serve`, `run_discord_bot`.
 - Background Discord process management stores `discord-bot.pid` and `discord-bot.log` in the active state directory, rejects duplicate starts for the same state, clears stale PID files on start, and honors `PUPPETMASTER_STATE_DIR` isolation.
-- Guild-scoped slash commands exist: `/puppet agents`, `/puppet bind`, `/puppet unbind`, `/puppet status`, `/puppet read`, `/puppet tree`, `/puppet screenshot`.
+- Guild-scoped slash commands exist: `/puppet agents`, `/puppet bind`, `/puppet unbind`, `/puppet status`, `/puppet read`, `/puppet tree`, `/puppet screenshot`, `/puppet compact`, `/puppet clear`, and `/skills`.
 - `/puppet bind` accepts root orchestrators only: `handle_bind_command`.
 - `/puppet screenshot` captures the bound root orchestrator's visible tmux pane and sends a rendered terminal-text PNG attachment.
 - Channel binding is the global routing layer: one channel maps to one root, one root maps to one channel, and two channels can drive two different roots in one registry.
 - Mention/reply-only inbound prompt routing exists: `DiscordRuntime.handle_message`.
 - Inbound Discord prompts use `DISCORD MESSAGE RECEIVED:\n<message>`.
-- Outbound human replies use frontend-neutral `send_human_message`.
+- Reusable Discord skills persist prompt text and `/skills skill-name:<name>` sends the saved prompt to the channel's bound root.
+- Outbound human replies use frontend-neutral `send_human_message` from root orchestrators.
 - Outbound Discord dispatch is durable and status-based: pending rows deliver, delivered/failed rows are not selected again.
 - Typing indicators start after inbound prompt delivery and stop on outbound delivery, root turn stop, or timeout.
 - Discord runtime errors are short and actionable, with setup hints for unbound channels and status/read hints for dead sessions.

@@ -25,6 +25,7 @@ from puppetmaster.services import (
     handle_stop_hook,
     inject_pending_prompt,
     kill_agent,
+    kill_root_tree,
     pause_agent,
     prompt_text,
     reconcile,
@@ -37,7 +38,14 @@ from puppetmaster.services import (
 )
 from puppetmaster.tmux import Tmux
 import puppetmaster.tui as tui_module
-from puppetmaster.tui import TuiApp, build_tree_rows, format_tree_row, parse_context_left, summarize_tree
+from puppetmaster.tui import (
+    TuiApp,
+    build_tree_rows,
+    format_tree_row,
+    parse_context_left,
+    summarize_agent_relationships,
+    summarize_tree,
+)
 
 
 @pytest.fixture()
@@ -143,10 +151,56 @@ def test_default_config_creation_writes_discord_section(tmp_path, monkeypatch):
 
     data = tomllib.loads((state_dir / "config.toml").read_text(encoding="utf-8"))
     assert "discord" in data
+    assert data["codex"]["home"] == ""
     assert data["discord"]["token"] == ""
     assert data["discord"]["guild_id"] == ""
     assert cfg.discord.token is None
     assert cfg.discord.guild_id is None
+
+
+def test_load_config_uses_configured_codex_home_sources(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    home = tmp_path / "home"
+    source_home = tmp_path / "source-codex"
+    managed_source_home = tmp_path / "managed-source-codex"
+    generated_home = tmp_path / "generated-agent-codex"
+    home.mkdir()
+    source_home.mkdir()
+    managed_source_home.mkdir()
+    generated_home.mkdir()
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PUPPETMASTER_AGENT_ID", raising=False)
+    monkeypatch.delenv("PUPPETMASTER_CODEX_HOME", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    default_cfg = load_config()
+    assert default_cfg.codex_home == (home / ".codex").resolve()
+
+    (state_dir / "config.toml").write_text(
+        """[codex]
+home = "~/source-codex"
+""",
+        encoding="utf-8",
+    )
+    configured_cfg = load_config()
+    assert configured_cfg.codex_home == (home / "source-codex").resolve()
+
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    env_cfg = load_config()
+    assert env_cfg.codex_home == source_home.resolve()
+
+    monkeypatch.setenv("PUPPETMASTER_AGENT_ID", "agt_root")
+    monkeypatch.delenv("PUPPETMASTER_CODEX_HOME", raising=False)
+    monkeypatch.setenv("CODEX_HOME", str(generated_home))
+    managed_without_source_cfg = load_config()
+    assert managed_without_source_cfg.codex_home == (home / "source-codex").resolve()
+
+    monkeypatch.setenv("PUPPETMASTER_CODEX_HOME", str(managed_source_home))
+    monkeypatch.setenv("CODEX_HOME", str(generated_home))
+    managed_cfg = load_config()
+    assert managed_cfg.codex_home == managed_source_home.resolve()
 
 
 def test_init_no_input_creates_default_config(tmp_path, monkeypatch, capsys):
@@ -173,6 +227,7 @@ def test_init_no_input_creates_default_config(tmp_path, monkeypatch, capsys):
     assert output["discord_guild_id"] is None
     assert output["started_discord"] is False
     assert set(["limits", "codex", "discord"]).issubset(data)
+    assert data["codex"]["home"] == ""
     assert data["discord"]["token"] == ""
     assert data["discord"]["guild_id"] == ""
 
@@ -426,12 +481,12 @@ def test_registry_initializes_discord_schema_on_fresh_state_dir(ctx):
         tables = {
             row["name"]
             for row in conn.execute(
-                "select name from sqlite_master where type='table' and name in (?, ?)",
-                ("discord_channel_bindings", "outbound_human_messages"),
+                "select name from sqlite_master where type='table' and name in (?, ?, ?)",
+                ("discord_channel_bindings", "outbound_human_messages", "discord_skills"),
             )
         }
 
-    assert tables == {"discord_channel_bindings", "outbound_human_messages"}
+    assert tables == {"discord_channel_bindings", "outbound_human_messages", "discord_skills"}
 
 
 def test_registry_initializes_discord_schema_on_existing_state_dir(tmp_path, monkeypatch):
@@ -448,12 +503,12 @@ def test_registry_initializes_discord_schema_on_existing_state_dir(tmp_path, mon
         tables = {
             row["name"]
             for row in conn.execute(
-                "select name from sqlite_master where type='table' and name in (?, ?)",
-                ("discord_channel_bindings", "outbound_human_messages"),
+                "select name from sqlite_master where type='table' and name in (?, ?, ?)",
+                ("discord_channel_bindings", "outbound_human_messages", "discord_skills"),
             )
         }
 
-    assert tables == {"discord_channel_bindings", "outbound_human_messages"}
+    assert tables == {"discord_channel_bindings", "outbound_human_messages", "discord_skills"}
 
 
 def test_discord_config_accepts_numeric_string_guild_id(tmp_path, monkeypatch):
@@ -544,6 +599,25 @@ def test_discord_channel_bindings_rebind_and_list(ctx):
     assert reg.unbind_discord_channel("channel-2") is True
     assert reg.unbind_discord_channel("channel-2") is False
     assert reg.discord_binding_for_channel("channel-2") is None
+
+
+def test_discord_skills_persist_and_update(ctx):
+    cfg, reg, _tmux = ctx
+
+    first = reg.upsert_discord_skill("review", "Review the current diff.")
+    second = reg.upsert_discord_skill("test-plan", "Write a test plan.")
+    updated = reg.upsert_discord_skill("review", "Review staged changes.")
+    reopened = Registry(cfg)
+
+    assert first["name"] == "review"
+    assert first["prompt"] == "Review the current diff."
+    assert updated["created_at"] == first["created_at"]
+    assert updated["updated_at"] >= first["updated_at"]
+    assert reopened.discord_skill("review")["prompt"] == "Review staged changes."
+    assert [skill["name"] for skill in reopened.list_discord_skills()] == ["review", "test-plan"]
+    assert reopened.delete_discord_skill(second["name"]) is True
+    assert reopened.delete_discord_skill(second["name"]) is False
+    assert reopened.discord_skill(second["name"]) is None
 
 
 def test_outbound_human_message_queue_lifecycle(ctx):
@@ -707,6 +781,69 @@ def test_start_orchestrator_allows_multiple_roots_by_default(ctx, tmp_path, monk
     assert {agent["id"] for agent in reg.list_agents()} == {root_a["id"], root_b["id"]}
 
 
+def test_start_orchestrator_goal_mode_prepends_goal_to_initial_prompt(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    monkeypatch.setattr(services.time, "sleep", lambda seconds: None)
+
+    class FakeTmux:
+        def __init__(self):
+            self.prompts = []
+
+        def create_session(self, _session, _cwd, _command):
+            return None
+
+        def pipe_pane(self, _session, _log_path):
+            return None
+
+        def send_prompt(self, session, prompt):
+            self.prompts.append((session, prompt))
+
+    fake = FakeTmux()
+
+    root = start_orchestrator(cfg, reg, fake, cwd=str(tmp_path), prompt="Manage this project.", goal=True)
+
+    prompt_path = Path(root["metadata"]["generated_files"]["prompt"])
+    assert "Task:\n/goal Manage this project." in prompt_path.read_text(encoding="utf-8")
+    assert "Task:\n/goal Manage this project." in fake.prompts[0][1]
+
+
+def test_start_orchestrator_codex_home_feeds_root_mcp_environment(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    source_home = tmp_path / "codex-source"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text('model = "gpt-source"\n', encoding="utf-8")
+    monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    monkeypatch.setattr(services.time, "sleep", lambda seconds: None)
+
+    class FakeTmux:
+        def create_session(self, _session, _cwd, _command):
+            return None
+
+        def pipe_pane(self, _session, _log_path):
+            return None
+
+        def send_prompt(self, _session, _prompt):
+            return None
+
+    root = start_orchestrator(
+        cfg,
+        reg,
+        FakeTmux(),
+        cwd=str(tmp_path),
+        prompt="Manage this project.",
+        codex_home=str(source_home),
+    )
+
+    files = root["metadata"]["generated_files"]
+    data = tomllib.loads(Path(files["config"]).read_text(encoding="utf-8"))
+    launch = Path(files["launch"]).read_text(encoding="utf-8")
+    assert files["source_codex_home"] == str(source_home.resolve())
+    assert data["model"] == "gpt-source"
+    assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_CODEX_HOME"] == str(source_home.resolve())
+    assert f"export PUPPETMASTER_CODEX_HOME={str(source_home.resolve())!r}" in launch
+
+
 def test_validate_agent_id_accepts_safe_ids_and_rejects_unsafe_ids():
     for value in ["project-a", "Project_1", "a.b", "A", "a" * 64]:
         assert validate_agent_id(value) == value
@@ -831,8 +968,8 @@ def test_orchestrator_start_defaults_cwd_to_current_directory(tmp_path, monkeypa
     def fake_build_context():
         return object(), object(), FakeTmux()
 
-    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id):
-        calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id})
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+        calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id, "goal": goal})
         return {"id": "agt_test", "tmux_session": "puppet_agt_test"}
 
     monkeypatch.setattr(cli_module, "build_context", fake_build_context)
@@ -848,7 +985,95 @@ def test_orchestrator_start_defaults_cwd_to_current_directory(tmp_path, monkeypa
         "name": "root",
         "new_root": False,
         "agent_id": None,
+        "goal": False,
     }
+    assert output["agent"]["id"] == "agt_test"
+
+
+def test_orchestrator_start_passes_goal_flag_from_cli(tmp_path, monkeypatch, capsys):
+    work = tmp_path / "project"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    parser = cli_module.build_parser()
+    args = parser.parse_args(["orchestrator", "start", "--goal", "--prompt", "Manage this project.", "--json"])
+    calls = {}
+
+    class FakeTmux:
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    def fake_build_context():
+        return object(), object(), FakeTmux()
+
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+        calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id, "goal": goal})
+        return {"id": "agt_test", "tmux_session": "puppet_agt_test"}
+
+    monkeypatch.setattr(cli_module, "build_context", fake_build_context)
+    monkeypatch.setattr(cli_module, "start_orchestrator", fake_start_orchestrator)
+
+    assert args.goal is True
+    assert args.func(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert calls["goal"] is True
+    assert output["agent"]["id"] == "agt_test"
+
+
+def test_orchestrator_start_applies_codex_home_from_cli(tmp_path, monkeypatch, capsys):
+    work = tmp_path / "project"
+    source_home = tmp_path / "codex-source"
+    work.mkdir()
+    source_home.mkdir()
+    monkeypatch.chdir(work)
+    parser = cli_module.build_parser()
+    args = parser.parse_args(
+        [
+            "orchestrator",
+            "start",
+            "--codex-home",
+            str(source_home),
+            "--prompt",
+            "Manage this project.",
+            "--json",
+        ]
+    )
+    calls = {}
+
+    class FakeConfig:
+        def with_codex_home(self, value):
+            calls["codex_home"] = value
+            return "configured-cfg"
+
+    class FakeTmux:
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    def fake_build_context():
+        return FakeConfig(), object(), FakeTmux()
+
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+        calls.update(
+            {
+                "cfg": cfg,
+                "cwd": cwd,
+                "prompt": prompt,
+                "name": name,
+                "new_root": new_root,
+                "agent_id": agent_id,
+                "goal": goal,
+            }
+        )
+        return {"id": "agt_test", "tmux_session": "puppet_agt_test"}
+
+    monkeypatch.setattr(cli_module, "build_context", fake_build_context)
+    monkeypatch.setattr(cli_module, "start_orchestrator", fake_start_orchestrator)
+
+    assert args.func(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert calls["codex_home"] == str(source_home)
+    assert calls["cfg"] == "configured-cfg"
     assert output["agent"]["id"] == "agt_test"
 
 
@@ -867,8 +1092,8 @@ def test_orchestrator_start_passes_custom_agent_id_from_cli(tmp_path, monkeypatc
     def fake_build_context():
         return object(), object(), FakeTmux()
 
-    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id):
-        calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id})
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+        calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id, "goal": goal})
         return {"id": agent_id, "root_id": agent_id, "tmux_session": f"puppet_{agent_id}"}
 
     monkeypatch.setattr(cli_module, "build_context", fake_build_context)
@@ -878,6 +1103,7 @@ def test_orchestrator_start_passes_custom_agent_id_from_cli(tmp_path, monkeypatc
 
     output = json.loads(capsys.readouterr().out)
     assert calls["agent_id"] == "project-a"
+    assert calls["goal"] is False
     assert output["agent"]["id"] == "project-a"
     assert output["agent"]["root_id"] == "project-a"
 
@@ -935,6 +1161,7 @@ def test_schedule_wakeup_persists_and_spawns_helper(ctx, tmp_path, monkeypatch):
     assert calls[0][0][-3:] == ["sleep-and-fire", "--wakeup-id", wakeup["id"]]
     assert "cwd" not in calls[0][1]
     assert calls[0][1]["env"]["PUPPETMASTER_STATE_DIR"] == str(cfg.state_dir)
+    assert calls[0][1]["env"]["PUPPETMASTER_CODEX_HOME"] == str(cfg.codex_home)
     assert calls[0][1]["env"]["PYTHONPATH"] == str((checkout / "src").resolve())
     assert calls[0][1]["env"]["PYTHONPATH"] != str(cfg.repo_dir / "src")
     assert sleeps == []
@@ -1119,6 +1346,20 @@ def test_mcp_send_human_message_returns_queued_result(ctx, tmp_path, monkeypatch
     assert reg.pending_outbound_human_messages("discord")[0]["message"] == "Hello from MCP."
 
 
+def test_mcp_send_human_message_rejects_child_callers(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    reg.bind_discord_channel("bound-channel", root["id"], "guild-1")
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, child))
+
+    result = mcp_server.send_human_message("Hello from child.")
+
+    assert result["error"]["code"] == "not_authorized"
+    assert "root orchestrators" in result["error"]["message"]
+    assert reg.pending_outbound_human_messages("discord") == []
+
+
 def test_mcp_send_human_message_returns_error_when_unbound(ctx, tmp_path, monkeypatch):
     cfg, reg, tmux = ctx
     caller = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
@@ -1141,6 +1382,59 @@ def test_mcp_send_human_message_returns_error_for_empty_message(ctx, tmp_path, m
 
     assert result["error"]["code"] == "message_required"
     assert reg.pending_outbound_human_messages("discord") == []
+
+
+def test_mcp_run_removes_human_message_tool_for_child_callers(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, child))
+
+    class FakeMcp:
+        def __init__(self):
+            self.removed: list[str] = []
+            self.ran = False
+
+        def remove_tool(self, name: str) -> None:
+            self.removed.append(name)
+
+        def run(self) -> None:
+            self.ran = True
+
+    fake = FakeMcp()
+    monkeypatch.setattr(mcp_server, "mcp", fake)
+
+    mcp_server.run()
+
+    assert fake.removed == ["send_human_message"]
+    assert fake.ran is True
+
+
+def test_mcp_kill_agent_tool_kills_authorized_child_session(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+
+    class FakeTmux:
+        def __init__(self):
+            self.killed: list[str] = []
+
+        def kill_session(self, session: str) -> None:
+            self.killed.append(session)
+
+        def session_exists(self, _session: str) -> bool:
+            return False
+
+    fake = FakeTmux()
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, fake, root))
+
+    result = mcp_server.kill_agent_tool(child["id"])
+
+    assert result["id"] == child["id"]
+    assert result["status"] == "killed"
+    assert result["termination_reason"] == "killed"
+    assert fake.killed == [child["tmux_session"]]
+    assert reg.get_agent(child["id"])["status"] == "killed"
 
 
 def test_fire_wakeup_marks_fired_queues_wait_over_and_is_idempotent(ctx, tmp_path):
@@ -1198,6 +1492,8 @@ def test_format_event_prompt_renders_state_change_and_wait_over(ctx, tmp_path):
     state_prompt = format_event_prompt(reg, reg.pending_deliveries(root["id"]), 0)
 
     assert f"{child['id']} has new state blocked." in state_prompt
+    assert f'kill_agent({{"agent_id":"{child["id"]}"}})' in state_prompt
+    assert "after final output is consumed" in state_prompt
     reg.mark_delivered([delivery["id"] for delivery in reg.pending_deliveries(root["id"])])
 
     wakeup = schedule_wakeup(cfg, reg, root["id"], 5, "retry", spawn_helper=False)
@@ -1238,6 +1534,85 @@ def test_stop_kill_pause_resume_queue_parent_and_root_notifications(ctx, tmp_pat
     for event_type in ("agent.stopped", "agent.killed", "agent.paused", "agent.resumed"):
         assert event_type in parent_types
         assert event_type in root_types
+
+
+def test_kill_root_tree_kills_only_one_root_tree(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root_a = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root A", role="orchestrator")
+    child_a = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child A", parent_id=root_a["id"])
+    grandchild_a = create_agent_record(cfg, reg, cwd=str(tmp_path), description="grandchild A", parent_id=child_a["id"])
+    root_b = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root B", role="orchestrator")
+    child_b = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child B", parent_id=root_b["id"])
+    live_sessions = {
+        root_a["tmux_session"],
+        child_a["tmux_session"],
+        grandchild_a["tmux_session"],
+        root_b["tmux_session"],
+        child_b["tmux_session"],
+    }
+
+    class FakeTmux:
+        def __init__(self):
+            self.killed: list[str] = []
+
+        def session_exists(self, session):
+            return session in live_sessions
+
+        def kill_session(self, session):
+            self.killed.append(session)
+            live_sessions.discard(session)
+
+    fake = FakeTmux()
+
+    result = kill_root_tree(reg, fake, root_a["id"])
+
+    assert set(result["killed"]) == {root_a["id"], child_a["id"], grandchild_a["id"]}
+    assert set(fake.killed) == {root_a["tmux_session"], child_a["tmux_session"], grandchild_a["tmux_session"]}
+    assert root_b["tmux_session"] in live_sessions
+    assert child_b["tmux_session"] in live_sessions
+    for agent_id in (root_a["id"], child_a["id"], grandchild_a["id"]):
+        assert reg.get_agent(agent_id)["status"] == "killed"
+    assert reg.get_agent(root_b["id"])["status"] == "starting"
+    assert reg.get_agent(child_b["id"])["status"] == "starting"
+
+
+def test_kill_root_tree_rejects_child_agent_ids(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+
+    class FakeTmux:
+        def session_exists(self, _session):
+            return True
+
+    with pytest.raises(PuppetError) as exc:
+        kill_root_tree(reg, FakeTmux(), child["id"])
+
+    assert exc.value.code == "invalid_agent"
+
+
+def test_agent_kill_tree_cli_passes_root_and_dry_run(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    parser = cli_module.build_parser()
+    args = parser.parse_args(["agent", "kill-tree", "root-a", "--dry-run", "--json"])
+    calls = {}
+
+    def fake_build_context():
+        return object(), object(), object()
+
+    def fake_kill_root_tree(reg, tmux, root_agent_id, *, dry_run):
+        calls.update({"reg": reg, "tmux": tmux, "root_agent_id": root_agent_id, "dry_run": dry_run})
+        return {"root_agent_id": root_agent_id, "dry_run": dry_run, "would_kill": ["root-a"]}
+
+    monkeypatch.setattr(cli_module, "build_context", fake_build_context)
+    monkeypatch.setattr(cli_module, "kill_root_tree", fake_kill_root_tree)
+
+    assert args.func(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert calls["root_agent_id"] == "root-a"
+    assert calls["dry_run"] is True
+    assert output["would_kill"] == ["root-a"]
 
 
 def test_inject_pending_prompt_does_not_require_idle_status(ctx, tmp_path):
@@ -1320,6 +1695,7 @@ def test_generated_codex_config_shape(ctx, tmp_path, monkeypatch):
     assert data["hooks"]["state"][state_key]["trusted_hash"].startswith("sha256:")
     assert data["projects"][str(tmp_path)]["trust_level"] == "trusted"
     assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_AGENT_ID"] == agent["id"]
+    assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_CODEX_HOME"] == str(cfg.codex_home)
     assert "initial-prompt.md" not in launch
     assert '"$(cat ' not in launch
 
@@ -1352,23 +1728,34 @@ def test_prompt_text_explains_orchestrator_wait_and_event_loop(ctx, tmp_path):
     child_prompt = prompt_text(child, "Run the tests.")
 
     assert "If you are only waiting for child-agent progress, do not call wait(). Simply end your turn." in root_prompt
-    assert "Use the Puppetmaster create_agent() tool to create child agents" in root_prompt
+    assert "Your primary role is orchestration" in root_prompt
+    assert "Do small, low-risk tasks yourself when delegation would add more overhead than value" in root_prompt
+    assert "Delegate larger, multi-step, research-heavy, test-heavy, or parallelizable tasks" in root_prompt
+    assert "Do not take on the main implementation or investigation yourself" in root_prompt
     assert "Do not use Codex's default spawn_agent tool" in root_prompt
     assert "Call wait(seconds, reason) only when you need a time-based wakeup" in root_prompt
+    assert "then call kill_agent(child_id) to close its tmux session" in root_prompt
+    assert "prevent stale Codex processes from accumulating" in root_prompt
+    assert "Do not kill a child you still expect to prompt" in root_prompt
     assert "Puppetmaster will send you a fresh PUPPETMASTER EVENT message" in root_prompt
     assert "PUPPETMASTER WAIT OVER" in root_prompt
     assert "send_human_message" in root_prompt
     assert "Always use send_human_message for every human-facing message" in root_prompt
     assert "Regularly update the human with send_human_message during longer work" in root_prompt
+    assert "Child agents do not have direct human-message tools" in root_prompt
     assert "DISCORD MESSAGE RECEIVED" in root_prompt
     assert "always answer the human by calling send_human_message" in root_prompt
     assert "routing" not in root_prompt.lower()
     assert "If you are only waiting for child-agent progress" not in child_prompt
+    assert "Your primary role is orchestration" not in child_prompt
     assert "Do not use Codex's default spawn_agent tool" not in child_prompt
     assert "Use wait(seconds, reason) only for a time-based wakeup." in child_prompt
-    assert "send_human_message" in child_prompt
-    assert "Always use send_human_message for every human-facing message" in child_prompt
-    assert "Regularly update the human with send_human_message during longer work" in child_prompt
+    assert "send_human_message" not in child_prompt
+    assert "send message tool" not in child_prompt
+    assert "Always use send_human_message for every human-facing message" not in child_prompt
+    assert "Regularly update the human with send_human_message during longer work" not in child_prompt
+    assert "Child agents do not have direct human-message tools" in child_prompt
+    assert "Use kill_agent after consuming final child output" in child_prompt
     assert "DISCORD MESSAGE RECEIVED" not in child_prompt
 
 
@@ -1446,6 +1833,7 @@ command = "existing-server"
     )
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    cfg = cfg.with_codex_home(codex_home)
     agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
 
     files = write_codex_files(cfg, agent, "hello", orchestrator=True)
@@ -1457,6 +1845,30 @@ command = "existing-server"
     assert data["mcp_servers"]["existing"]["command"] == "existing-server"
     assert data["features"]["hooks"] is True
     assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_AGENT_ID"] == agent["id"]
+
+
+def test_generated_codex_files_use_configured_codex_home_for_auth_and_subagents(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text('model = "gpt-source"\n', encoding="utf-8")
+    (source_home / "auth.json").write_text('{"token":"secret"}\n', encoding="utf-8")
+    cfg = cfg.with_codex_home(source_home)
+    monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+
+    files = write_codex_files(cfg, agent, "hello", orchestrator=True)
+
+    generated_home = Path(files["codex_home"])
+    data = tomllib.loads(Path(files["config"]).read_text(encoding="utf-8"))
+    launch = Path(files["launch"]).read_text(encoding="utf-8")
+    auth_link = generated_home / "auth.json"
+    assert data["model"] == "gpt-source"
+    assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_CODEX_HOME"] == str(source_home.resolve())
+    assert auth_link.is_symlink()
+    assert auth_link.resolve() == source_home.resolve() / "auth.json"
+    assert f"export PUPPETMASTER_CODEX_HOME={str(source_home.resolve())!r}" in launch
+    assert f"export CODEX_HOME={str(generated_home)!r}" in launch
 
 
 def test_tmux_send_prompt_pastes_and_confirms_with_second_enter(ctx, monkeypatch):
@@ -1656,6 +2068,22 @@ def test_tui_summarizes_tree_stats(ctx, tmp_path):
     assert "running:1" in stats["statuses"]
 
 
+def test_tui_summarizes_agent_relationship_counts(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    grandchild = create_agent_record(cfg, reg, cwd=str(tmp_path), description="grandchild", parent_id=child["id"])
+
+    child_counts, descendant_counts = summarize_agent_relationships(reg.list_agents())
+
+    assert child_counts[root["id"]] == 1
+    assert child_counts[child["id"]] == 1
+    assert child_counts[grandchild["id"]] == 0
+    assert descendant_counts[root["id"]] == 2
+    assert descendant_counts[child["id"]] == 1
+    assert descendant_counts[grandchild["id"]] == 0
+
+
 def test_tui_preview_scroll_is_bounded(ctx):
     cfg, reg, tmux = ctx
 
@@ -1678,6 +2106,53 @@ def test_tui_preview_scroll_is_bounded(ctx):
 
     app.scroll_preview(-100, screen)
     assert app.preview_scroll == 0
+
+
+def test_tui_agent_list_scroll_defers_preview_refresh(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+
+    class Screen:
+        def getmaxyx(self):
+            return (23, 80)
+
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.rows = build_tree_rows([root, child])
+
+    def fail_refresh(*_args, **_kwargs):
+        raise AssertionError("agent-list movement should not refresh preview synchronously")
+
+    app.refresh_preview = fail_refresh
+
+    app.move_selection(1, Screen())
+
+    assert app.selected == 1
+    assert app.preview_refresh_due_at is not None
+    assert app.preview_reset_pending is True
+
+
+def test_tui_debounced_preview_refresh_runs_when_due(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    agent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.rows = build_tree_rows([agent])
+    app.preview_refresh_due_at = 10.0
+    app.preview_reset_pending = True
+    calls = []
+
+    def record_refresh(*, reset_scroll=False):
+        calls.append(reset_scroll)
+
+    app.refresh_preview = record_refresh
+
+    assert app.maybe_refresh_debounced_preview(9.9) is False
+    assert calls == []
+
+    assert app.maybe_refresh_debounced_preview(10.0) is True
+    assert calls == [True]
+    assert app.preview_refresh_due_at is None
+    assert app.preview_reset_pending is False
 
 
 def test_tui_mouse_wheel_on_right_scrolls_preview_not_selection(ctx, monkeypatch):

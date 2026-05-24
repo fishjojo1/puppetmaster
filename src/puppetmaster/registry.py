@@ -40,6 +40,10 @@ create table if not exists agents(
   events_path text null,
   metadata_json text not null
 );
+create index if not exists agents_root_created_at_idx
+on agents(root_id, created_at);
+create index if not exists agents_parent_created_at_idx
+on agents(parent_id, created_at);
 create table if not exists events(
   id text primary key,
   agent_id text not null,
@@ -55,6 +59,8 @@ create table if not exists events(
   payload_json text not null,
   source text not null
 );
+create index if not exists events_agent_created_at_idx
+on events(agent_id, created_at);
 create table if not exists event_deliveries(
   id text primary key,
   event_id text not null,
@@ -64,6 +70,8 @@ create table if not exists event_deliveries(
   delivered_at text null,
   acknowledged_at text null
 );
+create index if not exists event_deliveries_recipient_status_idx
+on event_deliveries(recipient_agent_id, status);
 create table if not exists scheduled_wakeups(
   id text primary key,
   agent_id text not null,
@@ -104,6 +112,14 @@ create index if not exists outbound_human_messages_transport_status_created_at_i
 on outbound_human_messages(transport, status, created_at);
 create index if not exists outbound_human_messages_root_status_created_at_idx
 on outbound_human_messages(root_agent_id, status, created_at);
+create table if not exists discord_skills(
+  name text primary key,
+  prompt text not null,
+  created_at text not null,
+  updated_at text not null
+);
+create index if not exists discord_skills_updated_at_idx
+on discord_skills(updated_at);
 """
 
 
@@ -364,6 +380,14 @@ class Registry:
             rows = conn.execute(sql, params).fetchall()
         return [self._delivery(row) for row in rows]
 
+    def count_pending_deliveries(self, recipient_agent_id: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "select count(*) from event_deliveries where recipient_agent_id=? and status='pending'",
+                (recipient_agent_id,),
+            ).fetchone()
+        return int(row[0])
+
     def all_deliveries(self, recipient_agent_id: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         sql = "select d.*, e.agent_id, e.type, e.severity, e.summary, e.payload_json from event_deliveries d join events e on e.id=d.event_id"
         params: list[Any] = []
@@ -614,6 +638,45 @@ class Registry:
             raise PuppetError("not_found", f"outbound human message not found: {message_id}")
         return self._get_outbound_human_message(message_id)
 
+    def upsert_discord_skill(self, name: str, prompt: str) -> dict[str, Any]:
+        ts = now()
+        skill = {
+            "name": name,
+            "prompt": prompt,
+            "created_at": ts,
+            "updated_at": ts,
+        }
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into discord_skills(name,prompt,created_at,updated_at)
+                values(:name,:prompt,:created_at,:updated_at)
+                on conflict(name) do update set
+                  prompt=excluded.prompt,
+                  updated_at=excluded.updated_at
+                """,
+                skill,
+            )
+        found = self.discord_skill(name)
+        if not found:
+            raise PuppetError("not_found", f"discord skill not found: {name}")
+        return found
+
+    def discord_skill(self, name: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("select * from discord_skills where name=?", (name,)).fetchone()
+        return self._discord_skill(row) if row else None
+
+    def list_discord_skills(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("select * from discord_skills order by name asc").fetchall()
+        return [self._discord_skill(row) for row in rows]
+
+    def delete_discord_skill(self, name: str) -> bool:
+        with self.connect() as conn:
+            cursor = conn.execute("delete from discord_skills where name=?", (name,))
+        return cursor.rowcount > 0
+
     def children(self, agent_id: str) -> list[dict[str, Any]]:
         return self.list_agents(parent_id=agent_id)
 
@@ -643,12 +706,18 @@ class Registry:
             ).fetchone()
         return row["created_at"] if row else None
 
-    def count_events(self, agent_id: str, event_type: str) -> int:
+    def count_events(self, agent_id: str | None = None, event_type: str | None = None) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if agent_id:
+            clauses.append("agent_id=?")
+            params.append(agent_id)
+        if event_type:
+            clauses.append("type=?")
+            params.append(event_type)
+        where = " where " + " and ".join(clauses) if clauses else ""
         with self.connect() as conn:
-            row = conn.execute(
-                "select count(*) c from events where agent_id=? and type=?",
-                (agent_id, event_type),
-            ).fetchone()
+            row = conn.execute(f"select count(*) c from events{where}", params).fetchone()
         return int(row["c"])
 
     def _append_agent_event_file(self, agent: dict[str, Any], event: dict[str, Any]) -> None:
@@ -681,6 +750,9 @@ class Registry:
         return data
 
     def _discord_binding(self, row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def _discord_skill(self, row: sqlite3.Row) -> dict[str, Any]:
         return dict(row)
 
     def _get_outbound_human_message(self, message_id: str) -> dict[str, Any]:

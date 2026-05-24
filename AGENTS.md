@@ -18,7 +18,7 @@ Puppetmaster has three separate concerns:
 - State directory: config, registry, logs, generated per-agent Codex homes, Discord process metadata, and agent artifacts. The default is `~/.puppetmaster`; `PUPPETMASTER_STATE_DIR` overrides it for tests and experiments.
 - Agent workspace: the project directory passed as `--cwd` when starting an orchestrator or child agent.
 
-Managed Codex sessions intentionally run with broad local permissions and generated per-agent Codex config. Treat Discord-bound channels as a remote control surface for local command execution.
+Managed Codex sessions intentionally run with broad local permissions and generated per-agent Codex config. Runtime `CODEX_HOME` remains per-agent; the source Codex home for config/auth defaults to `~/.codex`, can be set with `[codex].home`, `CODEX_HOME` at root startup, `PUPPETMASTER_CODEX_HOME`, or `puppet orchestrator start --codex-home`, and is propagated to MCP-spawned descendants through `PUPPETMASTER_CODEX_HOME`. Treat Discord-bound channels as a remote control surface for local command execution.
 
 ## Source Layout
 
@@ -43,7 +43,7 @@ Important CLI groups:
 
 - `puppet init`
 - `puppet orchestrator start|inspect`
-- `puppet agent create|list|tree|inspect|read|prompt|attach|stop|kill|complete|pause|resume|mark-status|cleanup-completed`
+- `puppet agent create|list|tree|inspect|read|prompt|attach|stop|kill|kill-tree|complete|pause|resume|mark-status|cleanup-completed`
 - `puppet events list|pending|ack`
 - `puppet wakeup fire-due|fire|list|sleep-and-fire`
 - `puppet hook stop|drain-events`
@@ -54,17 +54,21 @@ Important CLI groups:
 - `puppet reconcile`
 - `puppet debug create-raw|tmux|registry`
 
-Managed agents receive an MCP server named `puppetmaster` with tools for creating and prompting child agents, reading and inspecting visible agents, completing work, scheduling wakeups, stopping/killing/pausing/resuming authorized agents, attaching to tmux sessions, and sending human messages through the bound root.
+`puppet orchestrator start --goal` and MCP `create_agent(goal=true)` both prepend literal `/goal ` to the managed agent's initial task prompt. `puppet orchestrator start --codex-home <path>` selects the source Codex home for the root tree's config/auth; generated per-agent `CODEX_HOME` directories are still used for runtime isolation.
 
-Generated agent prompts instruct agents to always use `send_human_message` for human-facing answers, status updates, readiness notices, blockers, and regular progress updates during longer work.
+Managed agents receive an MCP server named `puppetmaster` with tools for creating and prompting child agents, reading and inspecting visible agents, completing work, scheduling wakeups, stopping/killing/pausing/resuming authorized agents, and attaching to tmux sessions. Root orchestrators also receive `send_human_message` for replying through the bound root channel; child agents do not receive that tool.
+
+Generated root orchestrator prompts instruct roots to always use `send_human_message` for human-facing answers, status updates, readiness notices, blockers, and regular progress updates during longer work. They also instruct roots to call `kill_agent(agent_id)` after consuming final child output when a child is complete or no longer useful, so child tmux sessions and Codex processes do not accumulate. Generated child prompts instruct children to report through completion/blocker status or their parent/root instead of contacting the human directly.
 
 Discord slash commands are guild-scoped. Channel bindings are the routing layer: one channel binds to one root orchestrator, and one root orchestrator binds to one channel.
 
-Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset command to the bound root, then queue a regenerated Puppetmaster orchestrator prompt with a reset-specific task telling the root to notify the user that it is ready for new tasks.
+Discord `/skills` manages reusable prompts. With no arguments it lists saved skills, with `skill-name` plus `prompt` it creates or updates a skill, with only `skill-name` it sends the saved prompt to the channel's bound root orchestrator, and with `forget:true` it deletes the skill.
+
+Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset command to the bound root, then queue a regenerated Puppetmaster orchestrator prompt after a short delay with a reset-specific task telling the root to notify the user that it is ready for new tasks.
 
 ## State And Events
 
-The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, and outbound human messages. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config.
+The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, reusable Discord skills, and outbound human messages. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config.
 
 Completion is explicit. A Codex turn stopping is not the same as finishing work. Agents should call `complete_agent` with `success`, `failed`, `blocked`, or `cancelled` when their assigned task is actually terminal.
 
@@ -106,6 +110,10 @@ The release script runs pytest, package build checks, doctor checks, non-network
 For narrow changes, run the relevant pytest file or focused test. For changes touching shared supervisor behavior, state, Discord routing, Codex config generation, CLI surfaces, or packaging, run the full test suite. Before release-oriented changes, run `scripts/release-validate.sh`.
 
 When a change modifies CLI behavior, Discord behavior, config defaults, registry schema, event semantics, generated Codex files, or safety-sensitive lifecycle handling, add or update tests in the same change.
+
+## Commit Workflow
+
+Commit after every completed change unless the human explicitly asks not to commit yet. Before committing, inspect the staged diff for secrets, tokens, local state, logs, credentials, generated agent directories, virtualenvs, build artifacts, and caches; do not commit sensitive or local-only material.
 
 ## Keeping This File Living
 

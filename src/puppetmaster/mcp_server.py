@@ -50,6 +50,10 @@ def _error(exc: PuppetError) -> dict:
     return exc.as_dict()
 
 
+def _is_root_orchestrator(caller: dict[str, Any]) -> bool:
+    return caller["role"] == "orchestrator" and caller["id"] == caller["root_id"]
+
+
 mcp = FastMCP("puppetmaster")
 
 
@@ -191,9 +195,15 @@ def prompt_agent_tool(agent_id: str, prompt: str) -> dict:
 
 @mcp.tool()
 def send_human_message(message: str) -> dict:
-    """Send a concise message to the bound human operator channel. Use this when replying to a human request received through Puppetmaster."""
+    """Send a concise message to the bound human operator channel. Root orchestrators only."""
     try:
         _cfg, reg, _tmux, caller = _context()
+        if not _is_root_orchestrator(caller):
+            raise PuppetError(
+                "not_authorized",
+                "send_human_message is only available to root orchestrators.",
+                "Child agents should report results through complete_agent or prompt their parent/root agent.",
+            )
         return send_human_message_service(reg, caller["id"], message, source="mcp_tool")
     except PuppetError as exc:
         return _error(exc)
@@ -256,4 +266,10 @@ def attach_agent(agent_id: str) -> dict:
 
 
 def run() -> None:
+    try:
+        _cfg, _reg, _tmux, caller = _context()
+        if not _is_root_orchestrator(caller):
+            mcp.remove_tool("send_human_message")
+    except PuppetError:
+        pass
     mcp.run()
