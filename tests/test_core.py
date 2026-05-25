@@ -2244,3 +2244,62 @@ def test_cleanup_completed_prunes_stopped_subtrees(ctx, tmp_path):
     assert reg.maybe_agent(completed_parent["id"]) is not None
     assert reg.maybe_agent(stopped_leaf["id"]) is not None
     assert reg.maybe_agent(active_child["id"]) is not None
+
+
+def test_cleanup_completed_prunes_killed_and_dead_subtrees(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    completed_parent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="completed parent", parent_id=root["id"])
+    killed_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="killed child", parent_id=completed_parent["id"])
+    dead_leaf = create_agent_record(cfg, reg, cwd=str(tmp_path), description="dead leaf", parent_id=root["id"])
+    killed_parent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="killed parent", parent_id=root["id"])
+    active_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="active child", parent_id=killed_parent["id"])
+
+    reg.update_agent(completed_parent["id"], status="completed")
+    reg.update_agent(killed_child["id"], status="killed")
+    reg.update_agent(dead_leaf["id"], status="dead")
+    reg.update_agent(killed_parent["id"], status="killed")
+    reg.update_agent(active_child["id"], status="running")
+
+    dry_run = cleanup_completed_agents(reg, tmux, dry_run=True)
+    assert set(dry_run["would_prune"]) == {completed_parent["id"], killed_child["id"], dead_leaf["id"]}
+    assert {item["agent_id"] for item in dry_run["skipped"]} == {killed_parent["id"]}
+
+    result = cleanup_completed_agents(reg, tmux, dry_run=False)
+    assert set(result["pruned"]) == {completed_parent["id"], killed_child["id"], dead_leaf["id"]}
+    assert reg.maybe_agent(completed_parent["id"]) is None
+    assert reg.maybe_agent(killed_child["id"]) is None
+    assert reg.maybe_agent(dead_leaf["id"]) is None
+    assert reg.maybe_agent(killed_parent["id"]) is not None
+    assert reg.maybe_agent(active_child["id"]) is not None
+
+
+def test_agent_cleanup_dead_cli_prunes_dead_killed_and_stopped_agents(ctx, tmp_path, monkeypatch, capsys):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    killed_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="killed child", parent_id=root["id"])
+    dead_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="dead child", parent_id=root["id"])
+    stopped_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="stopped child", parent_id=root["id"])
+    completed_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="completed child", parent_id=root["id"])
+
+    reg.update_agent(killed_child["id"], status="killed")
+    reg.update_agent(dead_child["id"], status="dead")
+    reg.update_agent(stopped_child["id"], status="stopped")
+    reg.update_agent(completed_child["id"], status="completed")
+
+    class FakeTmux:
+        def session_exists(self, _session):
+            return False
+
+    monkeypatch.setattr(cli_module, "build_context", lambda: (cfg, reg, FakeTmux()))
+    parser = cli_module.build_parser()
+    args = parser.parse_args(["agent", "cleanup-dead", "--json"])
+
+    assert args.func(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert set(output["pruned"]) == {killed_child["id"], dead_child["id"], stopped_child["id"]}
+    assert reg.maybe_agent(killed_child["id"]) is None
+    assert reg.maybe_agent(dead_child["id"]) is None
+    assert reg.maybe_agent(stopped_child["id"]) is None
+    assert reg.maybe_agent(completed_child["id"]) is not None

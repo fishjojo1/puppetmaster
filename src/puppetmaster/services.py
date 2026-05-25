@@ -25,6 +25,8 @@ WAKEUP_REASON_MAX_LENGTH = 240
 INITIAL_PROMPT_SEND_DELAY_SECONDS = 10.0
 AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 AGENT_ID_FORMAT_HINT = "Agent ids must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63} and must not contain '..'."
+COMPLETED_CLEANUP_STATUSES = {"completed", "stopped", "killed", "dead"}
+DEAD_CLEANUP_STATUSES = {"stopped", "killed", "dead"}
 
 
 def agent_dir(config: Config, agent_id: str) -> Path:
@@ -322,10 +324,11 @@ def cleanup_completed_agents(
     dry_run: bool = True,
     kill_stale: bool = False,
     include_roots: bool = False,
+    cleanup_statuses: set[str] | None = None,
 ) -> dict[str, Any]:
     agents = registry.list_agents(root_id=root_id)
     by_id = {agent["id"]: agent for agent in agents}
-    cleanup_statuses = {"completed", "stopped"}
+    cleanup_statuses = cleanup_statuses or COMPLETED_CLEANUP_STATUSES
     cleanup_ids = {
         agent["id"]
         for agent in agents
@@ -340,7 +343,7 @@ def cleanup_completed_agents(
     skipped = [
         {
             "agent_id": agent_id,
-            "reason": "has non-completed-or-stopped descendants",
+            "reason": "has non-cleanable descendants",
         }
         for agent_id in sorted(cleanup_ids - prunable)
     ]

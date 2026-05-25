@@ -43,7 +43,7 @@ Important CLI groups:
 
 - `puppet init`
 - `puppet orchestrator start|inspect`
-- `puppet agent create|list|tree|inspect|read|prompt|attach|stop|kill|kill-tree|complete|pause|resume|mark-status|cleanup-completed`
+- `puppet agent create|list|tree|inspect|read|prompt|attach|stop|kill|kill-tree|complete|pause|resume|mark-status|cleanup-completed|cleanup-dead`
 - `puppet events list|pending|ack`
 - `puppet wakeup fire-due|fire|list|sleep-and-fire`
 - `puppet hook stop|drain-events`

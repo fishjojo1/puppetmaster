@@ -401,12 +401,14 @@ Human override with audit trail:
 puppet agent mark-status <agent-id> --status blocked --reason "Human found it waiting on input."
 ```
 
-Prune completed or stopped agents from the registry tree while preserving their logs and state directories:
+Prune completed, stopped, killed, or dead agents from the registry tree while preserving their logs and state directories:
 
 ```bash
 puppet agent cleanup-completed --dry-run
 puppet agent cleanup-completed
 puppet agent cleanup-completed --root <root-agent-id> --kill-stale
+puppet agent cleanup-dead --dry-run
+puppet agent cleanup-dead --include-roots
 ```
 
 ## Troubleshooting

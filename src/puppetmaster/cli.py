@@ -15,6 +15,7 @@ from .config import load_config, puppetmaster_subprocess_env, write_init_config
 from .errors import PuppetError
 from .registry import Registry
 from .services import (
+    DEAD_CLEANUP_STATUSES,
     cleanup_completed_agents,
     complete_agent,
     create_codex_agent,
@@ -357,14 +358,18 @@ def cmd_agent_resume(args: argparse.Namespace) -> int:
 
 def cmd_agent_cleanup_dead(args: argparse.Namespace) -> int:
     _cfg, reg, tmux = build_context()
-    agents = [a for a in reg.list_agents() if a["status"] in {"dead", "killed", "stopped"}]
-    killed = []
-    if args.kill_stale:
-        for agent in agents:
-            if tmux.session_exists(agent["tmux_session"]):
-                tmux.kill_session(agent["tmux_session"])
-                killed.append(agent["id"])
-    emit({"candidates": agents, "killed": killed}, args.json)
+    emit(
+        cleanup_completed_agents(
+            reg,
+            tmux,
+            root_id=args.root,
+            dry_run=args.dry_run,
+            kill_stale=args.kill_stale,
+            include_roots=args.include_roots,
+            cleanup_statuses=DEAD_CLEANUP_STATUSES,
+        ),
+        args.json,
+    )
     return 0
 
 
@@ -775,15 +780,18 @@ def build_parser() -> argparse.ArgumentParser:
     mark.add_argument("--reason", required=True)
     add_json(mark)
     mark.set_defaults(func=cmd_agent_mark_status)
-    cleanup = a.add_parser("cleanup-dead", help="Report dead/stopped/killed agents; optionally kill stale sessions.")
+    cleanup = a.add_parser("cleanup-dead", help="Prune dead, killed, or stopped agents from the registry tree while preserving logs.")
+    cleanup.add_argument("--root", help="Limit cleanup to one root_id.")
+    cleanup.add_argument("--dry-run", action="store_true", help="Preview cleanup without changing registry or tmux.")
     cleanup.add_argument("--kill-stale", action="store_true")
+    cleanup.add_argument("--include-roots", action="store_true", help="Allow pruning dead, killed, or stopped root orchestrators.")
     add_json(cleanup)
     cleanup.set_defaults(func=cmd_agent_cleanup_dead)
-    cleanup_completed = a.add_parser("cleanup-completed", help="Prune completed or stopped agents from the registry tree while preserving logs.")
+    cleanup_completed = a.add_parser("cleanup-completed", help="Prune completed, stopped, killed, or dead agents from the registry tree while preserving logs.")
     cleanup_completed.add_argument("--root", help="Limit cleanup to one root_id.")
     cleanup_completed.add_argument("--dry-run", action="store_true", help="Preview cleanup without changing registry or tmux.")
-    cleanup_completed.add_argument("--kill-stale", action="store_true", help="Kill live tmux sessions for pruned completed or stopped agents.")
-    cleanup_completed.add_argument("--include-roots", action="store_true", help="Allow pruning completed or stopped root orchestrators.")
+    cleanup_completed.add_argument("--kill-stale", action="store_true", help="Kill live tmux sessions for pruned completed, stopped, killed, or dead agents.")
+    cleanup_completed.add_argument("--include-roots", action="store_true", help="Allow pruning completed, stopped, killed, or dead root orchestrators.")
     add_json(cleanup_completed)
     cleanup_completed.set_defaults(func=cmd_agent_cleanup_completed)
 
