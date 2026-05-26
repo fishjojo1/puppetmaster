@@ -34,6 +34,7 @@ Managed Codex sessions intentionally run with broad local permissions and genera
 - `src/puppetmaster/native_screenshot.py`: optional native screenshot backends with terminal rendering fallback.
 - `tests/`: pytest coverage for core state, CLI, MCP tools, Discord behavior, tmux helpers, screenshots, terminal image rendering, and TUI helpers.
 - `milestones/`: implementation briefs and validation notes for completed design slices.
+- `skills/`: reusable prompt templates for Puppetmaster orchestrators or Discord `/skills` entries.
 - `docs/spec-conformance.md`: checklist mapping v1 requirements to implementation artifacts.
 - `scripts/release-validate.sh`: local release validation script.
 
