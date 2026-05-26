@@ -2474,6 +2474,44 @@ def test_tui_skill_mode_lists_and_scrolls_prompt(ctx):
     assert app.skill_preview_scroll == 0
 
 
+def test_tui_skill_mouse_wheel_on_right_scrolls_prompt_not_selection(ctx, monkeypatch):
+    cfg, reg, tmux = ctx
+    monkeypatch.setattr(tui_module.curses, "BUTTON4_PRESSED", 1, raising=False)
+    reg.upsert_discord_skill("review", "\n".join(f"line {index}" for index in range(12)))
+    reg.upsert_discord_skill("test-plan", "Write a test plan.")
+
+    class Screen:
+        def getmaxyx(self):
+            return (16, 90)
+
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.toggle_mode()
+
+    app.handle_mouse_event(TuiApp.right_x(90), 7, 1, Screen())
+
+    assert app.skill_preview_scroll == 3
+    assert app.current_skill()["name"] == "review"
+
+
+def test_tui_skill_mouse_wheel_on_left_moves_selection(ctx, monkeypatch):
+    cfg, reg, tmux = ctx
+    monkeypatch.setattr(tui_module.curses, "BUTTON5_PRESSED", 1, raising=False)
+    reg.upsert_discord_skill("review", "Review the diff.")
+    reg.upsert_discord_skill("test-plan", "Write a test plan.")
+
+    class Screen:
+        def getmaxyx(self):
+            return (16, 90)
+
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.toggle_mode()
+
+    app.handle_mouse_event(0, 7, 1, Screen())
+
+    assert app.skill_preview_scroll == 0
+    assert app.current_skill()["name"] == "test-plan"
+
+
 def test_tui_saves_updates_and_deletes_skills(ctx):
     cfg, reg, tmux = ctx
     app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)

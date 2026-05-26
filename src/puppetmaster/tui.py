@@ -351,6 +351,8 @@ class TuiApp:
             self.scroll_skill_preview_to_top(stdscr)
         elif key == curses.KEY_END:
             self.skill_preview_scroll = 0
+        elif key == curses.KEY_MOUSE:
+            self.handle_mouse(stdscr)
         elif key == ord("r"):
             self.reload_skills()
         elif key == ord("n"):
@@ -547,6 +549,12 @@ class TuiApp:
             return
         delta = self.mouse_wheel_delta(bstate)
         if delta == 0:
+            return
+        if self.mode == "skills":
+            if x >= self.right_x(width):
+                self.scroll_skill_preview(delta, stdscr)
+            else:
+                self.move_skill_selection(-1 if delta > 0 else 1, stdscr)
             return
         if x >= self.right_x(width):
             self.scroll_preview(delta, stdscr)
