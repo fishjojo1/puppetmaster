@@ -223,7 +223,7 @@ Slash commands:
 /skills skill-name:<optional> prompt:<optional> forget:<optional>
 ```
 
-After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Attachments are ignored in v1.
+After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Inbound user attachments are ignored in v1.
 
 `/puppet agents` formats each root id in its own copy-friendly code block so Discord users can copy one id at a time.
 
@@ -243,9 +243,9 @@ Native screenshot backends are best-effort and environment-dependent. Puppetmast
 
 `/puppet compact` sends Codex `/compact` to the bound root and then, after a short delay, queues the generated orchestrator prompt with a compacted-context task. `/puppet clear` sends Codex `/clear` to the bound root and then, after a short delay, queues the generated orchestrator prompt with a cleared-context task. These recovery prompts tell the root to report readiness through `send_human_message`.
 
-When a root orchestrator calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound replies are chunked to fit Discord limits.
+When a root orchestrator calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. It can also include `file_path` and optional `filename` to upload one local file attachment; relative paths resolve from the agent workspace, filenames are display names only, and files above Discord's default 10 MiB attachment limit are rejected before queueing. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound reply text is chunked to fit Discord limits.
 
-Bindings, reusable skills, and outbound messages are durable in SQLite. On restart, existing channel bindings still work, saved skills remain available, pending outbound messages are delivered once, and delivered or failed rows are not resent. Typing indicators are best-effort in-memory state and are reset by a bot restart.
+Bindings, reusable skills, and outbound messages are durable in SQLite. On restart, existing channel bindings still work, saved skills remain available, pending outbound messages and attachments are delivered once, and delivered or failed rows are not resent. Typing indicators are best-effort in-memory state and are reset by a bot restart.
 
 After an inbound prompt is delivered, the bot shows typing while the orchestrator is working. Typing stops when `send_human_message` is delivered, the root turn stops, or `typing_timeout_seconds` expires.
 
@@ -328,6 +328,8 @@ Generated root orchestrator prompts frame the root as a coordinator. Roots can h
 When a child is complete or no longer useful, roots are instructed to inspect/read any final output they need and then call `kill_agent(agent_id)`. That force-kills the child's tmux session and Codex process so completed work does not leave hundreds of idle Codex binaries behind.
 
 Child agents do not receive `send_human_message` in their MCP tool surface. They should report results with `complete_agent`, mark blockers with `complete_agent status:blocked`, or ask the parent/root to contact the human.
+
+For root orchestrators, `send_human_message` accepts `message`, optional `file_path`, and optional attachment display `filename`. File attachments are preflighted for existence, regular-file type, safe display filename, and Discord's default 10 MiB upload limit before they are queued.
 
 `wait` accepts positive seconds up to `[limits].max_wait_seconds` in `~/.puppetmaster/config.toml` (default `3600`). It does not sleep inside the MCP call.
 

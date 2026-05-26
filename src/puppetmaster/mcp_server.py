@@ -194,8 +194,8 @@ def prompt_agent_tool(agent_id: str, prompt: str) -> dict:
 
 
 @mcp.tool()
-def send_human_message(message: str) -> dict:
-    """Send a concise message to the bound human operator channel. Root orchestrators only."""
+def send_human_message(message: str = "", file_path: str | None = None, filename: str | None = None) -> dict:
+    """Send a concise message and optional file attachment to the bound human operator channel. Root orchestrators only."""
     try:
         _cfg, reg, _tmux, caller = _context()
         if not _is_root_orchestrator(caller):
@@ -204,7 +204,7 @@ def send_human_message(message: str) -> dict:
                 "send_human_message is only available to root orchestrators.",
                 "Child agents should report results through complete_agent or prompt their parent/root agent.",
             )
-        return send_human_message_service(reg, caller["id"], message, source="mcp_tool")
+        return send_human_message_service(reg, caller["id"], message, file_path=file_path, filename=filename, source="mcp_tool")
     except PuppetError as exc:
         return _error(exc)
 

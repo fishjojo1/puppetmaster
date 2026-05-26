@@ -103,6 +103,9 @@ create table if not exists outbound_human_messages(
   channel_id text not null,
   status text not null check(status in ('pending','delivered','failed')),
   message text not null,
+  attachment_path text null,
+  attachment_filename text null,
+  attachment_size integer null,
   created_at text not null,
   delivered_at text,
   failed_at text,
@@ -138,10 +141,21 @@ class Registry:
     def _init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._ensure_outbound_attachment_columns(conn)
             conn.execute(
                 "insert or ignore into schema_version(version, applied_at) values(1, ?)",
                 (now(),),
             )
+
+    def _ensure_outbound_attachment_columns(self, conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("pragma table_info(outbound_human_messages)").fetchall()}
+        for name, definition in {
+            "attachment_path": "text null",
+            "attachment_filename": "text null",
+            "attachment_size": "integer null",
+        }.items():
+            if name not in columns:
+                conn.execute(f"alter table outbound_human_messages add column {name} {definition}")
 
     def create_agent(self, fields: dict[str, Any]) -> dict[str, Any]:
         ts = now()
@@ -565,6 +579,9 @@ class Registry:
         transport: str,
         channel_id: str,
         message: str,
+        attachment_path: str | None = None,
+        attachment_filename: str | None = None,
+        attachment_size: int | None = None,
     ) -> dict[str, Any]:
         if transport != "discord":
             raise PuppetError("invalid_transport", f"unsupported outbound transport: {transport}")
@@ -576,6 +593,9 @@ class Registry:
             "channel_id": channel_id,
             "status": "pending",
             "message": message,
+            "attachment_path": attachment_path,
+            "attachment_filename": attachment_filename,
+            "attachment_size": attachment_size,
             "created_at": now(),
             "delivered_at": None,
             "failed_at": None,
@@ -585,10 +605,13 @@ class Registry:
             conn.execute(
                 """
                 insert into outbound_human_messages(
-                  id,root_agent_id,agent_id,transport,channel_id,status,message,created_at,delivered_at,failed_at,error
+                  id,root_agent_id,agent_id,transport,channel_id,status,message,
+                  attachment_path,attachment_filename,attachment_size,
+                  created_at,delivered_at,failed_at,error
                 ) values(
-                  :id,:root_agent_id,:agent_id,:transport,:channel_id,:status,:message,:created_at,
-                  :delivered_at,:failed_at,:error
+                  :id,:root_agent_id,:agent_id,:transport,:channel_id,:status,:message,
+                  :attachment_path,:attachment_filename,:attachment_size,
+                  :created_at,:delivered_at,:failed_at,:error
                 )
                 """,
                 outbound,

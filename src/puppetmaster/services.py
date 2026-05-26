@@ -27,6 +27,8 @@ AGENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 AGENT_ID_FORMAT_HINT = "Agent ids must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63} and must not contain '..'."
 COMPLETED_CLEANUP_STATUSES = {"completed", "stopped", "killed", "dead"}
 DEAD_CLEANUP_STATUSES = {"stopped", "killed", "dead"}
+DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024
+DISCORD_ATTACHMENT_FILENAME_MAX_LENGTH = 1024
 
 
 def agent_dir(config: Config, agent_id: str) -> Path:
@@ -380,12 +382,55 @@ def prompt_agent(registry: Registry, tmux: Tmux, agent_id: str, prompt: str, sou
     return event
 
 
-def send_human_message(registry: Registry, agent_id: str, message: str, *, source: str = "mcp_tool") -> dict[str, Any]:
+def _human_message_attachment(agent: dict[str, Any], file_path: str | None, filename: str | None) -> dict[str, Any] | None:
+    raw_path = (file_path or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = Path(agent["cwd"]) / path
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        raise PuppetError("file_not_found", f"attachment file not found: {raw_path}", "Pass a path to an existing regular file.") from None
+    if not resolved.is_file():
+        raise PuppetError("not_a_file", f"attachment path is not a file: {raw_path}", "Pass a path to a regular file, not a directory.")
+    size = resolved.stat().st_size
+    if size > DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES:
+        limit_mib = DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES // (1024 * 1024)
+        raise PuppetError(
+            "file_too_large",
+            f"attachment is {size} bytes, above Discord's default {limit_mib} MiB upload limit.",
+            "Send a smaller file, compress it, or share a link instead.",
+        )
+    display_name = (filename or resolved.name).strip()
+    if not display_name:
+        raise PuppetError("filename_required", "attachment filename must be non-empty.")
+    if "/" in display_name or "\\" in display_name or Path(display_name).name != display_name:
+        raise PuppetError("invalid_filename", "attachment filename must not contain path separators.", "Pass only a display filename like report.png.")
+    if len(display_name) > DISCORD_ATTACHMENT_FILENAME_MAX_LENGTH:
+        raise PuppetError(
+            "filename_too_long",
+            f"attachment filename is longer than Discord's {DISCORD_ATTACHMENT_FILENAME_MAX_LENGTH} character limit.",
+        )
+    return {"path": str(resolved), "filename": display_name, "size": size}
+
+
+def send_human_message(
+    registry: Registry,
+    agent_id: str,
+    message: str,
+    *,
+    file_path: str | None = None,
+    filename: str | None = None,
+    source: str = "mcp_tool",
+) -> dict[str, Any]:
     agent = registry.get_agent(agent_id)
     root_id = agent["root_id"]
-    normalized = message.strip()
-    if not normalized:
-        raise PuppetError("message_required", "send_human_message requires a non-empty message.", "Pass the human-facing reply text.")
+    normalized = (message or "").strip()
+    attachment = _human_message_attachment(agent, file_path, filename)
+    if not normalized and attachment is None:
+        raise PuppetError("message_required", "send_human_message requires a non-empty message or file_path.", "Pass human-facing reply text or a file to attach.")
     binding = registry.discord_binding_for_root(root_id)
     if not binding:
         raise PuppetError(
@@ -399,25 +444,38 @@ def send_human_message(registry: Registry, agent_id: str, message: str, *, sourc
         "discord",
         binding["channel_id"],
         normalized,
+        attachment_path=attachment["path"] if attachment else None,
+        attachment_filename=attachment["filename"] if attachment else None,
+        attachment_size=attachment["size"] if attachment else None,
     )
+    payload = {
+        "message_id": outbound["id"],
+        "transport": outbound["transport"],
+        "channel_id": outbound["channel_id"],
+        "message_length": len(normalized),
+    }
+    if attachment is not None:
+        payload["attachment_filename"] = attachment["filename"]
+        payload["attachment_size"] = attachment["size"]
     registry.append_event(
         agent_id,
         "human.message.queued",
         "Human message queued.",
-        {
-            "message_id": outbound["id"],
-            "transport": outbound["transport"],
-            "channel_id": outbound["channel_id"],
-            "message_length": len(normalized),
-        },
+        payload,
         source=source,
     )
-    return {
+    result = {
         "queued": True,
         "id": outbound["id"],
         "transport": outbound["transport"],
         "channel_id": outbound["channel_id"],
     }
+    if attachment is not None:
+        result["attachment"] = {
+            "filename": attachment["filename"],
+            "size": attachment["size"],
+        }
+    return result
 
 
 def notify_agent_state_change(
@@ -765,6 +823,7 @@ def prompt_text(agent: dict[str, Any], user_prompt: str) -> str:
     if agent["role"] == "orchestrator":
         human_message_tools = """
 - Always use send_human_message for every human-facing message, including answers, status updates, readiness notices, and blockers.
+- To attach one local file to a human-facing Discord reply, pass file_path and optional filename to send_human_message. Relative paths resolve from this agent's workspace. Files over Discord's default 10 MiB upload limit are rejected.
 - Regularly update the human with send_human_message during longer work, after meaningful progress, and before waiting on child agents or external events.
 """
         orchestration = """

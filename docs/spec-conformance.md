@@ -48,7 +48,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 ## Discord Integration
 
 - Discord config exists in global `~/.puppetmaster/config.toml`: `[discord]` in `Config`.
-- Discord state is durable in SQLite: `discord_channel_bindings`, `discord_skills`, and `outbound_human_messages`.
+- Discord state is durable in SQLite: `discord_channel_bindings`, `discord_skills`, and `outbound_human_messages`, including optional outbound attachment metadata.
 - The bot entrypoint exists: `puppet discord serve`, `run_discord_bot`.
 - Background Discord process management stores `discord-bot.pid` and `discord-bot.log` in the active state directory, rejects duplicate starts for the same state, clears stale PID files on start, and honors `PUPPETMASTER_STATE_DIR` isolation.
 - Guild-scoped slash commands exist: `/puppet agents`, `/puppet bind`, `/puppet unbind`, `/puppet status`, `/puppet read`, `/puppet tree`, `/puppet screenshot`, `/puppet compact`, `/puppet clear`, and `/skills`.
@@ -58,7 +58,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - Mention/reply-only inbound prompt routing exists: `DiscordRuntime.handle_message`.
 - Inbound Discord prompts use `DISCORD MESSAGE RECEIVED:\n<message>`.
 - Reusable Discord skills persist prompt text and `/skills skill-name:<name>` sends the saved prompt to the channel's bound root.
-- Outbound human replies use frontend-neutral `send_human_message` from root orchestrators.
+- Outbound human replies use frontend-neutral `send_human_message` from root orchestrators and can include one local file attachment within Discord's default upload limit.
 - Outbound Discord dispatch is durable and status-based: pending rows deliver, delivered/failed rows are not selected again.
 - Typing indicators start after inbound prompt delivery and stop on outbound delivery, root turn stop, or timeout.
 - Discord runtime errors are short and actionable, with setup hints for unbound channels and status/read hints for dead sessions.

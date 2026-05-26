@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import tomllib
 from pathlib import Path
 
@@ -623,12 +624,24 @@ def test_discord_skills_persist_and_update(ctx):
 def test_outbound_human_message_queue_lifecycle(ctx):
     _cfg, reg, _tmux = ctx
 
-    first = reg.enqueue_outbound_human_message("root-1", "agent-1", "discord", "channel-1", "hello")
+    first = reg.enqueue_outbound_human_message(
+        "root-1",
+        "agent-1",
+        "discord",
+        "channel-1",
+        "hello",
+        attachment_path="/tmp/report.txt",
+        attachment_filename="report.txt",
+        attachment_size=12,
+    )
     second = reg.enqueue_outbound_human_message("root-1", "agent-2", "discord", "channel-1", "follow-up")
 
     assert first["id"].startswith("msg_")
     assert first["status"] == "pending"
     assert first["message"] == "hello"
+    assert first["attachment_path"] == "/tmp/report.txt"
+    assert first["attachment_filename"] == "report.txt"
+    assert first["attachment_size"] == 12
     assert [item["id"] for item in reg.pending_outbound_human_messages("discord")] == [first["id"], second["id"]]
     assert reg.pending_outbound_human_messages("email") == []
 
@@ -646,6 +659,36 @@ def test_outbound_human_message_queue_lifecycle(ctx):
     assert failed_after_delivery["status"] == "failed"
     assert failed_after_delivery["delivered_at"] is None
     assert failed_after_delivery["failed_at"] is not None
+
+
+def test_registry_migrates_outbound_attachment_columns(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(tmp_path / ".state"))
+    cfg = load_config()
+    cfg.registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(cfg.registry_path) as conn:
+        conn.execute(
+            """
+            create table outbound_human_messages(
+              id text primary key,
+              root_agent_id text not null,
+              agent_id text not null,
+              transport text not null check(transport in ('discord')),
+              channel_id text not null,
+              status text not null check(status in ('pending','delivered','failed')),
+              message text not null,
+              created_at text not null,
+              delivered_at text,
+              failed_at text,
+              error text
+            )
+            """
+        )
+
+    reg = Registry(cfg)
+
+    with reg.connect() as conn:
+        columns = {row["name"] for row in conn.execute("pragma table_info(outbound_human_messages)").fetchall()}
+    assert {"attachment_path", "attachment_filename", "attachment_size"} <= columns
 
 
 def test_send_human_message_rejects_empty_message(ctx, tmp_path):
@@ -699,6 +742,56 @@ def test_send_human_message_enqueues_pending_message_and_audit_event(ctx, tmp_pa
         "channel_id": "bound-channel",
         "message_length": len("Hello human."),
     }
+
+
+def test_send_human_message_enqueues_file_attachment(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", root["id"], "guild-1")
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    result = services.send_human_message(reg, root["id"], "", file_path="report.txt", filename="summary.txt", source="test")
+
+    assert result["queued"] is True
+    assert result["attachment"] == {"filename": "summary.txt", "size": len("report")}
+    queued = reg.pending_outbound_human_messages("discord")[0]
+    assert queued["message"] == ""
+    assert queued["attachment_path"] == str(attachment)
+    assert queued["attachment_filename"] == "summary.txt"
+    assert queued["attachment_size"] == len("report")
+    audit = next(event for event in reg.list_events(root["id"], limit=10) if event["type"] == "human.message.queued")
+    assert audit["payload"]["attachment_filename"] == "summary.txt"
+    assert audit["payload"]["attachment_size"] == len("report")
+
+
+def test_send_human_message_rejects_oversized_file_before_queue(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", root["id"], "guild-1")
+    attachment = tmp_path / "large.bin"
+    attachment.write_bytes(b"abcd")
+    monkeypatch.setattr(services, "DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES", 3)
+
+    with pytest.raises(PuppetError) as exc:
+        services.send_human_message(reg, root["id"], "see attached", file_path=str(attachment))
+
+    assert exc.value.code == "file_too_large"
+    assert reg.pending_outbound_human_messages("discord") == []
+
+
+def test_send_human_message_rejects_invalid_attachment_filename(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", root["id"], "guild-1")
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    with pytest.raises(PuppetError) as exc:
+        services.send_human_message(reg, root["id"], "see attached", file_path=str(attachment), filename="../secret.txt")
+
+    assert exc.value.code == "invalid_filename"
+    assert reg.pending_outbound_human_messages("discord") == []
 
 
 def test_send_human_message_child_routes_through_root_binding(ctx, tmp_path):
@@ -1344,6 +1437,24 @@ def test_mcp_send_human_message_returns_queued_result(ctx, tmp_path, monkeypatch
     assert result["transport"] == "discord"
     assert result["channel_id"] == "bound-channel"
     assert reg.pending_outbound_human_messages("discord")[0]["message"] == "Hello from MCP."
+
+
+def test_mcp_send_human_message_accepts_attachment(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    caller = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("bound-channel", caller["id"], "guild-1")
+    attachment = tmp_path / "result.txt"
+    attachment.write_text("done", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, caller))
+
+    result = mcp_server.send_human_message(file_path="result.txt", filename="artifact.txt")
+
+    assert result["queued"] is True
+    assert result["attachment"] == {"filename": "artifact.txt", "size": len("done")}
+    queued = reg.pending_outbound_human_messages("discord")[0]
+    assert queued["message"] == ""
+    assert queued["attachment_path"] == str(attachment)
+    assert queued["attachment_filename"] == "artifact.txt"
 
 
 def test_mcp_send_human_message_rejects_child_callers(ctx, tmp_path, monkeypatch):

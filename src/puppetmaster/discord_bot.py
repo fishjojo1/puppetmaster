@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import Config, DiscordConfig, load_config
@@ -15,7 +16,7 @@ from .logging import log as supervisor_log
 from .model import now
 from .native_screenshot import capture_native_screenshot
 from .registry import Registry
-from .services import prompt_agent, prompt_text, read_agent
+from .services import DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES, prompt_agent, prompt_text, read_agent
 from .terminal_image import render_terminal_png
 from .tmux import Tmux
 
@@ -123,6 +124,39 @@ async def send_chunks(destination: Any, text: str, config: Config | DiscordConfi
 async def send_plain_chunks(destination: Any, text: str, config: Config | DiscordConfig) -> None:
     discord_config = _discord_config(config)
     for chunk in chunk_text(text, discord_config.chunk_size, discord_config.max_chunks):
+        await destination.send(chunk)
+
+
+def _discord_file_for_outbound(outbound: dict[str, Any]) -> Any | None:
+    attachment_path = outbound.get("attachment_path")
+    if not attachment_path:
+        return None
+    if discord is None:
+        raise PuppetError("discord_dependency_missing", "discord.py is not installed.")
+    path = Path(str(attachment_path))
+    if not path.is_file():
+        raise PuppetError("file_not_found", f"attachment file not found: {attachment_path}")
+    size = path.stat().st_size
+    if size > DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES:
+        limit_mib = DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES // (1024 * 1024)
+        raise PuppetError("file_too_large", f"attachment is {size} bytes, above Discord's default {limit_mib} MiB upload limit.")
+    return discord.File(str(path), filename=outbound.get("attachment_filename") or path.name)
+
+
+async def send_plain_chunks_with_attachment(destination: Any, outbound: dict[str, Any], config: Config | DiscordConfig) -> None:
+    file = _discord_file_for_outbound(outbound)
+    if file is None:
+        await send_plain_chunks(destination, outbound["message"], config)
+        return
+    discord_config = _discord_config(config)
+    chunks = chunk_text(outbound["message"], discord_config.chunk_size, discord_config.max_chunks)
+    try:
+        await destination.send(content=chunks[0] or None, file=file)
+    finally:
+        close = getattr(file, "close", None)
+        if close is not None:
+            close()
+    for chunk in chunks[1:]:
         await destination.send(chunk)
 
 
@@ -462,7 +496,7 @@ class DiscordRuntime:
                 channel = await self._get_channel(outbound["channel_id"])
                 if channel is None:
                     raise PuppetError("channel_not_found", f"Discord channel not found: {outbound['channel_id']}")
-                await send_plain_chunks(channel, outbound["message"], self.config)
+                await send_plain_chunks_with_attachment(channel, outbound, self.config)
                 self.registry.mark_outbound_human_message_delivered(outbound["id"])
                 self._log(
                     "info",
@@ -473,6 +507,7 @@ class DiscordRuntime:
                     agent_id=outbound["agent_id"],
                     channel_id=outbound["channel_id"],
                     message_length=len(outbound["message"]),
+                    attachment_size=outbound.get("attachment_size"),
                 )
                 self.stop_typing(outbound["root_agent_id"])
             except Exception as exc:
@@ -488,6 +523,7 @@ class DiscordRuntime:
                     agent_id=outbound["agent_id"],
                     channel_id=outbound["channel_id"],
                     message_length=len(outbound["message"]),
+                    attachment_size=outbound.get("attachment_size"),
                     error_message=error,
                 )
 

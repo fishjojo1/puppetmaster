@@ -56,7 +56,7 @@ Important CLI groups:
 
 `puppet orchestrator start --goal` and MCP `create_agent(goal=true)` both prepend literal `/goal ` to the managed agent's initial task prompt. `puppet orchestrator start --codex-home <path>` selects the source Codex home for the root tree's config/auth; generated per-agent `CODEX_HOME` directories are still used for runtime isolation.
 
-Managed agents receive an MCP server named `puppetmaster` with tools for creating and prompting child agents, reading and inspecting visible agents, completing work, scheduling wakeups, stopping/killing/pausing/resuming authorized agents, and attaching to tmux sessions. Root orchestrators also receive `send_human_message` for replying through the bound root channel; child agents do not receive that tool.
+Managed agents receive an MCP server named `puppetmaster` with tools for creating and prompting child agents, reading and inspecting visible agents, completing work, scheduling wakeups, stopping/killing/pausing/resuming authorized agents, and attaching to tmux sessions. Root orchestrators also receive `send_human_message` for replying through the bound root channel, with optional local file attachment support via `file_path` and `filename`; child agents do not receive that tool.
 
 Generated root orchestrator prompts instruct roots to always use `send_human_message` for human-facing answers, status updates, readiness notices, blockers, and regular progress updates during longer work. They also instruct roots to call `kill_agent(agent_id)` after consuming final child output when a child is complete or no longer useful, so child tmux sessions and Codex processes do not accumulate. Generated child prompts instruct children to report through completion/blocker status or their parent/root instead of contacting the human directly.
 
@@ -68,7 +68,7 @@ Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset 
 
 ## State And Events
 
-The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, reusable Discord skills, and outbound human messages. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config.
+The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, reusable Discord skills, and outbound human messages with optional attachment metadata. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config.
 
 Completion is explicit. A Codex turn stopping is not the same as finishing work. Agents should call `complete_agent` with `success`, `failed`, `blocked`, or `cancelled` when their assigned task is actually terminal.
 

@@ -265,15 +265,20 @@ class FakeDiscordChannel:
         self.guild = guild or FakeDiscordGuild()
         self.is_text_channel = True
         self.sent: list[str] = []
+        self.sent_files: list[object] = []
         self.fail_send = False
         self.typing_entries = 0
         self.typing_exits = 0
         self.fetched_messages: dict[str, FakeDiscordMessage] = {}
 
-    async def send(self, message: str) -> None:
+    async def send(self, message: str | None = None, **kwargs) -> None:
         if self.fail_send:
             raise RuntimeError("discord send failed")
-        self.sent.append(message)
+        content = kwargs.get("content", message)
+        self.sent.append(content or "")
+        file = kwargs.get("file")
+        if file is not None:
+            self.sent_files.append(file)
 
     def typing(self) -> FakeTyping:
         return FakeTyping(self)
@@ -633,6 +638,64 @@ def test_outbound_dispatch_sends_pending_and_marks_delivered(ctx, tmp_path):
 
     assert channel.sent == ["hello human"]
     assert _outbound_row(reg, outbound["id"])["status"] == "delivered"
+
+
+def test_outbound_dispatch_sends_attachment_and_marks_delivered(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    attachment = tmp_path / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+    outbound = reg.enqueue_outbound_human_message(
+        root["id"],
+        root["id"],
+        "discord",
+        "456",
+        "see attached",
+        attachment_path=str(attachment),
+        attachment_filename="summary.txt",
+        attachment_size=attachment.stat().st_size,
+    )
+    channel = FakeDiscordChannel()
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, bot=FakeDiscordBot({"456": channel}))
+        await runtime.dispatch_pending_outbound_once()
+        await runtime.close()
+
+    asyncio.run(run())
+
+    assert channel.sent == ["see attached"]
+    assert len(channel.sent_files) == 1
+    assert channel.sent_files[0].filename == "summary.txt"
+    assert _outbound_row(reg, outbound["id"])["status"] == "delivered"
+
+
+def test_outbound_dispatch_marks_missing_attachment_failed(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    outbound = reg.enqueue_outbound_human_message(
+        root["id"],
+        root["id"],
+        "discord",
+        "456",
+        "see attached",
+        attachment_path=str(tmp_path / "missing.txt"),
+        attachment_filename="missing.txt",
+        attachment_size=1,
+    )
+    channel = FakeDiscordChannel()
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, bot=FakeDiscordBot({"456": channel}))
+        await runtime.dispatch_pending_outbound_once()
+        await runtime.close()
+
+    asyncio.run(run())
+
+    row = _outbound_row(reg, outbound["id"])
+    assert row["status"] == "failed"
+    assert "attachment file not found" in row["error"]
+    assert channel.sent == []
 
 
 def test_pending_outbound_created_before_runtime_start_is_delivered(ctx, tmp_path):
