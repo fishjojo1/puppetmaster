@@ -344,13 +344,13 @@ class TuiApp:
         elif key in {curses.KEY_DOWN, ord("j")}:
             self.move_skill_selection(1, stdscr)
         elif key == curses.KEY_PPAGE:
-            self.scroll_skill_preview(self.skill_preview_page_size(stdscr), stdscr)
-        elif key == curses.KEY_NPAGE:
             self.scroll_skill_preview(-self.skill_preview_page_size(stdscr), stdscr)
+        elif key == curses.KEY_NPAGE:
+            self.scroll_skill_preview(self.skill_preview_page_size(stdscr), stdscr)
         elif key == curses.KEY_HOME:
-            self.scroll_skill_preview_to_top(stdscr)
-        elif key == curses.KEY_END:
             self.skill_preview_scroll = 0
+        elif key == curses.KEY_END:
+            self.scroll_skill_preview_to_bottom(stdscr)
         elif key == curses.KEY_MOUSE:
             self.handle_mouse(stdscr)
         elif key == ord("r"):
@@ -395,7 +395,7 @@ class TuiApp:
     def scroll_skill_preview(self, delta: int, stdscr: Any) -> None:
         self.skill_preview_scroll = min(max(self.skill_preview_scroll + delta, 0), self.max_skill_preview_scroll(stdscr))
 
-    def scroll_skill_preview_to_top(self, stdscr: Any) -> None:
+    def scroll_skill_preview_to_bottom(self, stdscr: Any) -> None:
         self.skill_preview_scroll = self.max_skill_preview_scroll(stdscr)
 
     def save_skill_prompt(self, skill_name: str | None, prompt: str | None) -> dict[str, Any]:
@@ -552,7 +552,7 @@ class TuiApp:
             return
         if self.mode == "skills":
             if x >= self.right_x(width):
-                self.scroll_skill_preview(delta, stdscr)
+                self.scroll_skill_preview(-delta, stdscr)
             else:
                 self.move_skill_selection(-1 if delta > 0 else 1, stdscr)
             return
@@ -692,10 +692,10 @@ class TuiApp:
         self.skill_preview_scroll = min(self.skill_preview_scroll, max_scroll)
         title = "Prompt"
         if max_scroll:
-            current = max_scroll - self.skill_preview_scroll + 1
+            current = self.skill_preview_scroll + 1
             title = f"Prompt {current}-{min(current + height - 1, len(lines))}/{len(lines)}"
         addstr(stdscr, y - 1, x, title, width, curses.A_BOLD)
-        start = max(0, len(lines) - height - self.skill_preview_scroll)
+        start = self.skill_preview_scroll
         lines = lines[start : start + height]
         for offset, line in enumerate(lines):
             addstr(stdscr, y + offset, x, line, width)

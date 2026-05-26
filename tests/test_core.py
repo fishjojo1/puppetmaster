@@ -2474,9 +2474,54 @@ def test_tui_skill_mode_lists_and_scrolls_prompt(ctx):
     assert app.skill_preview_scroll == 0
 
 
+def test_tui_skill_prompt_draw_starts_at_top(ctx):
+    cfg, reg, tmux = ctx
+    reg.upsert_discord_skill("review", "\n".join(f"line {index}" for index in range(12)))
+
+    class Screen:
+        def __init__(self):
+            self.calls = []
+
+        def addstr(self, y, x, text, attr):
+            self.calls.append((y, x, text.rstrip(), attr))
+
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.toggle_mode()
+    screen = Screen()
+
+    app.draw_skill_prompt(screen, 1, 0, 6, 80)
+
+    drawn = {y: text for y, _x, text, _attr in screen.calls}
+    assert drawn[0] == "Prompt 1-6/12"
+    assert drawn[1] == "line 0"
+    assert drawn[6] == "line 5"
+
+
+def test_tui_agent_preview_draw_still_starts_at_bottom(ctx):
+    cfg, reg, tmux = ctx
+
+    class Screen:
+        def __init__(self):
+            self.calls = []
+
+        def addstr(self, y, x, text, attr):
+            self.calls.append((y, x, text.rstrip(), attr))
+
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.preview = "\n".join(f"line {index}" for index in range(12))
+    screen = Screen()
+
+    app.draw_preview(screen, 1, 0, 6, 80)
+
+    drawn = {y: text for y, _x, text, _attr in screen.calls}
+    assert drawn[0] == "Preview 7-12/12"
+    assert drawn[1] == "line 6"
+    assert drawn[6] == "line 11"
+
+
 def test_tui_skill_mouse_wheel_on_right_scrolls_prompt_not_selection(ctx, monkeypatch):
     cfg, reg, tmux = ctx
-    monkeypatch.setattr(tui_module.curses, "BUTTON4_PRESSED", 1, raising=False)
+    monkeypatch.setattr(tui_module.curses, "BUTTON5_PRESSED", 1, raising=False)
     reg.upsert_discord_skill("review", "\n".join(f"line {index}" for index in range(12)))
     reg.upsert_discord_skill("test-plan", "Write a test plan.")
 
