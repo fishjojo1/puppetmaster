@@ -47,6 +47,19 @@ Create and maintain these project-local artifacts unless the existing repo has a
 
 If the repo already has a milestone or planning convention, use that convention and mention the chosen paths in the first status update.
 
+## Child Skill Templates
+
+When spawning child agents, use or reference these subagent skill templates in the child prompt. If Puppetmaster later supports first-class skill selection at spawn time, use these file names as the skill ids:
+
+- `subagent-researcher`: requirements, stack, repo, risk, and reuse research.
+- `subagent-project-planner`: full-project roadmap and milestone split.
+- `subagent-milestone-planner`: detailed plan for one milestone.
+- `subagent-milestone-executor`: implementation and focused verification for one milestone.
+- `subagent-milestone-validator`: independent validation for one milestone.
+- `subagent-fixer`: scoped fixes for validation, audit, or integration issues.
+- `subagent-integrator`: reconcile overlapping work, merge artifacts, resolve conflicts, and preserve intent.
+- `subagent-final-auditor`: final project audit against the PRD and all milestone evidence.
+
 ## Workflow
 
 ### 0. Intake And Repository Setup
