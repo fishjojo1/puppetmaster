@@ -43,6 +43,9 @@ Issues = "https://github.com/fishjojo1/puppetmaster/issues"
 [project.scripts]
 puppet = "puppetmaster.cli:main"
 
+[tool.setuptools.data-files]
+"share/puppetmaster/skills" = ["skills/*.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]

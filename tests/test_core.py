@@ -2091,6 +2091,62 @@ def test_mcp_create_agent_leaves_prompt_unchanged_without_goal_mode(tmp_path, mo
     assert captured["metadata"] == {}
 
 
+def test_mcp_list_subagent_skills_returns_frontmatter_descriptions():
+    result = mcp_server.list_subagent_skills()
+
+    skills = result["skills"]
+    names = [skill["name"] for skill in skills]
+    descriptions = {skill["name"]: skill["description"] for skill in skills}
+
+    assert names == sorted(names)
+    assert "project-orchestrator" not in names
+    assert "subagent-researcher" in names
+    assert "subagent-milestone-executor" in names
+    assert descriptions["subagent-researcher"].startswith("Research requirements")
+    assert all(descriptions[name] for name in names)
+
+
+def test_mcp_create_agent_prepends_selected_subagent_skill_to_prompt(tmp_path, monkeypatch):
+    captured = {}
+    caller = {"id": "agt_parent"}
+
+    class FakeTmux:
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    def fake_create_codex_agent(cfg, reg, tmux, **kwargs):
+        captured.update(kwargs)
+        return {"id": "agt_child", "status": "running", "cwd": kwargs["cwd"], "tmux_session": "puppet_agt_child"}
+
+    monkeypatch.setattr(mcp_server, "_context", lambda: (object(), object(), FakeTmux(), caller))
+    monkeypatch.setattr(mcp_server, "create_codex_agent", fake_create_codex_agent)
+
+    result = mcp_server.create_agent(
+        cwd=str(tmp_path),
+        prompt="Fix the validation failure in milestone 003.",
+        skill="subagent-fixer",
+        metadata={"milestone": "003"},
+    )
+
+    assert result["id"] == "agt_child"
+    assert result["skill"] == "subagent-fixer"
+    assert captured["metadata"] == {"milestone": "003", "skill": "subagent-fixer"}
+    assert captured["description"] == "Fix the validation failure in milestone 003."
+    assert captured["prompt"].startswith("You are being started with Puppetmaster subagent skill `subagent-fixer`.")
+    assert "# Subagent Fixer" in captured["prompt"]
+    assert "Assigned task:\nFix the validation failure in milestone 003." in captured["prompt"]
+
+
+def test_mcp_create_agent_rejects_unknown_or_non_subagent_skill(tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp_server, "_context", lambda: (object(), object(), object(), {"id": "agt_parent"}))
+
+    non_subagent = mcp_server.create_agent(cwd=str(tmp_path), prompt="Do work.", skill="project-orchestrator")
+    unknown = mcp_server.create_agent(cwd=str(tmp_path), prompt="Do work.", skill="subagent-missing")
+
+    assert non_subagent["error"]["code"] == "invalid_subagent_skill"
+    assert unknown["error"]["code"] == "unknown_subagent_skill"
+
+
 def test_mcp_create_agent_requires_prompt_when_goal_omitted(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "_context", lambda: (object(), object(), object(), {"id": "agt_parent"}))
 

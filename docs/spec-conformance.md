@@ -21,7 +21,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - Subagent Stop hook records `agent.turn_stopped`: `handle_stop_hook`.
 - Orchestrator Stop hook drains events: `puppet hook drain-events`.
 - MCP server command exists: `puppet mcp serve`.
-- Required MCP tools are registered: `src/puppetmaster/mcp_server.py`. `send_human_message` is root-orchestrator only and is removed from child-agent MCP tool listings. Orchestrator prompts and event prompts surface `kill_agent` as the cleanup action after final child output has been consumed.
+- Required MCP tools are registered: `src/puppetmaster/mcp_server.py`. `list_subagent_skills` exposes built-in `skills/subagent-*.md` templates for `create_agent(skill=...)`. `send_human_message` is root-orchestrator only and is removed from child-agent MCP tool listings. Orchestrator prompts and event prompts surface `kill_agent` as the cleanup action after final child output has been consumed.
 
 ## Completion And Events
 

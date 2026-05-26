@@ -307,6 +307,7 @@ Managed Codex sessions receive a per-agent MCP server named `puppetmaster`. V1 t
 
 ```text
 create_agent
+list_subagent_skills
 prompt_agent
 read_agent
 inspect_agent
@@ -320,6 +321,8 @@ attach_agent
 wait
 send_human_message  # root orchestrators only
 ```
+
+`list_subagent_skills` returns built-in subagent skill templates discovered from `skills/subagent-*.md`, using each file's YAML frontmatter `description`. `create_agent` accepts an optional `skill` name from that list; when provided, Puppetmaster prepends the skill instructions to the child agent's initial prompt and records the selected skill in agent metadata.
 
 `create_agent` can start a child in goal mode with `goal: true`. `goal` is an optional boolean; when true, Puppetmaster prepends literal `/goal ` to the start of the child agent's initial `prompt`. It does nothing else. `create_agent` always requires an explicit absolute `cwd` and a `prompt`; v1 does not default to the caller's cwd and does not create worktrees.
 

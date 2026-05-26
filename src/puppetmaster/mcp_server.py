@@ -21,6 +21,8 @@ from .services import (
     send_human_message as send_human_message_service,
     stop_agent,
 )
+from .skills import list_subagent_skills as list_subagent_skill_metadata
+from .skills import subagent_skill
 from .tmux import Tmux
 
 
@@ -62,6 +64,7 @@ def create_agent(
     cwd: str,
     description: str | None = None,
     prompt: str | None = None,
+    skill: str | None = None,
     goal: bool = False,
     name: str | None = None,
     metadata: dict | None = None,
@@ -69,16 +72,22 @@ def create_agent(
     """Create a child Codex agent.
 
     cwd is required and must be an existing absolute path. prompt is the child
-    agent's initial task. goal is an optional boolean; when true, Puppetmaster
+    agent's initial task. skill is an optional subagent skill name returned by
+    list_subagent_skills; when provided, Puppetmaster prepends that skill's
+    instructions to the child prompt. goal is an optional boolean; when true, Puppetmaster
     starts the agent in goal mode by prepending literal "/goal " to the start of
     prompt. It does nothing else. description is a short human-readable label.
     """
     try:
         cfg, reg, tmux, caller = _context()
-        task = _task_with_goal_mode(prompt, goal)
-        if not task:
+        base_task = (prompt or "").strip()
+        if not base_task:
             raise PuppetError("prompt_required", "create_agent requires prompt.", "Pass a full prompt.")
+        selected_skill = subagent_skill(skill)
+        task = _task_with_goal_mode(_task_with_skill(base_task, selected_skill), goal)
         agent_metadata = dict(metadata or {})
+        if selected_skill:
+            agent_metadata["skill"] = selected_skill.name
         agent_description = (description or _description_from_task(prompt or task)).strip()
         agent = create_codex_agent(
             cfg,
@@ -91,7 +100,13 @@ def create_agent(
             name=name,
             metadata=agent_metadata,
         )
-        return {"id": agent["id"], "status": agent["status"], "cwd": agent["cwd"], "attach_command": tmux.attach_command(agent["tmux_session"])}
+        return {
+            "id": agent["id"],
+            "status": agent["status"],
+            "cwd": agent["cwd"],
+            "skill": selected_skill.name if selected_skill else None,
+            "attach_command": tmux.attach_command(agent["tmux_session"]),
+        }
     except PuppetError as exc:
         return _error(exc)
 
@@ -108,6 +123,30 @@ def _task_with_goal_mode(prompt: str | None, goal: bool) -> str:
     if goal and task:
         return f"/goal {task}"
     return task
+
+
+def _task_with_skill(prompt: str, skill: Any | None) -> str:
+    if skill is None:
+        return prompt
+    return f"""You are being started with Puppetmaster subagent skill `{skill.name}`.
+
+Skill description:
+{skill.description}
+
+Skill instructions:
+{skill.body}
+
+Assigned task:
+{prompt}"""
+
+
+@mcp.tool()
+def list_subagent_skills() -> dict:
+    """List built-in subagent skills available for create_agent(skill=...)."""
+    try:
+        return {"skills": list_subagent_skill_metadata()}
+    except PuppetError as exc:
+        return _error(exc)
 
 
 @mcp.tool(name="complete_agent")
