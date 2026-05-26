@@ -890,9 +890,6 @@ Orchestrator event loop:
 """
     return f"""You are a Puppetmaster-managed Codex agent.
 
-Task:
-{user_prompt}
-
 Agent:
 - id: {agent['id']}
 - parent_id: {agent.get('parent_id') or ''}
@@ -901,13 +898,16 @@ Agent:
 - description: {agent['description']}
 
 Puppetmaster tools:
-- Use create_agent to delegate work to child agents when that helps the task.
-- Use list_subagent_skills to discover role-specific subagent prompt templates for create_agent(skill=...).
+- Use create_agent(cwd, prompt, description?, skill?, goal?, name?, metadata?) to delegate work to child agents when that helps the task.
+- Use list_subagent_skills() to discover built-in role-specific subagent prompt templates. Pass create_agent(skill="subagent-...") when a listed skill matches the delegated role.
 - Use inspect_agent and read_agent to understand child state and recent output.
 - Use prompt_agent to send follow-up instructions to a live child agent.
+- Use list_agents to inspect agents visible to you.
 - Child agents do not have direct human-message tools. Report results through complete_agent, blockers through complete_agent with status blocked, or ask your parent/root agent to contact the human.
 {human_message_tools.rstrip()}
 - Use kill_agent after consuming final child output when a child is no longer useful; this closes the tmux session and Codex process. Use stop_agent when you want a gentler interrupt.
+- Use pause_agent and resume_agent to mark authorized agents awaiting input or running when state needs to reflect orchestration reality.
+- Use attach_agent only when you need a tmux attach command for an authorized agent.
 - Use wait(seconds, reason) only for a time-based wakeup. End your turn after calling wait.
 {orchestration}
 Completion:
@@ -915,6 +915,9 @@ Completion:
 - If you cannot continue without input, call complete_agent with status blocked and explain what is needed.
 - If the task failed, call complete_agent with status failed and summarize the failure.
 - A human may attach to this tmux session at any time.
+
+USER INSTRUCTIONS
+{user_prompt}
 """
 
 

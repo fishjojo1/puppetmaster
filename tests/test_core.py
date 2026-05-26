@@ -898,8 +898,9 @@ def test_start_orchestrator_goal_mode_prepends_goal_to_initial_prompt(ctx, tmp_p
     root = start_orchestrator(cfg, reg, fake, cwd=str(tmp_path), prompt="Manage this project.", goal=True)
 
     prompt_path = Path(root["metadata"]["generated_files"]["prompt"])
-    assert "Task:\n/goal Manage this project." in prompt_path.read_text(encoding="utf-8")
-    assert "Task:\n/goal Manage this project." in fake.prompts[0][1]
+    prompt_text_value = prompt_path.read_text(encoding="utf-8")
+    assert "USER INSTRUCTIONS\n/goal Manage this project." in prompt_text_value
+    assert "USER INSTRUCTIONS\n/goal Manage this project." in fake.prompts[0][1]
 
 
 def test_start_orchestrator_codex_home_feeds_root_mcp_environment(ctx, tmp_path, monkeypatch):
@@ -1961,9 +1962,16 @@ def test_prompt_text_explains_orchestrator_wait_and_event_loop(ctx, tmp_path):
     assert "send_human_message" in root_prompt
     assert "Always use send_human_message for every human-facing message" in root_prompt
     assert "Regularly update the human with send_human_message during longer work" in root_prompt
+    assert "Use create_agent(cwd, prompt, description?, skill?, goal?, name?, metadata?)" in root_prompt
+    assert "Use list_subagent_skills() to discover built-in role-specific subagent prompt templates" in root_prompt
+    assert 'Pass create_agent(skill="subagent-...")' in root_prompt
+    assert "Use pause_agent and resume_agent" in root_prompt
+    assert "Use attach_agent only when you need a tmux attach command" in root_prompt
     assert "Child agents do not have direct human-message tools" in root_prompt
     assert "DISCORD MESSAGE RECEIVED" in root_prompt
     assert "always answer the human by calling send_human_message" in root_prompt
+    assert root_prompt.rfind("USER INSTRUCTIONS\nCoordinate the work.") > root_prompt.find("Puppetmaster tools:")
+    assert "Task:\nCoordinate the work." not in root_prompt
     assert "routing" not in root_prompt.lower()
     assert "If you are only waiting for child-agent progress" not in child_prompt
     assert "Your primary role is orchestration" not in child_prompt
@@ -1976,6 +1984,7 @@ def test_prompt_text_explains_orchestrator_wait_and_event_loop(ctx, tmp_path):
     assert "Child agents do not have direct human-message tools" in child_prompt
     assert "Use kill_agent after consuming final child output" in child_prompt
     assert "DISCORD MESSAGE RECEIVED" not in child_prompt
+    assert child_prompt.endswith("USER INSTRUCTIONS\nRun the tests.\n")
 
 
 def test_create_codex_agent_launches_interactive_session_then_sends_initial_prompt(ctx, tmp_path, monkeypatch):
@@ -2020,7 +2029,7 @@ def test_create_codex_agent_launches_interactive_session_then_sends_initial_prom
     assert len(fake.created) == 1
     assert len(fake.piped) == 1
     assert fake.prompts[0][0] == agent["tmux_session"]
-    assert "Task:\nCoordinate child work." in fake.prompts[0][1]
+    assert "USER INSTRUCTIONS\nCoordinate child work." in fake.prompts[0][1]
     assert "Orchestrator event loop:" in fake.prompts[0][1]
     assert fake.calls == [
         ("create", agent["tmux_session"]),

@@ -61,6 +61,8 @@ Managed agents receive an MCP server named `puppetmaster` with tools for listing
 
 Generated root orchestrator prompts instruct roots to always use `send_human_message` for human-facing answers, status updates, readiness notices, blockers, and regular progress updates during longer work. They also instruct roots to call `list_subagent_skills()` before role-specific delegation when useful, pass `create_agent(skill="subagent-...")` for matching templates, and call `kill_agent(agent_id)` after consuming final child output when a child is complete or no longer useful, so child tmux sessions and Codex processes do not accumulate. Generated child prompts instruct children to report through completion/blocker status or their parent/root instead of contacting the human directly.
 
+Generated managed-agent prompts place Puppetmaster runtime/tool instructions before the user task. The user task is appended at the bottom under a literal `USER INSTRUCTIONS` heading so task-specific instructions have the final prompt position.
+
 Discord slash commands are guild-scoped. Channel bindings are the routing layer: one channel binds to one root orchestrator, and one root orchestrator binds to one channel.
 
 Discord `/skills` manages reusable prompts. With no arguments it lists saved skills, `skill-name` autocompletes from saved skills, with `skill-name` plus `prompt` it creates or updates a skill, with `skill-name` plus `view:true` it shows the stored prompt without running it, with only `skill-name` it sends the saved prompt to the channel's bound root orchestrator, and with `forget:true` it deletes the skill.
