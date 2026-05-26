@@ -55,7 +55,7 @@ Important CLI groups:
 - `puppet reconcile`
 - `puppet debug create-raw|tmux|registry`
 
-`puppet orchestrator start --goal` and MCP `create_agent(goal=true)` both prepend literal `/goal ` to the managed agent's initial task prompt. `puppet orchestrator start --codex-home <path>` selects the source Codex home for the root tree's config/auth; generated per-agent `CODEX_HOME` directories are still used for runtime isolation.
+`puppet orchestrator start --goal` and MCP `create_agent(goal=true)` both prepend literal `/goal ` to the managed agent's initial task prompt. Codex goal mode lets the managed agent work continuously with auto-compaction until terminal, so it is best for substantial tasks with well-defined success criteria and not for vague exploration or small one-shot questions. `puppet orchestrator start --codex-home <path>` selects the source Codex home for the root tree's config/auth; generated per-agent `CODEX_HOME` directories are still used for runtime isolation.
 
 Managed agents receive an MCP server named `puppetmaster` with tools for listing subagent skills, creating and prompting child agents, reading and inspecting visible agents, completing work, scheduling wakeups, stopping/killing/pausing/resuming authorized agents, and attaching to tmux sessions. Root orchestrators also receive `send_human_message` for replying through the bound root channel, with optional local file attachment support via `file_path` and `filename`; child agents do not receive that tool.
 

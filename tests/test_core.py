@@ -1965,6 +1965,9 @@ def test_prompt_text_explains_orchestrator_wait_and_event_loop(ctx, tmp_path):
     assert "Use create_agent(cwd, prompt, description?, skill?, goal?, name?, metadata?)" in root_prompt
     assert "Use list_subagent_skills() to discover built-in role-specific subagent prompt templates" in root_prompt
     assert 'Pass create_agent(skill="subagent-...")' in root_prompt
+    assert "Pass create_agent(goal=True) for child tasks with clear success criteria" in root_prompt
+    assert "should run continuously in Codex goal mode with auto-compaction until terminal" in root_prompt
+    assert "avoid it for small one-shot questions, vague exploration, or tasks that need frequent human steering" in root_prompt
     assert "Use pause_agent and resume_agent" in root_prompt
     assert "Use attach_agent only when you need a tmux attach command" in root_prompt
     assert "Child agents do not have direct human-message tools" in root_prompt

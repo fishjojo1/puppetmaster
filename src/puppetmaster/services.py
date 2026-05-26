@@ -876,6 +876,7 @@ Orchestrator event loop:
 - Do small, low-risk tasks yourself when delegation would add more overhead than value.
 - Delegate larger, multi-step, research-heavy, test-heavy, or parallelizable tasks to Puppetmaster child agents with create_agent().
 - Use list_subagent_skills() to discover built-in subagent skill templates, and pass create_agent(skill="subagent-...") when a listed skill matches the delegated role.
+- Use create_agent(goal=True) for delegated work with well-defined success criteria where the child should keep working continuously through Codex goal mode and auto-compaction until the goal is complete, blocked, or failed. Goal mode is useful for substantial implementation, validation, audit, or research goals; avoid it for small one-shot questions, vague exploration, or tasks that need frequent human steering.
 - Do not take on the main implementation or investigation yourself when a task is large enough for child-agent execution.
 - Do not use Codex's default spawn_agent tool for Puppetmaster child-agent delegation; those agents are outside the Puppetmaster event loop.
 - When a child completes, blocks, fails, stops, is killed, or finishes a turn, Puppetmaster queues a state-change event for you.
@@ -900,6 +901,7 @@ Agent:
 Puppetmaster tools:
 - Use create_agent(cwd, prompt, description?, skill?, goal?, name?, metadata?) to delegate work to child agents when that helps the task.
 - Use list_subagent_skills() to discover built-in role-specific subagent prompt templates. Pass create_agent(skill="subagent-...") when a listed skill matches the delegated role.
+- Pass create_agent(goal=True) for child tasks with clear success criteria that should run continuously in Codex goal mode with auto-compaction until terminal; do not use goal mode for vague, tiny, or human-steered tasks.
 - Use inspect_agent and read_agent to understand child state and recent output.
 - Use prompt_agent to send follow-up instructions to a live child agent.
 - Use list_agents to inspect agents visible to you.
