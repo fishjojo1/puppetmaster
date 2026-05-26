@@ -17,6 +17,7 @@ from .model import now
 from .native_screenshot import capture_native_screenshot
 from .registry import Registry
 from .services import DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES, prompt_agent, prompt_text, read_agent
+from .skills import normalize_skill_name
 from .terminal_image import render_terminal_png
 from .tmux import Tmux
 
@@ -38,7 +39,6 @@ NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents,
 PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound root."
 PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
 PROMPT_DELIVERED_REACTION = "\N{WHITE HEAVY CHECK MARK}"
-SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 MAX_SKILL_AUTOCOMPLETE_CHOICES = 25
 POST_RESET_PROMPT_DELAY_SECONDS = 3.0
 POST_CLEAR_TASK_PROMPT = (
@@ -876,16 +876,7 @@ def handle_clear_command(registry: Registry, tmux: Tmux, channel: Any) -> SlashC
 
 
 def _normalize_skill_name(skill_name: str | None) -> str | None:
-    normalized = (skill_name or "").strip().lower()
-    if not normalized:
-        return None
-    if not SKILL_NAME_PATTERN.match(normalized):
-        raise PuppetError(
-            "invalid_skill_name",
-            "skill-name must start with a letter or number and contain only letters, numbers, dot, underscore, or hyphen.",
-            "Use a short name like review, release-check, or test.plan.",
-        )
-    return normalized
+    return normalize_skill_name(skill_name)
 
 
 def _format_skill_list(skills: list[dict[str, Any]]) -> str:
@@ -894,6 +885,17 @@ def _format_skill_list(skills: list[dict[str, Any]]) -> str:
     lines = ["Saved skills:"]
     lines.extend(f"- {skill['name']}" for skill in skills)
     return "\n".join(lines)
+
+
+def _format_skill_detail(skill: dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            f"Skill: {skill['name']}",
+            f"Updated: {skill['updated_at']}",
+            "",
+            skill["prompt"],
+        ]
+    )
 
 
 def autocomplete_discord_skill_names(registry: Registry, current: str | None, limit: int = MAX_SKILL_AUTOCOMPLETE_CHOICES) -> list[str]:
@@ -914,13 +916,14 @@ def handle_skills_command(
     skill_name: str | None = None,
     prompt: str | None = None,
     forget: bool | None = False,
+    view: bool | None = False,
 ) -> str:
     normalized_name = _normalize_skill_name(skill_name)
     prompt_text_value = (prompt or "").strip()
 
     if normalized_name is None:
-        if prompt_text_value or forget:
-            raise PuppetError("skill_name_required", "skill-name is required.", "Pass a skill-name to create, run, or forget a skill.")
+        if prompt_text_value or forget or view:
+            raise PuppetError("skill_name_required", "skill-name is required.", "Pass a skill-name to create, run, view, or forget a skill.")
         return _format_skill_list(registry.list_discord_skills())
 
     if forget:
@@ -942,6 +945,9 @@ def handle_skills_command(
             f"skill not found: {normalized_name}",
             "Create it with /skills skill-name:<name> prompt:<prompt>.",
         )
+
+    if view:
+        return _format_skill_detail(skill)
 
     root = _require_bound_root(registry, channel)
     prompt_agent(
@@ -1170,10 +1176,11 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
             for name in autocomplete_discord_skill_names(reg, current)
         ]
 
-    @app_commands.command(name="skills", description="Create, list, forget, or run reusable prompts.")
+    @app_commands.command(name="skills", description="Create, list, view, forget, or run reusable prompts.")
     @app_commands.describe(
-        skill_name="Skill name to run, create, or forget.",
+        skill_name="Skill name to run, view, create, or forget.",
         prompt="Reusable prompt text. Omit this to run the skill.",
+        view="Show the stored prompt instead of running it.",
         forget="Delete this skill instead of running it.",
     )
     @app_commands.autocomplete(skill_name=skill_name_autocomplete)
@@ -1181,6 +1188,7 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
         interaction: discord.Interaction,
         skill_name: str | None = None,
         prompt: str | None = None,
+        view: bool | None = False,
         forget: bool | None = False,
     ) -> None:
         await _run_interaction_command(
@@ -1193,6 +1201,7 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
             skill_name,
             prompt,
             forget,
+            view,
         )
 
     @bot.event

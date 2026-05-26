@@ -2284,6 +2284,63 @@ def test_tui_mouse_wheel_on_right_scrolls_preview_not_selection(ctx, monkeypatch
     assert app.selected == 4
 
 
+def test_tui_skill_mode_lists_and_scrolls_prompt(ctx):
+    cfg, reg, tmux = ctx
+    reg.upsert_discord_skill("review", "\n".join(f"line {index}" for index in range(12)))
+    reg.upsert_discord_skill("test-plan", "Write a test plan.")
+
+    class Screen:
+        def getmaxyx(self):
+            return (16, 90)
+
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+    app.toggle_mode()
+
+    assert app.mode == "skills"
+    assert [skill["name"] for skill in app.skills] == ["review", "test-plan"]
+    assert app.current_skill()["name"] == "review"
+    assert app.skill_preview_page_size(Screen()) == 6
+    assert app.max_skill_preview_scroll(Screen()) == 6
+
+    app.scroll_skill_preview(3, Screen())
+    assert app.skill_preview_scroll == 3
+
+    app.move_skill_selection(1, Screen())
+    assert app.current_skill()["name"] == "test-plan"
+    assert app.skill_preview_scroll == 0
+
+
+def test_tui_saves_updates_and_deletes_skills(ctx):
+    cfg, reg, tmux = ctx
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+
+    saved = app.save_skill_prompt("Review", "  Review the diff.  ")
+    updated = app.save_skill_prompt("review", "Review staged changes.")
+
+    assert saved["name"] == "review"
+    assert reg.discord_skill("review")["prompt"] == "Review staged changes."
+    assert updated["updated_at"] >= saved["updated_at"]
+    assert app.current_skill()["name"] == "review"
+
+    assert app.delete_current_skill() is True
+    assert reg.discord_skill("review") is None
+    assert app.current_skill() is None
+
+
+def test_tui_rejects_invalid_or_empty_skill_edits(ctx):
+    cfg, reg, tmux = ctx
+    app = TuiApp(cfg, reg, tmux, root_id=None, refresh=1.0, lines=120)
+
+    with pytest.raises(PuppetError) as invalid_name:
+        app.save_skill_prompt("../secret", "Do work.")
+    with pytest.raises(PuppetError) as empty_prompt:
+        app.save_skill_prompt("review", " \n\t ")
+
+    assert invalid_name.value.code == "invalid_skill_name"
+    assert empty_prompt.value.code == "skill_prompt_required"
+    assert reg.list_discord_skills() == []
+
+
 def test_cleanup_completed_prunes_completed_subtrees_and_preserves_active_descendants(ctx, tmp_path):
     cfg, reg, tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")

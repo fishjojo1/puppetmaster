@@ -62,7 +62,9 @@ Generated root orchestrator prompts instruct roots to always use `send_human_mes
 
 Discord slash commands are guild-scoped. Channel bindings are the routing layer: one channel binds to one root orchestrator, and one root orchestrator binds to one channel.
 
-Discord `/skills` manages reusable prompts. With no arguments it lists saved skills, `skill-name` autocompletes from saved skills, with `skill-name` plus `prompt` it creates or updates a skill, with only `skill-name` it sends the saved prompt to the channel's bound root orchestrator, and with `forget:true` it deletes the skill.
+Discord `/skills` manages reusable prompts. With no arguments it lists saved skills, `skill-name` autocompletes from saved skills, with `skill-name` plus `prompt` it creates or updates a skill, with `skill-name` plus `view:true` it shows the stored prompt without running it, with only `skill-name` it sends the saved prompt to the channel's bound root orchestrator, and with `forget:true` it deletes the skill.
+
+The TUI opens on the agent tree. Press `s` to switch to the reusable skills view, where `n` creates a skill, `e` or Enter edits the selected skill through `$VISUAL`/`$EDITOR`, and `d` deletes the selected skill.
 
 Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset command to the bound root, then queue a regenerated Puppetmaster orchestrator prompt after a short delay with a reset-specific task telling the root to notify the user that it is ready for new tasks.
 

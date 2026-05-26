@@ -1036,6 +1036,32 @@ def test_skills_saves_updates_and_forgets_prompts(ctx):
     assert reg.discord_skill("review") is None
 
 
+def test_skills_views_saved_prompt_without_channel_binding(ctx):
+    _cfg, reg, _tmux = ctx
+    reg.upsert_discord_skill("review", "Review the diff.\nReport bugs first.")
+    tmux = FakeTmux(live=True)
+
+    output = handle_skills_command(reg, tmux, FakeTextChannel(), "review", view=True)
+
+    assert output.splitlines() == [
+        "Skill: review",
+        f"Updated: {reg.discord_skill('review')['updated_at']}",
+        "",
+        "Review the diff.",
+        "Report bugs first.",
+    ]
+    assert tmux.sent_prompts == []
+
+
+def test_skills_view_requires_a_skill_name(ctx):
+    _cfg, reg, _tmux = ctx
+
+    with pytest.raises(PuppetError) as exc:
+        handle_skills_command(reg, FakeTmux(), FakeTextChannel(), view=True)
+
+    assert exc.value.code == "skill_name_required"
+
+
 def test_skills_rejects_invalid_names(ctx):
     _cfg, reg, _tmux = ctx
 

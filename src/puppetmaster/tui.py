@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import curses
+import os
 import re
+import shlex
+import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -10,6 +14,7 @@ from .config import Config
 from .errors import PuppetError
 from .registry import Registry
 from .services import read_agent
+from .skills import normalize_skill_name
 from .tmux import Tmux
 
 
@@ -144,6 +149,11 @@ class TuiApp:
         self.last_refresh = 0.0
         self.preview_refresh_due_at: float | None = None
         self.preview_reset_pending = False
+        self.mode = "agents"
+        self.skills: list[dict[str, Any]] = []
+        self.skill_selected = 0
+        self.skill_scroll = 0
+        self.skill_preview_scroll = 0
 
     def run(self, stdscr: Any) -> None:
         try:
@@ -184,6 +194,7 @@ class TuiApp:
         try:
             self.message = ""
             agents = self.registry.list_agents(root_id=self.root_id)
+            self.reload_skills(clear_message=False)
             sessions = self.tmux.list_sessions(self.config.tmux_session_prefix)
             self.live_sessions = {item["session"] for item in sessions}
             self.rows = build_tree_rows(agents)
@@ -203,6 +214,14 @@ class TuiApp:
             self.agent_stats = {}
             self.child_counts = {}
             self.descendant_counts = {}
+            self.skills = []
+
+    def reload_skills(self, *, clear_message: bool = True) -> None:
+        if clear_message:
+            self.message = ""
+        self.skills = self.registry.list_discord_skills()
+        if self.skill_selected >= len(self.skills):
+            self.skill_selected = max(0, len(self.skills) - 1)
 
     def input_timeout_ms(self) -> int:
         return max(10, int(min(self.refresh, INPUT_POLL_SECONDS) * 1000))
@@ -264,9 +283,20 @@ class TuiApp:
             return None
         return self.rows[self.selected]["agent"]
 
+    def current_skill(self) -> dict[str, Any] | None:
+        if not self.skills:
+            return None
+        return self.skills[self.skill_selected]
+
     def handle_key(self, key: int, stdscr: Any) -> bool:
         if key in {ord("q"), 27}:
             return True
+        if key == ord("s"):
+            self.toggle_mode()
+            return False
+        if self.mode == "skills":
+            self.handle_skill_key(key, stdscr)
+            return False
         if key in {curses.KEY_UP, ord("k")}:
             self.move_selection(-1, stdscr)
         elif key in {curses.KEY_DOWN, ord("j")}:
@@ -296,6 +326,188 @@ class TuiApp:
         elif key in {10, 13, curses.KEY_ENTER, ord("a")}:
             self.attach_selected(stdscr)
         return False
+
+    def toggle_mode(self) -> None:
+        if self.mode == "skills":
+            self.mode = "agents"
+            self.message = ""
+        else:
+            self.mode = "skills"
+            try:
+                self.reload_skills()
+            except PuppetError as exc:
+                self.message = f"error[{exc.code}]: {exc.message}"
+
+    def handle_skill_key(self, key: int, stdscr: Any) -> None:
+        if key in {curses.KEY_UP, ord("k")}:
+            self.move_skill_selection(-1, stdscr)
+        elif key in {curses.KEY_DOWN, ord("j")}:
+            self.move_skill_selection(1, stdscr)
+        elif key == curses.KEY_PPAGE:
+            self.scroll_skill_preview(self.skill_preview_page_size(stdscr), stdscr)
+        elif key == curses.KEY_NPAGE:
+            self.scroll_skill_preview(-self.skill_preview_page_size(stdscr), stdscr)
+        elif key == curses.KEY_HOME:
+            self.scroll_skill_preview_to_top(stdscr)
+        elif key == curses.KEY_END:
+            self.skill_preview_scroll = 0
+        elif key == ord("r"):
+            self.reload_skills()
+        elif key == ord("n"):
+            self.create_skill_interactive(stdscr)
+        elif key in {10, 13, curses.KEY_ENTER, ord("e")}:
+            self.edit_current_skill_interactive(stdscr)
+        elif key == ord("d"):
+            self.delete_current_skill_interactive(stdscr)
+
+    def move_skill_selection(self, delta: int, stdscr: Any) -> None:
+        if not self.skills:
+            return
+        previous = self.skill_selected
+        self.skill_selected = min(max(self.skill_selected + delta, 0), len(self.skills) - 1)
+        self.ensure_skill_selected_visible(stdscr)
+        if self.skill_selected != previous:
+            self.skill_preview_scroll = 0
+
+    def ensure_skill_selected_visible(self, stdscr: Any) -> None:
+        height, _width = stdscr.getmaxyx()
+        list_height = max(1, height - 3)
+        if self.skill_selected < self.skill_scroll:
+            self.skill_scroll = self.skill_selected
+        elif self.skill_selected >= self.skill_scroll + list_height:
+            self.skill_scroll = self.skill_selected - list_height + 1
+
+    def skill_prompt_lines(self) -> list[str]:
+        skill = self.current_skill()
+        if not skill:
+            return ["No skills saved. Press n to create one."]
+        return str(skill["prompt"]).splitlines() or [""]
+
+    def skill_preview_page_size(self, stdscr: Any) -> int:
+        height, _width = stdscr.getmaxyx()
+        return max(1, height - 10)
+
+    def max_skill_preview_scroll(self, stdscr: Any) -> int:
+        return max(0, len(self.skill_prompt_lines()) - self.skill_preview_page_size(stdscr))
+
+    def scroll_skill_preview(self, delta: int, stdscr: Any) -> None:
+        self.skill_preview_scroll = min(max(self.skill_preview_scroll + delta, 0), self.max_skill_preview_scroll(stdscr))
+
+    def scroll_skill_preview_to_top(self, stdscr: Any) -> None:
+        self.skill_preview_scroll = self.max_skill_preview_scroll(stdscr)
+
+    def save_skill_prompt(self, skill_name: str | None, prompt: str | None) -> dict[str, Any]:
+        normalized = normalize_skill_name(skill_name)
+        if normalized is None:
+            raise PuppetError("skill_name_required", "skill-name is required.")
+        prompt_text = (prompt or "").strip()
+        if not prompt_text:
+            raise PuppetError("skill_prompt_required", "prompt must be non-empty.")
+        skill = self.registry.upsert_discord_skill(normalized, prompt_text)
+        self.reload_skills(clear_message=False)
+        self.skill_selected = next((index for index, item in enumerate(self.skills) if item["name"] == normalized), self.skill_selected)
+        return skill
+
+    def delete_current_skill(self) -> bool:
+        skill = self.current_skill()
+        if not skill:
+            return False
+        deleted = self.registry.delete_discord_skill(skill["name"])
+        self.reload_skills(clear_message=False)
+        self.skill_preview_scroll = 0
+        return deleted
+
+    def create_skill_interactive(self, stdscr: Any) -> None:
+        name = self.prompt_line(stdscr, "New skill name: ")
+        if name is None:
+            return
+        try:
+            normalized = normalize_skill_name(name)
+            if normalized is None:
+                self.message = "Skill name is required."
+                return
+        except PuppetError as exc:
+            self.message = f"error[{exc.code}]: {exc.message}"
+            return
+        existing = self.registry.discord_skill(normalized)
+        initial_prompt = existing["prompt"] if existing else ""
+        prompt = self.edit_prompt_in_editor(stdscr, normalized, initial_prompt)
+        if prompt is None:
+            return
+        try:
+            self.save_skill_prompt(normalized, prompt)
+            self.message = f"Saved skill: {normalized}"
+        except PuppetError as exc:
+            self.message = f"error[{exc.code}]: {exc.message}"
+
+    def edit_current_skill_interactive(self, stdscr: Any) -> None:
+        skill = self.current_skill()
+        if not skill:
+            self.message = "No skill selected."
+            return
+        prompt = self.edit_prompt_in_editor(stdscr, skill["name"], skill["prompt"])
+        if prompt is None:
+            return
+        try:
+            self.save_skill_prompt(skill["name"], prompt)
+            self.message = f"Saved skill: {skill['name']}"
+        except PuppetError as exc:
+            self.message = f"error[{exc.code}]: {exc.message}"
+
+    def delete_current_skill_interactive(self, stdscr: Any) -> None:
+        skill = self.current_skill()
+        if not skill:
+            self.message = "No skill selected."
+            return
+        if not self.confirm(stdscr, f"Delete skill {skill['name']}? y/N "):
+            self.message = "Delete cancelled."
+            return
+        if self.delete_current_skill():
+            self.message = f"Deleted skill: {skill['name']}"
+        else:
+            self.message = f"Skill not found: {skill['name']}"
+
+    def prompt_line(self, stdscr: Any, prompt: str) -> str | None:
+        height, width = stdscr.getmaxyx()
+        addstr(stdscr, height - 1, 0, prompt, width, curses.A_BOLD)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        curses.echo()
+        try:
+            raw = stdscr.getstr(height - 1, min(len(prompt), max(0, width - 1)), max(1, width - len(prompt) - 1))
+        except curses.error:
+            return None
+        finally:
+            curses.noecho()
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+        return raw.decode("utf-8", errors="replace").strip()
+
+    def confirm(self, stdscr: Any, prompt: str) -> bool:
+        answer = self.prompt_line(stdscr, prompt)
+        return bool(answer and answer.lower().startswith("y"))
+
+    def edit_prompt_in_editor(self, stdscr: Any, skill_name: str, initial_prompt: str) -> str | None:
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+        with tempfile.NamedTemporaryFile("w+", encoding="utf-8", suffix=f"-{skill_name}.txt") as handle:
+            handle.write(initial_prompt)
+            handle.flush()
+            curses.endwin()
+            try:
+                completed = subprocess.run([*shlex.split(editor), handle.name], check=False)
+            finally:
+                stdscr.clear()
+                stdscr.keypad(True)
+                stdscr.timeout(self.input_timeout_ms())
+            if completed.returncode != 0:
+                self.message = f"Editor exited with status {completed.returncode}."
+                return None
+            handle.seek(0)
+            return handle.read()
 
     def move_selection(self, delta: int, stdscr: Any) -> None:
         if not self.rows:
@@ -381,6 +593,9 @@ class TuiApp:
         if height < 10 or width < 50:
             addstr(stdscr, 0, 0, "Terminal too small for Puppetmaster TUI.", width)
             return
+        if self.mode == "skills":
+            self.draw_skills(stdscr)
+            return
 
         left_width = self.left_width(width)
         right_x = self.right_x(width)
@@ -395,7 +610,7 @@ class TuiApp:
             stdscr,
             height - 1,
             0,
-            "q quit | up/down select | pgup/pgdn scroll preview | home/end preview | enter attach | r refresh",
+            "q quit | s skills | up/down select | pgup/pgdn scroll preview | home/end preview | enter attach | r refresh",
             width,
             curses.A_DIM,
         )
@@ -408,6 +623,74 @@ class TuiApp:
         self.draw_stats(stdscr, 9, right_x, min(7, height - 11), right_width)
         self.draw_preview(stdscr, 17, right_x, height - 18, right_width)
         stdscr.refresh()
+
+    def draw_skills(self, stdscr: Any) -> None:
+        height, width = stdscr.getmaxyx()
+        left_width = self.left_width(width)
+        right_x = self.right_x(width)
+        right_width = width - right_x
+        content_height = height - 2
+
+        addstr(stdscr, 0, 0, "Puppetmaster TUI - Skills", width, curses.A_BOLD)
+        addstr(
+            stdscr,
+            height - 1,
+            0,
+            "q quit | s agents | up/down select | pgup/pgdn scroll prompt | n new | e/enter edit | d delete | r refresh",
+            width,
+            curses.A_DIM,
+        )
+        for y in range(1, height - 1):
+            addstr(stdscr, y, left_width, "|", 1, curses.A_DIM)
+
+        self.draw_skill_list(stdscr, 1, 0, content_height, left_width)
+        self.draw_skill_details(stdscr, 1, right_x, min(5, content_height), right_width)
+        self.draw_skill_prompt(stdscr, 7, right_x, height - 8, right_width)
+        stdscr.refresh()
+
+    def draw_skill_list(self, stdscr: Any, y: int, x: int, height: int, width: int) -> None:
+        self.skill_scroll = min(self.skill_scroll, max(0, len(self.skills) - height))
+        visible = self.skills[self.skill_scroll : self.skill_scroll + height]
+        if not visible:
+            addstr(stdscr, y, x, "No skills saved.", width)
+            return
+        for offset, skill in enumerate(visible):
+            index = self.skill_scroll + offset
+            attr = curses.A_REVERSE if index == self.skill_selected else curses.A_NORMAL
+            addstr(stdscr, y + offset, x, skill["name"], width, attr)
+
+    def draw_skill_details(self, stdscr: Any, y: int, x: int, height: int, width: int) -> None:
+        skill = self.current_skill()
+        if not skill:
+            lines = ["No skill selected.", "Press n to create one."]
+        else:
+            lines = [
+                f"skill: {skill['name']}",
+                f"created: {skill['created_at']}",
+                f"updated: {skill['updated_at']}",
+                f"prompt lines: {len(str(skill['prompt']).splitlines()) or 1}",
+            ]
+        if self.message:
+            lines.append(self.message)
+        for offset, line in enumerate(lines[:height]):
+            attr = curses.A_BOLD if offset == 0 else curses.A_NORMAL
+            addstr(stdscr, y + offset, x, line, width, attr)
+
+    def draw_skill_prompt(self, stdscr: Any, y: int, x: int, height: int, width: int) -> None:
+        if height <= 0:
+            return
+        lines = self.skill_prompt_lines()
+        max_scroll = max(0, len(lines) - height)
+        self.skill_preview_scroll = min(self.skill_preview_scroll, max_scroll)
+        title = "Prompt"
+        if max_scroll:
+            current = max_scroll - self.skill_preview_scroll + 1
+            title = f"Prompt {current}-{min(current + height - 1, len(lines))}/{len(lines)}"
+        addstr(stdscr, y - 1, x, title, width, curses.A_BOLD)
+        start = max(0, len(lines) - height - self.skill_preview_scroll)
+        lines = lines[start : start + height]
+        for offset, line in enumerate(lines):
+            addstr(stdscr, y + offset, x, line, width)
 
     def draw_tree(self, stdscr: Any, y: int, x: int, height: int, width: int) -> None:
         self.scroll = min(self.scroll, max(0, len(self.rows) - height))
