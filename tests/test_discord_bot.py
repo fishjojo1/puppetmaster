@@ -14,6 +14,7 @@ from puppetmaster.discord_bot import (
     NOT_BOUND_REPLY,
     PROMPT_DELIVERED_REACTION,
     TEXT_ONLY_REPLY,
+    autocomplete_discord_skill_names,
     build_discord_bot,
     chunk_text,
     code_block,
@@ -85,6 +86,12 @@ class FakeDiscordObject:
         self.id = id
 
 
+class FakeChoice:
+    def __init__(self, name: str, value: str):
+        self.name = name
+        self.value = value
+
+
 class FakeDiscordModule:
     HTTPException = FakeDiscordHTTPException
     Forbidden = FakeDiscordForbidden
@@ -108,6 +115,7 @@ class FakeAppCommandGroup:
 
 class FakeAppCommandsModule:
     Group = FakeAppCommandGroup
+    Choice = FakeChoice
 
     @staticmethod
     def command(name: str, description: str):
@@ -121,6 +129,14 @@ class FakeAppCommandsModule:
     @staticmethod
     def describe(**_kwargs):
         def decorator(func):
+            return func
+
+        return decorator
+
+    @staticmethod
+    def autocomplete(**kwargs):
+        def decorator(func):
+            func.autocomplete_fields = kwargs
             return func
 
         return decorator
@@ -933,6 +949,17 @@ def test_skills_lists_saved_skill_names(ctx):
     assert output.splitlines() == ["Saved skills:", "- review", "- test-plan"]
 
 
+def test_skills_autocomplete_lists_and_filters_saved_skill_names(ctx):
+    _cfg, reg, _tmux = ctx
+    reg.upsert_discord_skill("code-review", "Review the diff.")
+    reg.upsert_discord_skill("release-check", "Check release readiness.")
+    reg.upsert_discord_skill("security-audit", "Audit security.")
+
+    assert autocomplete_discord_skill_names(reg, "") == ["code-review", "release-check", "security-audit"]
+    assert autocomplete_discord_skill_names(reg, "re") == ["release-check", "code-review"]
+    assert autocomplete_discord_skill_names(reg, "AUD", limit=1) == ["security-audit"]
+
+
 def test_skills_saves_updates_and_forgets_prompts(ctx):
     _cfg, reg, _tmux = ctx
 
@@ -1447,6 +1474,7 @@ def test_validate_discord_config_requires_token_and_guild_id(ctx):
 def test_build_discord_bot_reports_missing_guild_access(ctx, monkeypatch):
     cfg, reg, tmux = ctx
     cfg = replace(cfg, discord=DiscordConfig(token="secret", guild_id=123))
+    reg.upsert_discord_skill("release-check", "Check release readiness.")
     monkeypatch.setattr(discord_bot_module, "discord", FakeDiscordModule)
     monkeypatch.setattr(discord_bot_module, "app_commands", FakeAppCommandsModule)
     monkeypatch.setattr(discord_bot_module, "commands", FakeCommandsModule)
@@ -1461,7 +1489,11 @@ def test_build_discord_bot_reports_missing_guild_access(ctx, monkeypatch):
     assert "screenshot" in {name for name, _description, _func in group.commands}
     assert "compact" in {name for name, _description, _func in group.commands}
     assert "clear" in {name for name, _description, _func in group.commands}
-    assert bot.tree.added[1][0].command_name == "skills"
+    skills_command = bot.tree.added[1][0]
+    assert skills_command.command_name == "skills"
+    autocomplete = skills_command.autocomplete_fields["skill_name"]
+    choices = asyncio.run(autocomplete(object(), "rel"))
+    assert [(choice.name, choice.value) for choice in choices] == [("release-check", "release-check")]
     assert exc.value.code == "discord_guild_access_denied"
     assert "guild 123" in exc.value.message
     assert "Missing Access" in exc.value.message

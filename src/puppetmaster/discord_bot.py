@@ -38,6 +38,7 @@ PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound ro
 PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
 PROMPT_DELIVERED_REACTION = "\N{WHITE HEAVY CHECK MARK}"
 SKILL_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+MAX_SKILL_AUTOCOMPLETE_CHOICES = 25
 POST_RESET_PROMPT_DELAY_SECONDS = 3.0
 POST_CLEAR_TASK_PROMPT = (
     "Your context has just been cleared. Use the send message tool to inform the user that you are now ready to receive tasks."
@@ -859,6 +860,17 @@ def _format_skill_list(skills: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def autocomplete_discord_skill_names(registry: Registry, current: str | None, limit: int = MAX_SKILL_AUTOCOMPLETE_CHOICES) -> list[str]:
+    if limit <= 0:
+        return []
+    query = (current or "").strip().lower()
+    names = [skill["name"] for skill in registry.list_discord_skills()]
+    if query:
+        names = [name for name in names if query in name]
+        names.sort(key=lambda name: (not name.startswith(query), name))
+    return names[:limit]
+
+
 def handle_skills_command(
     registry: Registry,
     tmux: Tmux,
@@ -1115,12 +1127,20 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
     async def clear(interaction: discord.Interaction) -> None:
         await _run_interaction_command(interaction, cfg, runtime.request_clear, interaction.channel)
 
+    async def skill_name_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        del interaction
+        return [
+            app_commands.Choice(name=name, value=name)
+            for name in autocomplete_discord_skill_names(reg, current)
+        ]
+
     @app_commands.command(name="skills", description="Create, list, forget, or run reusable prompts.")
     @app_commands.describe(
         skill_name="Skill name to run, create, or forget.",
         prompt="Reusable prompt text. Omit this to run the skill.",
         forget="Delete this skill instead of running it.",
     )
+    @app_commands.autocomplete(skill_name=skill_name_autocomplete)
     async def skills(
         interaction: discord.Interaction,
         skill_name: str | None = None,
