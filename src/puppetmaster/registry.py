@@ -275,6 +275,18 @@ class Registry:
             cursor = conn.execute(f"delete from agents where id in ({placeholders})", agent_ids)
         return int(cursor.rowcount)
 
+    def clear_agent_state(self) -> dict[str, int]:
+        with self.connect() as conn:
+            counts = {
+                "scheduled_wakeups": conn.execute("delete from scheduled_wakeups").rowcount,
+                "event_deliveries": conn.execute("delete from event_deliveries").rowcount,
+                "events": conn.execute("delete from events").rowcount,
+                "outbound_human_messages": conn.execute("delete from outbound_human_messages").rowcount,
+                "discord_channel_bindings": conn.execute("delete from discord_channel_bindings").rowcount,
+                "agents": conn.execute("delete from agents").rowcount,
+            }
+        return {key: int(value) for key, value in counts.items()}
+
     def append_event(
         self,
         agent_id: str,

@@ -44,7 +44,7 @@ Important CLI groups:
 
 - `puppet init`
 - `puppet orchestrator start|inspect`
-- `puppet agent create|list|tree|inspect|read|prompt|attach|stop|kill|kill-tree|complete|pause|resume|mark-status|cleanup-completed|cleanup-dead`
+- `puppet agent create|list|tree|inspect|read|prompt|attach|stop|kill|kill-tree|reset|complete|pause|resume|mark-status|cleanup-completed|cleanup-dead`
 - `puppet events list|pending|ack`
 - `puppet wakeup fire-due|fire|list|sleep-and-fire`
 - `puppet hook stop|drain-events`
@@ -74,6 +74,8 @@ Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset 
 The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, reusable Discord skills, and outbound human messages with optional attachment metadata. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config.
 
 Completion is explicit. A Codex turn stopping is not the same as finishing work. Agents should call `complete_agent` with `success`, `failed`, `blocked`, or `cancelled` when their assigned task is actually terminal.
+
+`puppet agent reset` is the global agent reset/nuke command. It kills every live tmux session using the Puppetmaster tmux prefix, clears all agent rows and agent-related events, deliveries, wakeups, Discord channel bindings, and outbound human messages, and preserves logs/artifacts plus reusable Discord skills. Use `--dry-run` to preview.
 
 Stop hooks and event delivery are central to orchestration. Orchestrator hooks drain pending events, and high-signal state changes are queued to parent/root recipients. Low-signal turn-stop noise is coalesced.
 

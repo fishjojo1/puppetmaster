@@ -36,6 +36,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 ## Human CLI
 
 - Required final command groups exist: `orchestrator`, `agent`, `events`, `hook`, `mcp`, `doctor`, `reconcile`, `debug`.
+- Global agent reset exists: `puppet agent reset` kills all Puppetmaster tmux sessions and clears registered agents, including root orchestrators, while preserving logs/artifacts and reusable skills.
 - `puppet init` creates or updates global config, supports interactive hidden token entry, non-interactive Discord flags, JSON output, and optional background Discord startup.
 - `puppet orchestrator start` can create multiple root orchestrators in one global registry; roots remain distinct by `id`, `root_id`, and `cwd`.
 - `puppet orchestrator start --agent-id <id>` creates a root with an exact safe id; unsafe ids, duplicate registry ids, existing agent directories, and existing derived tmux sessions fail before root creation.

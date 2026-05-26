@@ -30,6 +30,7 @@ from puppetmaster.services import (
     pause_agent,
     prompt_text,
     reconcile,
+    reset_agents,
     resume_agent,
     schedule_wakeup,
     start_orchestrator,
@@ -1724,6 +1725,113 @@ def test_agent_kill_tree_cli_passes_root_and_dry_run(tmp_path, monkeypatch, caps
     assert calls["root_agent_id"] == "root-a"
     assert calls["dry_run"] is True
     assert output["would_kill"] == ["root-a"]
+
+
+def test_reset_agents_kills_all_puppetmaster_sessions_and_clears_agent_state(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    other_root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="other", role="orchestrator")
+    event = reg.append_event(child["id"], "agent.test", "queued")
+    reg.queue_delivery(event["id"], root["id"])
+    schedule_wakeup(cfg, reg, child["id"], 10, "test wakeup")
+    reg.bind_discord_channel("channel-1", root["id"], "guild-1")
+    reg.enqueue_outbound_human_message(root["id"], child["id"], "discord", "channel-1", "pending")
+    reg.upsert_discord_skill("keep-me", "Saved prompt.")
+
+    unmanaged = f"{cfg.tmux_session_prefix}unmanaged"
+    live_sessions = {
+        root["tmux_session"],
+        child["tmux_session"],
+        other_root["tmux_session"],
+        unmanaged,
+        "not-puppetmaster",
+    }
+
+    class FakeTmux:
+        killed: list[str] = []
+
+        def list_sessions(self, prefix=None):
+            return [
+                {"session": session, "created": "0", "attached": "0", "pane_command": ""}
+                for session in sorted(live_sessions)
+                if prefix is None or session.startswith(prefix)
+            ]
+
+        def kill_session(self, session):
+            self.killed.append(session)
+            live_sessions.discard(session)
+
+    fake = FakeTmux()
+
+    result = reset_agents(cfg, reg, fake)
+
+    assert set(result["cleared"]) == {root["id"], child["id"], other_root["id"]}
+    assert set(result["killed"]) == {root["tmux_session"], child["tmux_session"], other_root["tmux_session"], unmanaged}
+    assert result["unmanaged_tmux"] == [unmanaged]
+    assert result["logs_preserved"] is True
+    assert result["skills_preserved"] is True
+    assert reg.list_agents() == []
+    assert reg.list_events() == []
+    assert reg.pending_deliveries(root["id"]) == []
+    assert reg.list_wakeups() == []
+    assert reg.list_discord_bindings() == []
+    assert reg.pending_outbound_human_messages("discord") == []
+    assert [skill["name"] for skill in reg.list_discord_skills()] == ["keep-me"]
+    assert "not-puppetmaster" in live_sessions
+
+
+def test_reset_agents_dry_run_does_not_clear_or_kill(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    live_sessions = {root["tmux_session"]}
+
+    class FakeTmux:
+        killed: list[str] = []
+
+        def list_sessions(self, prefix=None):
+            return [
+                {"session": session, "created": "0", "attached": "0", "pane_command": ""}
+                for session in sorted(live_sessions)
+                if prefix is None or session.startswith(prefix)
+            ]
+
+        def kill_session(self, session):
+            self.killed.append(session)
+
+    fake = FakeTmux()
+
+    result = reset_agents(cfg, reg, fake, dry_run=True)
+
+    assert result["would_clear"] == [root["id"]]
+    assert result["would_kill"] == [root["tmux_session"]]
+    assert result["cleared"] == []
+    assert result["killed"] == []
+    assert fake.killed == []
+    assert reg.get_agent(root["id"])["id"] == root["id"]
+
+
+def test_agent_reset_cli_passes_dry_run(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    parser = cli_module.build_parser()
+    args = parser.parse_args(["agent", "reset", "--dry-run", "--json"])
+    calls = {}
+
+    def fake_build_context():
+        return "cfg", "reg", "tmux"
+
+    def fake_reset_agents(cfg, reg, tmux, *, dry_run):
+        calls.update({"cfg": cfg, "reg": reg, "tmux": tmux, "dry_run": dry_run})
+        return {"dry_run": dry_run, "would_clear": ["agt_root"], "would_kill": ["puppet_agt_root"]}
+
+    monkeypatch.setattr(cli_module, "build_context", fake_build_context)
+    monkeypatch.setattr(cli_module, "reset_agents", fake_reset_agents)
+
+    assert args.func(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert calls == {"cfg": "cfg", "reg": "reg", "tmux": "tmux", "dry_run": True}
+    assert output["would_clear"] == ["agt_root"]
 
 
 def test_inject_pending_prompt_does_not_require_idle_status(ctx, tmp_path):

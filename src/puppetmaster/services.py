@@ -318,6 +318,50 @@ def kill_root_tree(
     }
 
 
+def reset_agents(
+    config: Config,
+    registry: Registry,
+    tmux: Tmux,
+    *,
+    source: str = "human_cli",
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    agents = sorted(registry.list_agents(include_dead=True), key=lambda item: int(item["depth"]), reverse=True)
+    registered_sessions = {agent["tmux_session"] for agent in agents}
+    live_sessions = {item["session"] for item in tmux.list_sessions(config.tmux_session_prefix)}
+    live_registered = [agent for agent in agents if agent["tmux_session"] in live_sessions]
+    unmanaged_sessions = sorted(live_sessions - registered_sessions)
+    sessions_to_kill = [agent["tmux_session"] for agent in live_registered] + unmanaged_sessions
+
+    if not dry_run:
+        for session in sessions_to_kill:
+            tmux.kill_session(session)
+        counts = registry.clear_agent_state()
+    else:
+        counts = {
+            "scheduled_wakeups": 0,
+            "event_deliveries": 0,
+            "events": 0,
+            "outbound_human_messages": 0,
+            "discord_channel_bindings": 0,
+            "agents": 0,
+        }
+
+    return {
+        "dry_run": dry_run,
+        "source": source,
+        "agents": agents,
+        "would_clear": [agent["id"] for agent in agents] if dry_run else [],
+        "cleared": [agent["id"] for agent in agents] if not dry_run else [],
+        "would_kill": sessions_to_kill if dry_run else [],
+        "killed": sessions_to_kill if not dry_run else [],
+        "unmanaged_tmux": unmanaged_sessions,
+        "counts": counts,
+        "logs_preserved": True,
+        "skills_preserved": True,
+    }
+
+
 def cleanup_completed_agents(
     registry: Registry,
     tmux: Tmux,

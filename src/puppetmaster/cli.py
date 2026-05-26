@@ -33,6 +33,7 @@ from .services import (
     prompt_agent,
     read_agent,
     reconcile,
+    reset_agents,
     resume_agent,
     sleep_and_fire_wakeup,
     start_orchestrator,
@@ -300,6 +301,12 @@ def cmd_agent_kill(args: argparse.Namespace) -> int:
 def cmd_agent_kill_tree(args: argparse.Namespace) -> int:
     _cfg, reg, tmux = build_context()
     emit(kill_root_tree(reg, tmux, args.root_agent_id, dry_run=args.dry_run), args.json)
+    return 0
+
+
+def cmd_agent_reset(args: argparse.Namespace) -> int:
+    cfg, reg, tmux = build_context()
+    emit(reset_agents(cfg, reg, tmux, dry_run=args.dry_run), args.json)
     return 0
 
 
@@ -760,6 +767,10 @@ def build_parser() -> argparse.ArgumentParser:
     kill_tree.add_argument("--dry-run", action="store_true", help="Preview matching live sessions without killing them.")
     add_json(kill_tree)
     kill_tree.set_defaults(func=cmd_agent_kill_tree)
+    reset = a.add_parser("reset", help="Kill all Puppetmaster tmux sessions and clear all registered agents, including root orchestrators.")
+    reset.add_argument("--dry-run", action="store_true", help="Preview agents and tmux sessions without killing or clearing them.")
+    add_json(reset)
+    reset.set_defaults(func=cmd_agent_reset)
     complete = a.add_parser("complete", help="Mark an agent complete, failed, blocked, or cancelled.")
     complete.add_argument("agent_id")
     complete.add_argument("--status", required=True, choices=["success", "failed", "blocked", "cancelled"])

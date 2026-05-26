@@ -139,6 +139,15 @@ puppet agent kill-tree <root-agent-id>
 puppet agent kill-tree <root-agent-id> --dry-run
 ```
 
+Reset all registered agents, including root orchestrators, and kill all live Puppetmaster tmux sessions:
+
+```bash
+puppet agent reset --dry-run
+puppet agent reset
+```
+
+`agent reset` clears agent registry state, agent events, event deliveries, wakeups, Discord channel bindings, and pending outbound human messages. It preserves logs, generated artifacts, configuration, and reusable skills.
+
 ## Discord Bot
 
 Create or update global state:
