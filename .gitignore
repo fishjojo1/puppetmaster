@@ -1,5 +1,6 @@
 .venv/
 .puppetmaster/
+skills/
 .env
 .env.*
 !.env.example
