@@ -10,6 +10,7 @@ from puppetmaster.config import DiscordConfig, load_config
 from puppetmaster import discord_bot as discord_bot_module
 from puppetmaster.discord_bot import (
     DISCORD_PROMPT_PREFIX,
+    FILES_ATTACHED_HEADING,
     DiscordRuntime,
     NOT_BOUND_REPLY,
     PROMPT_DELIVERED_REACTION,
@@ -293,6 +294,19 @@ class FakeReference:
         self.message_id = message_id
 
 
+class FakeDiscordAttachment:
+    def __init__(self, filename: str, content: bytes = b"file-content", size: int | None = None):
+        self.filename = filename
+        self.content = content
+        self.size = len(content) if size is None else size
+        self.saved_to: list[Path] = []
+
+    async def save(self, path: str | Path) -> None:
+        destination = Path(path)
+        destination.write_bytes(self.content)
+        self.saved_to.append(destination)
+
+
 class FakeDiscordMessage:
     def __init__(
         self,
@@ -441,7 +455,6 @@ def test_inbound_mention_is_delivered_with_clean_prompt_and_reaction(ctx, tmp_pa
             "<@999> hello there",
             channel=FakeDiscordChannel(),
             mentions=[bot_user],
-            attachments=[object()],
         )
         try:
             handled = await runtime.handle_message(message, bot_user)
@@ -454,6 +467,49 @@ def test_inbound_mention_is_delivered_with_clean_prompt_and_reaction(ctx, tmp_pa
 
     assert handled is True
     assert delivered == [(root["id"], f"{DISCORD_PROMPT_PREFIX}hello there", "discord")]
+    assert message.reactions == [PROMPT_DELIVERED_REACTION]
+    assert message.replies == []
+
+
+def test_inbound_mention_downloads_attachment_and_adds_paths_to_prompt(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("456", root["id"], "123")
+    delivered: list[tuple[str, str, str]] = []
+    bot_user = FakeDiscordUser("999")
+    attachment = FakeDiscordAttachment("../report final.txt", b"report")
+
+    def fake_prompt(registry, tmux_client, agent_id, prompt, source):
+        delivered.append((agent_id, prompt, source))
+        return {"created_at": "2026-05-20T00:00:01Z"}
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, prompt_func=fake_prompt)
+        message = FakeDiscordMessage(
+            "<@999> please inspect",
+            channel=FakeDiscordChannel(),
+            mentions=[bot_user],
+            attachments=[attachment],
+            message_id="message/with spaces",
+        )
+        try:
+            handled = await runtime.handle_message(message, bot_user)
+        finally:
+            await runtime.close()
+        return handled, message
+
+    handled, message = asyncio.run(run())
+
+    assert handled is True
+    saved_path = cfg.state_dir / "human_files" / root["id"] / "message-with-spaces" / "01-report-final.txt"
+    assert saved_path.read_bytes() == b"report"
+    assert delivered == [
+        (
+            root["id"],
+            f"{DISCORD_PROMPT_PREFIX}please inspect\n\n{FILES_ATTACHED_HEADING}\n{saved_path}",
+            "discord",
+        )
+    ]
     assert message.reactions == [PROMPT_DELIVERED_REACTION]
     assert message.replies == []
 
@@ -483,12 +539,13 @@ def test_inbound_reply_to_bot_is_delivered_without_mention(ctx, tmp_path):
     assert prompts == [f"{DISCORD_PROMPT_PREFIX}follow up"]
 
 
-def test_inbound_text_empty_message_with_attachment_is_rejected(ctx, tmp_path):
+def test_inbound_text_empty_message_with_attachment_is_delivered(ctx, tmp_path):
     cfg, reg, tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
     reg.bind_discord_channel("456", root["id"], "123")
     bot_user = FakeDiscordUser("999")
     delivered: list[str] = []
+    attachment = FakeDiscordAttachment("context.md", b"# context")
 
     def fake_prompt(registry, tmux_client, agent_id, prompt, source):
         delivered.append(prompt)
@@ -496,7 +553,37 @@ def test_inbound_text_empty_message_with_attachment_is_rejected(ctx, tmp_path):
 
     async def run():
         runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, prompt_func=fake_prompt)
-        message = FakeDiscordMessage("<@999>   ", mentions=[bot_user], attachments=[object()])
+        message = FakeDiscordMessage("<@999>   ", mentions=[bot_user], attachments=[attachment])
+        try:
+            handled = await runtime.handle_message(message, bot_user)
+        finally:
+            await runtime.close()
+        return handled, message
+
+    handled, message = asyncio.run(run())
+
+    assert handled is True
+    saved_path = cfg.state_dir / "human_files" / root["id"] / "message-1" / "01-context.md"
+    assert saved_path.read_bytes() == b"# context"
+    assert delivered == [f"{DISCORD_PROMPT_PREFIX.rstrip()}\n{FILES_ATTACHED_HEADING}\n{saved_path}"]
+    assert message.replies == []
+
+
+def test_inbound_oversized_attachment_is_rejected_before_prompt(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("456", root["id"], "123")
+    bot_user = FakeDiscordUser("999")
+    delivered: list[str] = []
+    attachment = FakeDiscordAttachment("huge.bin", b"small", size=11 * 1024 * 1024)
+
+    def fake_prompt(registry, tmux_client, agent_id, prompt, source):
+        delivered.append(prompt)
+        return {"created_at": "2026-05-20T00:00:01Z"}
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, prompt_func=fake_prompt)
+        message = FakeDiscordMessage("<@999> see attached", mentions=[bot_user], attachments=[attachment])
         try:
             handled = await runtime.handle_message(message, bot_user)
         finally:
@@ -507,7 +594,8 @@ def test_inbound_text_empty_message_with_attachment_is_rejected(ctx, tmp_path):
 
     assert handled is True
     assert delivered == []
-    assert message.replies == [TEXT_ONLY_REPLY]
+    assert "I could not download that attachment" in message.replies[0]
+    assert "error[file_too_large]" in message.replies[0]
 
 
 def test_inbound_unbound_channel_mention_receives_setup_hint(ctx):

@@ -69,11 +69,13 @@ Discord `/skills` manages reusable prompts. With no arguments it lists saved ski
 
 The TUI opens on the agent tree. Press `s` to switch to the reusable skills view, where `n` creates a skill, `e` or Enter edits the selected skill through `$VISUAL`/`$EDITOR`, and `d` deletes the selected skill.
 
+Discord inbound file attachments are saved under the active state directory at `human_files/<root-agent-id>/<discord-message-id>/`. The delivered root prompt includes a literal `FILES ATTACHED` section with absolute saved paths. Attachment-only Discord messages are valid prompts.
+
 Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset command to the bound root, then queue a regenerated Puppetmaster orchestrator prompt after a short delay with a reset-specific task telling the root to notify the user that it is ready for new tasks.
 
 ## State And Events
 
-The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, reusable Discord skills, and outbound human messages with optional attachment metadata. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config.
+The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, reusable Discord skills, and outbound human messages with optional attachment metadata. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config. Inbound Discord human uploads also live under the active state directory in `human_files/`.
 
 Completion is explicit. A Codex turn stopping is not the same as finishing work. Agents should call `complete_agent` with `success`, `failed`, `blocked`, or `cancelled` when their assigned task is actually terminal.
 

@@ -232,7 +232,7 @@ Slash commands:
 /skills skill-name:<optional> prompt:<optional> view:<optional> forget:<optional>
 ```
 
-After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Inbound user attachments are ignored in v1.
+After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Inbound user attachments are downloaded into `~/.puppetmaster/human_files/<root-agent-id>/<discord-message-id>/` and the delivered prompt includes a `FILES ATTACHED` block listing the saved local paths. Attachment-only messages are accepted.
 
 `/puppet agents` formats each root id in its own copy-friendly code block so Discord users can copy one id at a time.
 
@@ -254,7 +254,7 @@ Native screenshot backends are best-effort and environment-dependent. Puppetmast
 
 When a root orchestrator calls `send_human_message(message)`, Puppetmaster queues the reply for the bound root and the Discord bot posts it back to the bound channel. It can also include `file_path` and optional `filename` to upload one local file attachment; relative paths resolve from the agent workspace, filenames are display names only, and files above Discord's default 10 MiB attachment limit are rejected before queueing. The MCP tool does not accept Discord channel ids; routing always follows the root binding. Outbound reply text is chunked to fit Discord limits.
 
-Bindings, reusable skills, and outbound messages are durable in SQLite. On restart, existing channel bindings still work, saved skills remain available, pending outbound messages and attachments are delivered once, and delivered or failed rows are not resent. Typing indicators are best-effort in-memory state and are reset by a bot restart.
+Bindings, reusable skills, inbound human files, and outbound messages are durable in the active state directory. On restart, existing channel bindings still work, saved skills remain available, pending outbound messages and attachments are delivered once, and delivered or failed rows are not resent. Typing indicators are best-effort in-memory state and are reset by a bot restart.
 
 After an inbound prompt is delivered, the bot shows typing while the orchestrator is working. Typing stops when `send_human_message` is delivered, the root turn stops, or `typing_timeout_seconds` expires.
 
@@ -357,6 +357,7 @@ By default Puppetmaster writes state in `~/.puppetmaster/`:
 ~/.puppetmaster/puppetmaster.log.jsonl
 ~/.puppetmaster/discord-bot.pid
 ~/.puppetmaster/discord-bot.log
+~/.puppetmaster/human_files/<root-agent-id>/<discord-message-id>/<attachment>
 ~/.puppetmaster/agents/<agent-id>/initial-prompt.md
 ~/.puppetmaster/agents/<agent-id>/terminal.log
 ~/.puppetmaster/agents/<agent-id>/events.jsonl

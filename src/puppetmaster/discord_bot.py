@@ -34,7 +34,8 @@ except ImportError:  # pragma: no cover
 TRUNCATED_MARKER = "[truncated]"
 CODE_BLOCK_OVERHEAD = len("```\n\n```")
 DISCORD_PROMPT_PREFIX = "DISCORD MESSAGE RECEIVED:\n"
-TEXT_ONLY_REPLY = "I only accept text messages right now."
+FILES_ATTACHED_HEADING = "FILES ATTACHED"
+TEXT_ONLY_REPLY = "Send text or attach a file for the bound orchestrator."
 NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents, then /puppet bind."
 PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound root."
 PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
@@ -264,6 +265,30 @@ def _strip_bot_mentions(content: str, bot_user: Any) -> str:
     return cleaned.strip()
 
 
+def _safe_path_component(value: str, fallback: str, max_length: int = 120) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "").strip()).strip(".-")
+    if not cleaned:
+        cleaned = fallback
+    return cleaned[:max_length] or fallback
+
+
+def _safe_inbound_attachment_filename(attachment: Any, index: int) -> str:
+    raw_name = str(getattr(attachment, "filename", "") or f"attachment-{index}")
+    name = Path(raw_name.replace("\\", "/")).name
+    return _safe_path_component(name, f"attachment-{index}", max_length=180)
+
+
+def _format_inbound_prompt(cleaned: str, file_paths: list[str]) -> str:
+    if not file_paths:
+        return f"{DISCORD_PROMPT_PREFIX}{cleaned}"
+    lines = [DISCORD_PROMPT_PREFIX.rstrip()]
+    if cleaned:
+        lines.extend([cleaned, ""])
+    lines.append(FILES_ATTACHED_HEADING)
+    lines.extend(file_paths)
+    return "\n".join(lines)
+
+
 async def _is_reply_to_bot(message: Any, bot_user: Any) -> bool:
     bot_user_id = _user_id(bot_user)
     if bot_user_id is None:
@@ -315,6 +340,42 @@ class DiscordRuntime:
         if isinstance(self.config, Config):
             supervisor_log(self.config, level, event, message, **fields)
 
+    async def _save_inbound_attachments(self, root_agent_id: str, message: Any) -> list[str]:
+        attachments = list(getattr(message, "attachments", []) or [])
+        if not attachments:
+            return []
+        message_id = _safe_path_component(str(getattr(message, "id", "") or ""), "message")
+        target_dir = self.registry.config.state_dir / "human_files" / _safe_path_component(root_agent_id, "root") / message_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        saved_paths: list[str] = []
+        for index, attachment in enumerate(attachments, start=1):
+            size = getattr(attachment, "size", None)
+            if size is not None and int(size) > DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES:
+                limit_mib = DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES // (1024 * 1024)
+                raise PuppetError(
+                    "file_too_large",
+                    f"inbound attachment is {int(size)} bytes, above Discord's default {limit_mib} MiB attachment limit.",
+                )
+            filename = _safe_inbound_attachment_filename(attachment, index)
+            path = target_dir / f"{index:02d}-{filename}"
+            save = getattr(attachment, "save", None)
+            if save is None:
+                raise PuppetError("attachment_download_unavailable", "Discord attachment cannot be downloaded.")
+            await save(path)
+            if not path.is_file():
+                raise PuppetError("attachment_download_failed", f"Discord attachment was not saved: {path}")
+            actual_size = path.stat().st_size
+            if actual_size > DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                limit_mib = DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES // (1024 * 1024)
+                raise PuppetError(
+                    "file_too_large",
+                    f"inbound attachment is {actual_size} bytes, above Discord's default {limit_mib} MiB attachment limit.",
+                )
+            saved_paths.append(str(path))
+        return saved_paths
+
     async def handle_message(self, message: Any, bot_user: Any) -> bool:
         if _is_bot_author(message, bot_user):
             return False
@@ -350,11 +411,28 @@ class DiscordRuntime:
             return True
 
         cleaned = _strip_bot_mentions(str(getattr(message, "content", "") or ""), bot_user)
-        if not cleaned:
+        attachments = list(getattr(message, "attachments", []) or [])
+        if not cleaned and not attachments:
             await message.reply(TEXT_ONLY_REPLY)
             return True
 
-        prompt = f"{DISCORD_PROMPT_PREFIX}{cleaned}"
+        try:
+            file_paths = await self._save_inbound_attachments(binding["root_agent_id"], message)
+        except PuppetError as exc:
+            self._log(
+                "warning",
+                "discord.inbound.attachment_failed",
+                "Discord attachment download failed.",
+                root_agent_id=binding["root_agent_id"],
+                channel_id=channel_id,
+                discord_message_id=str(getattr(message, "id", "")) or None,
+                error_code=exc.code,
+                error_message=exc.message,
+            )
+            await message.reply(f"I could not download that attachment. {format_error(exc)}")
+            return True
+
+        prompt = _format_inbound_prompt(cleaned, file_paths)
         try:
             event = self.prompt_func(self.registry, self.tmux, binding["root_agent_id"], prompt, "discord")
         except PuppetError as exc:
@@ -398,6 +476,7 @@ class DiscordRuntime:
             guild_id=str(getattr(guild, "id", "")),
             discord_message_id=str(getattr(message, "id", "")) or None,
             prompt_length=len(cleaned),
+            attachment_count=len(file_paths),
             event_id=event.get("id"),
         )
         self.start_typing(binding["root_agent_id"], channel, event.get("created_at") or now())
