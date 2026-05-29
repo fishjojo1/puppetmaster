@@ -1347,6 +1347,38 @@ def test_screenshot_interaction_defers_before_capturing_pane(ctx, tmp_path, monk
     assert fake_tmux.captured == [root["tmux_session"]]
 
 
+def test_interaction_command_defers_before_running_handler(ctx):
+    cfg, _reg, _tmux = ctx
+    interaction = FakeInteraction(FakeTextChannel())
+
+    def handler() -> str:
+        assert interaction.response.deferred is True
+        return "done"
+
+    asyncio.run(discord_bot_module._run_interaction_command(interaction, cfg, handler))
+
+    assert interaction.response.deferred is True
+    assert interaction.response.thinking is True
+    assert interaction.response.sent == []
+    assert interaction.followup.sent[0]["args"] == ("```\ndone\n```",)
+
+
+def test_plain_interaction_command_defers_before_running_handler(ctx):
+    cfg, _reg, _tmux = ctx
+    interaction = FakeInteraction(FakeTextChannel())
+
+    def handler() -> str:
+        assert interaction.response.deferred is True
+        return "done"
+
+    asyncio.run(discord_bot_module._run_plain_interaction_command(interaction, cfg, handler))
+
+    assert interaction.response.deferred is True
+    assert interaction.response.thinking is True
+    assert interaction.response.sent == []
+    assert interaction.followup.sent[0]["args"] == ("done",)
+
+
 def test_compact_requires_a_binding(ctx):
     _cfg, reg, _tmux = ctx
 
@@ -1583,12 +1615,13 @@ def test_agents_interaction_sends_plain_markdown_for_individual_id_copy(ctx, tmp
 
     asyncio.run(discord_bot_module._run_plain_interaction_command(interaction, cfg, handle_agents_command, reg))
 
-    assert len(interaction.response.sent) == 1
-    content = interaction.response.sent[0]["args"][0]
+    assert interaction.response.deferred is True
+    assert interaction.response.sent == []
+    assert len(interaction.followup.sent) == 1
+    content = interaction.followup.sent[0]["args"][0]
     assert content.startswith("Root orchestrators:")
     assert f"```text\n{root['id']}\n```" in content
     assert not content.startswith("```\n")
-    assert interaction.followup.sent == []
 
 
 def test_tree_requires_binding_and_renders_descendants(ctx, tmp_path):

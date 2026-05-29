@@ -1098,12 +1098,18 @@ def handle_tree_command(registry: Registry, channel: Any) -> str:
 CommandFunc = Callable[..., str]
 
 
+async def _defer_interaction_response(interaction: Any) -> None:
+    if not interaction.response.is_done():
+        await interaction.response.defer(thinking=True)
+
+
 async def _run_interaction_command(
     interaction: Any,
     config: Config,
     func: CommandFunc,
     *args: Any,
 ) -> None:
+    await _defer_interaction_response(interaction)
     try:
         text = func(*args)
     except PuppetError as exc:
@@ -1117,6 +1123,7 @@ async def _run_plain_interaction_command(
     func: CommandFunc,
     *args: Any,
 ) -> None:
+    await _defer_interaction_response(interaction)
     try:
         text = func(*args)
     except PuppetError as exc:
@@ -1131,8 +1138,7 @@ async def _run_screenshot_interaction(
     tmux: Tmux,
     mode: str | None = None,
 ) -> None:
-    if not interaction.response.is_done():
-        await interaction.response.defer(thinking=True)
+    await _defer_interaction_response(interaction)
     try:
         screenshot = handle_screenshot_command(registry, tmux, interaction.channel, mode)
     except PuppetError as exc:
