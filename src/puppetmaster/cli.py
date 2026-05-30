@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import getpass
 import json
 import os
@@ -43,6 +45,7 @@ from .tmux import Tmux
 
 DISCORD_PID_FILE = "discord-bot.pid"
 DISCORD_LOG_FILE = "discord-bot.log"
+DISCORD_LOCK_FILE = "discord-bot.lock"
 
 
 def build_context():
@@ -517,6 +520,42 @@ def _discord_log_path(cfg) -> Path:
     return cfg.state_dir / DISCORD_LOG_FILE
 
 
+def _discord_lock_path(cfg) -> Path:
+    return cfg.state_dir / DISCORD_LOCK_FILE
+
+
+@contextlib.contextmanager
+def discord_serve_lock(cfg):
+    lock_path = _discord_lock_path(cfg)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = lock_path.open("w", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            status = discord_background_status(cfg)
+            pid = status.get("pid")
+            detail = f" with pid {pid}" if pid else ""
+            raise PuppetError(
+                "discord_bot_already_running",
+                f"discord bot is already running{detail}",
+                "Use `puppet discord status` or stop the existing discord serve process.",
+            ) from exc
+        _discord_pid_path(cfg).write_text(f"{os.getpid()}\n", encoding="utf-8")
+        lock_fh.seek(0)
+        lock_fh.truncate()
+        lock_fh.write(f"{os.getpid()}\n")
+        lock_fh.flush()
+        yield
+    finally:
+        current_pid = _read_pid(_discord_pid_path(cfg))
+        if current_pid == os.getpid():
+            _discord_pid_path(cfg).unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
+
+
 def _read_pid(path: Path) -> int | None:
     try:
         return int(path.read_text(encoding="utf-8").strip())
@@ -610,6 +649,7 @@ def start_discord_background(args: argparse.Namespace) -> int:
 def cmd_discord_serve(args: argparse.Namespace) -> int:
     if args.background:
         return start_discord_background(args)
+    cfg = load_config()
 
     try:
         from .discord_bot import run_discord_bot
@@ -620,7 +660,8 @@ def cmd_discord_serve(args: argparse.Namespace) -> int:
             "Install project dependencies with `uv sync` and retry.",
         ) from exc
 
-    return run_discord_bot()
+    with discord_serve_lock(cfg):
+        return run_discord_bot()
 
 
 def cmd_discord_status(args: argparse.Namespace) -> int:

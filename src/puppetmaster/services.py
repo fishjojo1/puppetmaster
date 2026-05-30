@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import Config, inherited_pythonpath, puppetmaster_subprocess_env
+from .config import Config, codex_home_pool_env_value, inherited_pythonpath, puppetmaster_subprocess_env
 from .errors import PuppetError, require
 from .logging import log
 from .model import COMPLETION_STATUSES, TERMINAL_STATUSES, json_dumps, new_id, now, validate_cwd
@@ -1007,9 +1007,22 @@ def user_codex_config(codex_home: Path) -> dict[str, Any]:
         ) from exc
 
 
-def write_codex_files(config: Config, agent: dict[str, Any], user_prompt: str, orchestrator: bool = False) -> dict[str, str]:
+def source_codex_home_for_spawn(config: Config, spawn_index: int) -> Path:
+    if config.codex_home_pool:
+        return config.codex_home_pool[spawn_index % len(config.codex_home_pool)]
+    return config.codex_home
+
+
+def write_codex_files(
+    config: Config,
+    agent: dict[str, Any],
+    user_prompt: str,
+    orchestrator: bool = False,
+    source_codex_home: Path | None = None,
+) -> dict[str, str]:
     directory = agent_dir(config, agent["id"])
     codex_home = directory / "codex-config"
+    source_home = source_codex_home or config.codex_home
     hooks_dir = codex_home / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)
     prompt_path = directory / "initial-prompt.md"
@@ -1029,10 +1042,12 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         "PUPPETMASTER_PARENT_AGENT_ID": agent.get("parent_id") or "",
         "PUPPETMASTER_ROOT_AGENT_ID": agent["root_id"],
         "PUPPETMASTER_STATE_DIR": str(config.state_dir),
-        "PUPPETMASTER_CODEX_HOME": str(config.codex_home),
+        "PUPPETMASTER_CODEX_HOME": str(source_home),
         "PUPPETMASTER_CONFIG_DIR": str(codex_home),
         "PUPPETMASTER_ROLE": agent["role"],
     }
+    if config.codex_home_pool:
+        env["PUPPETMASTER_CODEX_HOME_POOL"] = codex_home_pool_env_value(config.codex_home_pool)
     pythonpath = inherited_pythonpath()
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
@@ -1052,7 +1067,7 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         },
     }
     config_toml.write_text(
-        toml_dumps(deep_merge(user_codex_config(config.codex_home), generated_codex_config)),
+        toml_dumps(deep_merge(user_codex_config(source_home), generated_codex_config)),
         encoding="utf-8",
     )
     hooks_json.write_text(
@@ -1077,7 +1092,7 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         ),
         encoding="utf-8",
     )
-    auth_json = config.codex_home / "auth.json"
+    auth_json = source_home / "auth.json"
     if auth_json.exists() and not (codex_home / "auth.json").exists():
         try:
             (codex_home / "auth.json").symlink_to(auth_json)
@@ -1091,6 +1106,11 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
     if config.codex_bypass_approvals_and_sandbox:
         flags.insert(1, "--dangerously-bypass-approvals-and-sandbox")
     pythonpath_export = f"export PYTHONPATH={pythonpath!r}\n" if pythonpath is not None else ""
+    pool_export = (
+        f"export PUPPETMASTER_CODEX_HOME_POOL={codex_home_pool_env_value(config.codex_home_pool)!r}\n"
+        if config.codex_home_pool
+        else ""
+    )
     launch.write_text(
         f"""#!/usr/bin/env bash
 set -euo pipefail
@@ -1098,7 +1118,8 @@ export PUPPETMASTER_AGENT_ID={agent['id']!r}
 export PUPPETMASTER_PARENT_AGENT_ID={agent.get('parent_id') or ''}
 export PUPPETMASTER_ROOT_AGENT_ID={agent['root_id']!r}
 export PUPPETMASTER_STATE_DIR={str(config.state_dir)!r}
-export PUPPETMASTER_CODEX_HOME={str(config.codex_home)!r}
+export PUPPETMASTER_CODEX_HOME={str(source_home)!r}
+{pool_export}\
 export PUPPETMASTER_CONFIG_DIR={str(codex_home)!r}
 export PUPPETMASTER_ROLE={agent['role']!r}
 {pythonpath_export}\
@@ -1114,7 +1135,7 @@ exec {codex!r} {' '.join(shlex_quote(flag) for flag in flags)}
         "config": str(config_toml),
         "hook": str(stop_hook),
         "codex_home": str(codex_home),
-        "source_codex_home": str(config.codex_home),
+        "source_codex_home": str(source_home),
     }
 
 
@@ -1157,6 +1178,8 @@ def create_codex_agent(
     if agent_id is not None:
         ensure_agent_id_available(config, registry, tmux, agent_id)
     discover_codex()
+    spawn_index = registry.count_agents()
+    source_codex_home = source_codex_home_for_spawn(config, spawn_index)
     agent = create_agent_record(
         config,
         registry,
@@ -1169,7 +1192,13 @@ def create_codex_agent(
         metadata={"runtime": "codex", **(metadata or {})},
         agent_id=agent_id,
     )
-    files = write_codex_files(config, agent, prompt, orchestrator=role == "orchestrator")
+    files = write_codex_files(
+        config,
+        agent,
+        prompt,
+        orchestrator=role == "orchestrator",
+        source_codex_home=source_codex_home,
+    )
     agent = registry.update_agent(
         agent["id"],
         initial_prompt_path=files["prompt"],

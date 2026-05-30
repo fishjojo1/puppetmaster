@@ -8,7 +8,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - Any managed agent can create children through MCP: `create_agent` MCP tool.
 - Every managed session runs in tmux: `Tmux.create_session`.
 - Codex no-sandbox/no-approval mode is generated: `write_codex_files` launch flags.
-- Configurable source Codex homes are supported for root trees: `puppet orchestrator start --codex-home`, `[codex].home`, `CODEX_HOME`, and `PUPPETMASTER_CODEX_HOME`; runtime `CODEX_HOME` remains per-agent.
+- Configurable source Codex homes are supported for root trees: `puppet orchestrator start --codex-home`, `[codex].home`, `[codex].home_pool`, `CODEX_HOME`, `PUPPETMASTER_CODEX_HOME`, and `PUPPETMASTER_CODEX_HOME_POOL`; runtime `CODEX_HOME` remains per-agent.
 - Durable registry exists: `~/.puppetmaster/registry.sqlite`, `Registry`.
 - Durable terminal logs exist: per-agent `terminal.log`, tmux `pipe-pane`.
 - Agent inspection works: `puppet agent inspect`, `inspect_agent`.
@@ -40,7 +40,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - `puppet init` creates or updates global config, supports interactive hidden token entry, non-interactive Discord flags, JSON output, and optional background Discord startup.
 - `puppet orchestrator start` can create multiple root orchestrators in one global registry; roots remain distinct by `id`, `root_id`, and `cwd`.
 - `puppet orchestrator start --agent-id <id>` creates a root with an exact safe id; unsafe ids, duplicate registry ids, existing agent directories, and existing derived tmux sessions fail before root creation.
-- `puppet orchestrator start --codex-home <path>` uses that Codex home as the root tree's source config/auth home and propagates it to MCP-spawned child agents.
+- `puppet orchestrator start --codex-home <path>` uses that Codex home as the root tree's source config/auth home and bypasses account pooling; `[codex].home_pool` rotates source config/auth homes across newly spawned root and child agents.
 - `puppet orchestrator start --goal` prepends literal `/goal ` to the root orchestrator's initial prompt.
 - `agent create`, `agent list`, `agent tree`, `agent inspect`, `agent read`, `agent prompt`, `agent attach`, `agent stop`, `agent kill`, `agent kill-tree`, `agent complete` exist.
 - Compatibility aliases exist for milestone commands: `agent create-raw`, `agent create-codex`, `debug create-raw`.

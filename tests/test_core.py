@@ -154,6 +154,7 @@ def test_default_config_creation_writes_discord_section(tmp_path, monkeypatch):
     data = tomllib.loads((state_dir / "config.toml").read_text(encoding="utf-8"))
     assert "discord" in data
     assert data["codex"]["home"] == ""
+    assert data["codex"]["home_pool"] == []
     assert data["discord"]["token"] == ""
     assert data["discord"]["guild_id"] == ""
     assert cfg.discord.token is None
@@ -203,6 +204,51 @@ home = "~/source-codex"
     monkeypatch.setenv("CODEX_HOME", str(generated_home))
     managed_cfg = load_config()
     assert managed_cfg.codex_home == managed_source_home.resolve()
+
+
+def test_load_config_uses_codex_home_pool_and_preserves_explicit_overrides(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    state_dir = tmp_path / ".state"
+    home = tmp_path / "home"
+    source_home = tmp_path / "source-codex"
+    selected_home = tmp_path / "selected-codex"
+    generated_home = tmp_path / "generated-agent-codex"
+    home.mkdir()
+    source_home.mkdir()
+    selected_home.mkdir()
+    generated_home.mkdir()
+    state_dir.mkdir()
+    monkeypatch.setenv("PUPPETMASTER_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("PUPPETMASTER_AGENT_ID", raising=False)
+    monkeypatch.delenv("PUPPETMASTER_CODEX_HOME", raising=False)
+    monkeypatch.delenv("PUPPETMASTER_CODEX_HOME_POOL", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+    (state_dir / "config.toml").write_text(
+        """[codex]
+home = "~/source-codex"
+home_pool = ["~/pool-a", "~/pool-b"]
+""",
+        encoding="utf-8",
+    )
+
+    configured_cfg = load_config()
+    assert configured_cfg.codex_home == (home / "source-codex").resolve()
+    assert configured_cfg.codex_home_pool == ((home / "pool-a").resolve(), (home / "pool-b").resolve())
+
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    env_cfg = load_config()
+    assert env_cfg.codex_home == source_home.resolve()
+    assert env_cfg.codex_home_pool == ()
+
+    monkeypatch.setenv("PUPPETMASTER_AGENT_ID", "agt_root")
+    monkeypatch.setenv("PUPPETMASTER_CODEX_HOME", str(selected_home))
+    monkeypatch.setenv("PUPPETMASTER_CODEX_HOME_POOL", json.dumps([str(home / "pool-b"), str(home / "pool-a")]))
+    monkeypatch.setenv("CODEX_HOME", str(generated_home))
+    managed_cfg = load_config()
+    assert managed_cfg.codex_home == selected_home.resolve()
+    assert managed_cfg.codex_home_pool == ((home / "pool-b").resolve(), (home / "pool-a").resolve())
 
 
 def test_init_no_input_creates_default_config(tmp_path, monkeypatch, capsys):
@@ -645,6 +691,10 @@ def test_outbound_human_message_queue_lifecycle(ctx):
     assert first["attachment_size"] == 12
     assert [item["id"] for item in reg.pending_outbound_human_messages("discord")] == [first["id"], second["id"]]
     assert reg.pending_outbound_human_messages("email") == []
+    assert [item["id"] for item in reg.claim_pending_outbound_human_messages("discord", limit=1)] == [first["id"]]
+    assert [item["id"] for item in reg.pending_outbound_human_messages("discord")] == [second["id"]]
+    assert [item["id"] for item in reg.claim_pending_outbound_human_messages("discord", limit=10)] == [second["id"]]
+    assert reg.pending_outbound_human_messages("discord") == []
 
     delivered = reg.mark_outbound_human_message_delivered(first["id"])
     failed = reg.mark_outbound_human_message_failed(second["id"], "discord API failed")
@@ -689,7 +739,7 @@ def test_registry_migrates_outbound_attachment_columns(tmp_path, monkeypatch):
 
     with reg.connect() as conn:
         columns = {row["name"] for row in conn.execute("pragma table_info(outbound_human_messages)").fetchall()}
-    assert {"attachment_path", "attachment_filename", "attachment_size"} <= columns
+    assert {"attachment_path", "attachment_filename", "attachment_size", "claimed_at"} <= columns
 
 
 def test_send_human_message_rejects_empty_message(ctx, tmp_path):
@@ -937,6 +987,80 @@ def test_start_orchestrator_codex_home_feeds_root_mcp_environment(ctx, tmp_path,
     assert data["model"] == "gpt-source"
     assert data["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_CODEX_HOME"] == str(source_home.resolve())
     assert f"export PUPPETMASTER_CODEX_HOME={str(source_home.resolve())!r}" in launch
+
+
+def test_codex_home_pool_rotates_across_spawned_agents(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    pool_a = tmp_path / "codex-a"
+    pool_b = tmp_path / "codex-b"
+    pool_a.mkdir()
+    pool_b.mkdir()
+    (pool_a / "config.toml").write_text('model = "gpt-a"\n', encoding="utf-8")
+    (pool_b / "config.toml").write_text('model = "gpt-b"\n', encoding="utf-8")
+    (pool_b / "auth.json").write_text('{"token":"b"}\n', encoding="utf-8")
+    cfg = cfg.with_codex_home_pool([str(pool_a), str(pool_b)])
+    monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    monkeypatch.setattr(services.time, "sleep", lambda seconds: None)
+
+    class FakeTmux:
+        def create_session(self, _session, _cwd, _command):
+            return None
+
+        def pipe_pane(self, _session, _log_path):
+            return None
+
+        def send_prompt(self, _session, _prompt):
+            return None
+
+    root = services.create_codex_agent(
+        cfg,
+        reg,
+        FakeTmux(),
+        cwd=str(tmp_path),
+        description="root",
+        prompt="root",
+        role="orchestrator",
+    )
+    child = services.create_codex_agent(
+        cfg,
+        reg,
+        FakeTmux(),
+        cwd=str(tmp_path),
+        description="child",
+        prompt="child",
+        parent_id=root["id"],
+    )
+    grandchild = services.create_codex_agent(
+        cfg,
+        reg,
+        FakeTmux(),
+        cwd=str(tmp_path),
+        description="grandchild",
+        prompt="grandchild",
+        parent_id=child["id"],
+    )
+
+    root_files = root["metadata"]["generated_files"]
+    child_files = child["metadata"]["generated_files"]
+    grandchild_files = grandchild["metadata"]["generated_files"]
+    root_config = tomllib.loads(Path(root_files["config"]).read_text(encoding="utf-8"))
+    child_config = tomllib.loads(Path(child_files["config"]).read_text(encoding="utf-8"))
+    child_launch = Path(child_files["launch"]).read_text(encoding="utf-8")
+    child_generated_home = Path(child_files["codex_home"])
+
+    assert root_files["source_codex_home"] == str(pool_a.resolve())
+    assert child_files["source_codex_home"] == str(pool_b.resolve())
+    assert grandchild_files["source_codex_home"] == str(pool_a.resolve())
+    assert root_config["model"] == "gpt-a"
+    assert child_config["model"] == "gpt-b"
+    assert child_config["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_CODEX_HOME"] == str(pool_b.resolve())
+    assert json.loads(child_config["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_CODEX_HOME_POOL"]) == [
+        str(pool_a.resolve()),
+        str(pool_b.resolve()),
+    ]
+    assert (child_generated_home / "auth.json").resolve() == pool_b.resolve() / "auth.json"
+    assert f"export PUPPETMASTER_CODEX_HOME={str(pool_b.resolve())!r}" in child_launch
+    assert "PUPPETMASTER_CODEX_HOME_POOL" in child_launch
 
 
 def test_validate_agent_id_accepts_safe_ids_and_rejects_unsafe_ids():
@@ -1337,6 +1461,31 @@ def test_discord_serve_background_rejects_existing_process(ctx, monkeypatch):
 
     with pytest.raises(PuppetError) as exc:
         cli_module.cmd_discord_serve(argparse.Namespace(background=True, json=False))
+
+    assert exc.value.code == "discord_bot_already_running"
+
+
+def test_discord_serve_lock_writes_and_clears_pid_file(ctx):
+    cfg, _reg, _tmux = ctx
+    pid_file = cfg.state_dir / cli_module.DISCORD_PID_FILE
+
+    with cli_module.discord_serve_lock(cfg):
+        assert pid_file.read_text(encoding="utf-8") == f"{cli_module.os.getpid()}\n"
+
+    assert not pid_file.exists()
+
+
+def test_discord_serve_lock_rejects_locked_file(ctx, monkeypatch):
+    cfg, _reg, _tmux = ctx
+
+    def fake_flock(_fh, _flags):
+        raise BlockingIOError
+
+    monkeypatch.setattr(cli_module.fcntl, "flock", fake_flock)
+
+    with pytest.raises(PuppetError) as exc:
+        with cli_module.discord_serve_lock(cfg):
+            pass
 
     assert exc.value.code == "discord_bot_already_running"
 

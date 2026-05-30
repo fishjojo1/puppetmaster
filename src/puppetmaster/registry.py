@@ -107,6 +107,7 @@ create table if not exists outbound_human_messages(
   attachment_filename text null,
   attachment_size integer null,
   created_at text not null,
+  claimed_at text,
   delivered_at text,
   failed_at text,
   error text
@@ -123,6 +124,17 @@ create table if not exists discord_skills(
 );
 create index if not exists discord_skills_updated_at_idx
 on discord_skills(updated_at);
+create table if not exists discord_inbound_messages(
+  id text primary key,
+  channel_id text not null,
+  discord_message_id text not null,
+  root_agent_id text null,
+  status text not null,
+  created_at text not null,
+  updated_at text not null
+);
+create unique index if not exists discord_inbound_messages_channel_message_idx
+on discord_inbound_messages(channel_id, discord_message_id);
 """
 
 
@@ -153,6 +165,7 @@ class Registry:
             "attachment_path": "text null",
             "attachment_filename": "text null",
             "attachment_size": "integer null",
+            "claimed_at": "text null",
         }.items():
             if name not in columns:
                 conn.execute(f"alter table outbound_human_messages add column {name} {definition}")
@@ -247,6 +260,11 @@ class Registry:
                 "select * from agents where status in ('starting','running','idle','awaiting_input','unknown')"
             ).fetchall()
         return [self._agent(row) for row in rows]
+
+    def count_agents(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("select count(*) as count from agents").fetchone()
+        return int(row["count"])
 
     def update_agent(self, agent_id: str, **fields: Any) -> dict[str, Any]:
         if "status" in fields and fields["status"] not in VALID_STATUSES:
@@ -609,6 +627,7 @@ class Registry:
             "attachment_filename": attachment_filename,
             "attachment_size": attachment_size,
             "created_at": now(),
+            "claimed_at": None,
             "delivered_at": None,
             "failed_at": None,
             "error": None,
@@ -619,11 +638,11 @@ class Registry:
                 insert into outbound_human_messages(
                   id,root_agent_id,agent_id,transport,channel_id,status,message,
                   attachment_path,attachment_filename,attachment_size,
-                  created_at,delivered_at,failed_at,error
+                  created_at,claimed_at,delivered_at,failed_at,error
                 ) values(
                   :id,:root_agent_id,:agent_id,:transport,:channel_id,:status,:message,
                   :attachment_path,:attachment_filename,:attachment_size,
-                  :created_at,:delivered_at,:failed_at,:error
+                  :created_at,:claimed_at,:delivered_at,:failed_at,:error
                 )
                 """,
                 outbound,
@@ -635,13 +654,41 @@ class Registry:
             rows = conn.execute(
                 """
                 select * from outbound_human_messages
-                where transport=? and status='pending'
+                where transport=? and status='pending' and claimed_at is null
                 order by created_at asc, rowid asc
                 limit ?
                 """,
                 (transport, int(limit)),
             ).fetchall()
         return [self._outbound_human_message(row) for row in rows]
+
+    def claim_pending_outbound_human_messages(self, transport: str, limit: int = 20) -> list[dict[str, Any]]:
+        claimed: list[dict[str, Any]] = []
+        ts = now()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                select id from outbound_human_messages
+                where transport=? and status='pending' and claimed_at is null
+                order by created_at asc, rowid asc
+                limit ?
+                """,
+                (transport, int(limit)),
+            ).fetchall()
+            for row in rows:
+                cursor = conn.execute(
+                    """
+                    update outbound_human_messages
+                    set claimed_at=?
+                    where id=? and status='pending' and claimed_at is null
+                    """,
+                    (ts, row["id"]),
+                )
+                if cursor.rowcount == 1:
+                    found = conn.execute("select * from outbound_human_messages where id=?", (row["id"],)).fetchone()
+                    if found is not None:
+                        claimed.append(self._outbound_human_message(found))
+        return claimed
 
     def mark_outbound_human_message_delivered(self, message_id: str) -> dict[str, Any]:
         ts = now()
@@ -657,6 +704,27 @@ class Registry:
         if cursor.rowcount != 1:
             raise PuppetError("not_found", f"outbound human message not found: {message_id}")
         return self._get_outbound_human_message(message_id)
+
+    def claim_discord_inbound_message(
+        self,
+        channel_id: str,
+        discord_message_id: str | None,
+        root_agent_id: str | None = None,
+    ) -> bool:
+        message_id = (discord_message_id or "").strip()
+        if not message_id:
+            return True
+        ts = now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                insert or ignore into discord_inbound_messages(
+                  id,channel_id,discord_message_id,root_agent_id,status,created_at,updated_at
+                ) values(?,?,?,?,?,?,?)
+                """,
+                (new_id("din"), channel_id, message_id, root_agent_id, "claimed", ts, ts),
+            )
+        return cursor.rowcount == 1
 
     def mark_outbound_human_message_failed(self, message_id: str, error: str) -> dict[str, Any]:
         ts = now()

@@ -471,6 +471,38 @@ def test_inbound_mention_is_delivered_with_clean_prompt_and_reaction(ctx, tmp_pa
     assert message.replies == []
 
 
+def test_inbound_duplicate_discord_message_is_claimed_once(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("456", root["id"], "123")
+    delivered: list[str] = []
+    bot_user = FakeDiscordUser("999")
+
+    def fake_prompt(registry, tmux_client, agent_id, prompt, source):
+        delivered.append(prompt)
+        return {"created_at": "2026-05-20T00:00:01Z"}
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, prompt_func=fake_prompt)
+        first = FakeDiscordMessage("<@999> hello", mentions=[bot_user], message_id="same-message")
+        second = FakeDiscordMessage("<@999> hello", mentions=[bot_user], message_id="same-message")
+        try:
+            first_handled = await runtime.handle_message(first, bot_user)
+            second_handled = await runtime.handle_message(second, bot_user)
+        finally:
+            await runtime.close()
+        return first_handled, second_handled, first, second
+
+    first_handled, second_handled, first, second = asyncio.run(run())
+
+    assert first_handled is True
+    assert second_handled is True
+    assert delivered == [f"{DISCORD_PROMPT_PREFIX}hello"]
+    assert first.reactions == [PROMPT_DELIVERED_REACTION]
+    assert second.reactions == []
+    assert second.replies == []
+
+
 def test_inbound_mention_downloads_attachment_and_adds_paths_to_prompt(ctx, tmp_path):
     cfg, reg, tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
@@ -726,6 +758,25 @@ def test_outbound_dispatch_sends_pending_and_marks_delivered(ctx, tmp_path):
 
     assert channel.sent == ["hello human"]
     assert _outbound_row(reg, outbound["id"])["status"] == "delivered"
+
+
+def test_outbound_dispatch_claims_messages_before_sending(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    outbound = reg.enqueue_outbound_human_message(root["id"], root["id"], "discord", "456", "claimed elsewhere")
+    claimed = reg.claim_pending_outbound_human_messages("discord")
+    channel = FakeDiscordChannel()
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, bot=FakeDiscordBot({"456": channel}))
+        await runtime.dispatch_pending_outbound_once()
+        await runtime.close()
+
+    asyncio.run(run())
+
+    assert [item["id"] for item in claimed] == [outbound["id"]]
+    assert channel.sent == []
+    assert _outbound_row(reg, outbound["id"])["status"] == "pending"
 
 
 def test_outbound_dispatch_sends_attachment_and_marks_delivered(ctx, tmp_path):

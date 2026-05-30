@@ -42,6 +42,7 @@ class Config:
     repo_dir: Path
     state_dir: Path
     codex_home: Path
+    codex_home_pool: tuple[Path, ...]
     tmux_session_prefix: str
     limits: Limits
     discord: DiscordConfig
@@ -61,7 +62,10 @@ class Config:
         return self.state_dir / "puppetmaster.log.jsonl"
 
     def with_codex_home(self, value: str | os.PathLike[str]) -> "Config":
-        return replace(self, codex_home=resolve_codex_home(value))
+        return replace(self, codex_home=resolve_codex_home(value), codex_home_pool=())
+
+    def with_codex_home_pool(self, values: object) -> "Config":
+        return replace(self, codex_home_pool=resolve_codex_home_pool(values))
 
 
 def _repo_dir() -> Path:
@@ -91,6 +95,22 @@ def resolve_codex_home(value: str | os.PathLike[str] | None) -> Path:
     return Path(text).expanduser().resolve()
 
 
+def resolve_codex_home_pool(value: object) -> tuple[Path, ...]:
+    if value is None or value == "":
+        return ()
+    if not isinstance(value, list | tuple):
+        raise PuppetError("invalid_config", "codex.home_pool must be a list of path strings")
+    paths: list[Path] = []
+    for item in value:
+        if not isinstance(item, str | os.PathLike):
+            raise PuppetError("invalid_config", "codex.home_pool must be a list of path strings")
+        text = os.fspath(item).strip()
+        if not text:
+            raise PuppetError("invalid_config", "codex.home_pool entries must be non-empty path strings")
+        paths.append(Path(text).expanduser().resolve())
+    return tuple(paths)
+
+
 def _codex_home_from_env() -> str | None:
     explicit = os.environ.get("PUPPETMASTER_CODEX_HOME")
     if explicit is not None:
@@ -98,6 +118,25 @@ def _codex_home_from_env() -> str | None:
     if os.environ.get("PUPPETMASTER_AGENT_ID"):
         return None
     return os.environ.get("CODEX_HOME")
+
+
+def codex_home_pool_env_value(pool: tuple[Path, ...]) -> str:
+    return json.dumps([str(path) for path in pool])
+
+
+def _codex_home_pool_from_env() -> list[str] | None:
+    raw = os.environ.get("PUPPETMASTER_CODEX_HOME_POOL")
+    if raw is None:
+        return None
+    if not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise PuppetError("invalid_config", "PUPPETMASTER_CODEX_HOME_POOL must be a JSON list of path strings") from exc
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise PuppetError("invalid_config", "PUPPETMASTER_CODEX_HOME_POOL must be a JSON list of path strings")
+    return parsed
 
 
 def inherited_pythonpath() -> str | None:
@@ -121,6 +160,10 @@ def puppetmaster_subprocess_env(config: "Config") -> dict[str, str]:
     env = os.environ.copy()
     env["PUPPETMASTER_STATE_DIR"] = str(config.state_dir)
     env["PUPPETMASTER_CODEX_HOME"] = str(config.codex_home)
+    if config.codex_home_pool:
+        env["PUPPETMASTER_CODEX_HOME_POOL"] = codex_home_pool_env_value(config.codex_home_pool)
+    else:
+        env.pop("PUPPETMASTER_CODEX_HOME_POOL", None)
     pythonpath = inherited_pythonpath()
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
@@ -147,6 +190,7 @@ def default_config_data() -> dict[str, Any]:
         },
         "codex": {
             "home": "",
+            "home_pool": [],
             "no_alt_screen": True,
             "bypass_approvals_and_sandbox": True,
         },
@@ -323,7 +367,12 @@ def load_config() -> Config:
     codex_raw = raw.get("codex", {})
     if not isinstance(codex_raw, dict):
         raise PuppetError("invalid_config", "codex config must be a table")
-    codex_home = resolve_codex_home(_codex_home_from_env() or codex_raw.get("home", ""))
+    env_home = _codex_home_from_env()
+    env_pool = _codex_home_pool_from_env()
+    codex_home = resolve_codex_home(env_home or codex_raw.get("home", ""))
+    codex_home_pool = resolve_codex_home_pool(env_pool if env_pool is not None else codex_raw.get("home_pool", []))
+    if env_home is not None and env_pool is None:
+        codex_home_pool = ()
     max_concurrent_children = (
         os.environ.get("PUPPETMASTER_MAX_CONCURRENT_CHILDREN")
         or os.environ.get("PUPPETMASTER_MAX_CHILDREN")
@@ -343,6 +392,7 @@ def load_config() -> Config:
         repo_dir=repo,
         state_dir=state_dir,
         codex_home=codex_home,
+        codex_home_pool=codex_home_pool,
         tmux_session_prefix=os.environ.get("PUPPETMASTER_TMUX_PREFIX", raw.get("tmux_session_prefix", "puppet_")),
         limits=limits,
         discord=_parse_discord_config(raw),
@@ -370,6 +420,7 @@ max_log_read_lines = 2000
 
 [codex]
 home = ""
+home_pool = []
 no_alt_screen = true
 bypass_approvals_and_sandbox = true
 

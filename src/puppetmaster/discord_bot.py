@@ -13,7 +13,7 @@ from typing import Any, Callable
 from .config import Config, DiscordConfig, load_config
 from .errors import PuppetError
 from .logging import log as supervisor_log
-from .model import now
+from .model import TERMINAL_STATUSES, now
 from .native_screenshot import capture_native_screenshot
 from .registry import Registry
 from .services import DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES, prompt_agent, prompt_text, read_agent
@@ -39,6 +39,7 @@ TEXT_ONLY_REPLY = "Send text or attach a file for the bound orchestrator."
 NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents, then /puppet bind."
 PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound root."
 PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
+STALE_BINDING_REPLY = "The orchestrator bound to this channel is no longer live. Use /puppet agents, then /puppet bind."
 PROMPT_DELIVERED_REACTION = "\N{WHITE HEAVY CHECK MARK}"
 MAX_SKILL_AUTOCOMPLETE_CHOICES = 25
 POST_RESET_PROMPT_DELAY_SECONDS = 3.0
@@ -398,6 +399,21 @@ class DiscordRuntime:
             return False
 
         binding = self.registry.discord_binding_for_channel(channel_id)
+        discord_message_id = str(getattr(message, "id", "")) or None
+        if not self.registry.claim_discord_inbound_message(
+            channel_id,
+            discord_message_id,
+            binding["root_agent_id"] if binding else None,
+        ):
+            self._log(
+                "info",
+                "discord.inbound.duplicate",
+                "Discord prompt ignored because the Discord message was already claimed.",
+                channel_id=channel_id,
+                guild_id=str(getattr(guild, "id", "")),
+                discord_message_id=discord_message_id,
+            )
+            return True
         if not binding:
             self._log(
                 "info",
@@ -405,10 +421,26 @@ class DiscordRuntime:
                 "Discord prompt ignored because the channel is not bound.",
                 channel_id=channel_id,
                 guild_id=str(getattr(guild, "id", "")),
-                discord_message_id=str(getattr(message, "id", "")) or None,
+                discord_message_id=discord_message_id,
             )
             await message.reply(NOT_BOUND_REPLY)
             return True
+
+        if self.prompt_func is prompt_agent:
+            root = self.registry.maybe_agent(binding["root_agent_id"])
+            if root is None or root["status"] in TERMINAL_STATUSES or not self.tmux.session_exists(root["tmux_session"]):
+                self.registry.unbind_discord_channel(channel_id)
+                self._log(
+                    "warning",
+                    "discord.inbound.stale_binding",
+                    "Discord channel binding pointed at a non-live root orchestrator.",
+                    root_agent_id=binding["root_agent_id"],
+                    channel_id=channel_id,
+                    guild_id=str(getattr(guild, "id", "")),
+                    discord_message_id=discord_message_id,
+                )
+                await message.reply(STALE_BINDING_REPLY)
+                return True
 
         cleaned = _strip_bot_mentions(str(getattr(message, "content", "") or ""), bot_user)
         attachments = list(getattr(message, "attachments", []) or [])
@@ -425,7 +457,7 @@ class DiscordRuntime:
                 "Discord attachment download failed.",
                 root_agent_id=binding["root_agent_id"],
                 channel_id=channel_id,
-                discord_message_id=str(getattr(message, "id", "")) or None,
+                discord_message_id=discord_message_id,
                 error_code=exc.code,
                 error_message=exc.message,
             )
@@ -442,7 +474,7 @@ class DiscordRuntime:
                 "Discord prompt delivery failed.",
                 root_agent_id=binding["root_agent_id"],
                 channel_id=channel_id,
-                discord_message_id=str(getattr(message, "id", "")) or None,
+                discord_message_id=discord_message_id,
                 error_code=exc.code,
                 error_message=exc.message,
             )
@@ -460,7 +492,7 @@ class DiscordRuntime:
                 "Discord prompt delivery failed.",
                 root_agent_id=binding["root_agent_id"],
                 channel_id=channel_id,
-                discord_message_id=str(getattr(message, "id", "")) or None,
+                discord_message_id=discord_message_id,
                 error_message=_short_exception(exc),
             )
             await message.reply(f"{PROMPT_DELIVERY_FAILED_REPLY} {_short_exception(exc)}\n{PROMPT_DELIVERY_FAILED_HINT}")
@@ -474,7 +506,7 @@ class DiscordRuntime:
             root_agent_id=binding["root_agent_id"],
             channel_id=channel_id,
             guild_id=str(getattr(guild, "id", "")),
-            discord_message_id=str(getattr(message, "id", "")) or None,
+            discord_message_id=discord_message_id,
             prompt_length=len(cleaned),
             attachment_count=len(file_paths),
             event_id=event.get("id"),
@@ -570,7 +602,7 @@ class DiscordRuntime:
             return await fetch_channel(channel_id)
 
     async def dispatch_pending_outbound_once(self) -> None:
-        for outbound in self.registry.pending_outbound_human_messages("discord", limit=20):
+        for outbound in self.registry.claim_pending_outbound_human_messages("discord", limit=20):
             try:
                 channel = await self._get_channel(outbound["channel_id"])
                 if channel is None:
