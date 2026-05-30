@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 from dataclasses import replace
 from pathlib import Path
 
@@ -1730,6 +1731,45 @@ def test_validate_discord_config_requires_token_and_guild_id(ctx):
     assert missing_guild.value.code == "discord_guild_required"
     assert "discord.guild_id is required" in missing_guild.value.message
     assert "~/.puppetmaster/config.toml" in missing_guild.value.hint
+
+
+def test_discord_shutdown_signal_is_logged(ctx, monkeypatch):
+    cfg, _reg, _tmux = ctx
+    calls = []
+    monkeypatch.setattr(discord_bot_module, "supervisor_log", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    with pytest.raises(SystemExit) as exc:
+        discord_bot_module._raise_for_shutdown_signal(cfg, signal.SIGTERM, None)
+
+    assert exc.value.code == 143
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[:4] == (cfg, "warning", "discord.bot.signal", "Discord bot received shutdown signal.")
+    assert kwargs == {"signal": signal.SIGTERM, "signal_name": "SIGTERM"}
+
+
+def test_run_discord_bot_logs_crash(ctx, monkeypatch):
+    cfg, _reg, _tmux = ctx
+    cfg = replace(cfg, discord=DiscordConfig(token="secret", guild_id=123))
+    calls = []
+
+    class Bot:
+        def run(self, token: str) -> None:
+            assert token == "secret"
+            raise RuntimeError("gateway disconnected hard")
+
+    monkeypatch.setattr(discord_bot_module, "load_config", lambda: cfg)
+    monkeypatch.setattr(discord_bot_module, "build_discord_bot", lambda config: Bot())
+    monkeypatch.setattr(discord_bot_module, "supervisor_log", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    with pytest.raises(RuntimeError, match="gateway disconnected hard"):
+        discord_bot_module.run_discord_bot()
+
+    events = [args[2] for args, _kwargs in calls]
+    assert events == ["discord.bot.starting", "discord.bot.crashed"]
+    crash_args, crash_kwargs = calls[-1]
+    assert crash_args[:4] == (cfg, "error", "discord.bot.crashed", "Discord bot crashed.")
+    assert crash_kwargs == {"exception_type": "RuntimeError", "error": "gateway disconnected hard"}
 
 
 def test_build_discord_bot_reports_missing_guild_access(ctx, monkeypatch):

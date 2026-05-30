@@ -211,6 +211,8 @@ puppet discord stop
 ```
 
 For foreground debugging, use `puppet discord serve`.
+Discord bot starts, shutdown signals, clean stops, and unhandled crashes are recorded in `~/.puppetmaster/puppetmaster.log.jsonl`;
+foreground/background stdout and stderr go to `~/.puppetmaster/discord-bot.log` for background runs.
 
 Start one or more root orchestrators, then bind each Discord text channel to the root it should control:
 

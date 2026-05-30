@@ -5,6 +5,7 @@ import contextlib
 import io
 import logging
 import re
+import signal
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,31 @@ POST_COMPACT_TASK_PROMPT = (
     "Your context has just been compacted. Use the send message tool to inform the user that you are now ready to receive tasks."
 )
 LOGGER = logging.getLogger(__name__)
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return str(signum)
+
+
+def _raise_for_shutdown_signal(config: Config, signum: int, _frame: object) -> None:
+    signal_name = _signal_name(signum)
+    LOGGER.warning(
+        "Discord bot received shutdown signal %s.",
+        signal_name,
+        extra={"event": "discord.bot.signal", "signal": signum, "signal_name": signal_name},
+    )
+    supervisor_log(
+        config,
+        "warning",
+        "discord.bot.signal",
+        "Discord bot received shutdown signal.",
+        signal=signum,
+        signal_name=signal_name,
+    )
+    raise SystemExit(128 + signum)
 
 
 def _discord_config(config: Config | DiscordConfig) -> DiscordConfig:
@@ -1380,5 +1406,46 @@ def run_discord_bot() -> int:
         typing_timeout_seconds=discord_config.typing_timeout_seconds,
     )
     bot = build_discord_bot(cfg)
-    bot.run(discord_config.token)
-    return 0
+    previous_handlers: dict[signal.Signals, Any] = {}
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, lambda received, frame: _raise_for_shutdown_signal(cfg, received, frame))
+
+    try:
+        bot.run(discord_config.token)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+        LOGGER.info(
+            "Discord bot exiting with code %s.",
+            code,
+            extra={"event": "discord.bot.exiting", "exit_code": code},
+        )
+        supervisor_log(
+            cfg,
+            "info",
+            "discord.bot.exiting",
+            "Discord bot exiting.",
+            exit_code=code,
+        )
+        raise
+    except BaseException as exc:
+        LOGGER.exception(
+            "Discord bot crashed.",
+            extra={"event": "discord.bot.crashed", "exception_type": type(exc).__name__},
+        )
+        supervisor_log(
+            cfg,
+            "error",
+            "discord.bot.crashed",
+            "Discord bot crashed.",
+            exception_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
+    else:
+        LOGGER.info("Discord bot stopped.", extra={"event": "discord.bot.stopped"})
+        supervisor_log(cfg, "info", "discord.bot.stopped", "Discord bot stopped.")
+        return 0
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)

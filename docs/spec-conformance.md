@@ -51,7 +51,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - Discord config exists in global `~/.puppetmaster/config.toml`: `[discord]` in `Config`.
 - Discord state is durable in the active state directory: SQLite stores `discord_channel_bindings`, `discord_skills`, and `outbound_human_messages`, including optional outbound attachment metadata; inbound human uploads are stored under `human_files/`.
 - The bot entrypoint exists: `puppet discord serve`, `run_discord_bot`.
-- Background Discord process management stores `discord-bot.pid` and `discord-bot.log` in the active state directory, rejects duplicate starts for the same state, clears stale PID files on start, and honors `PUPPETMASTER_STATE_DIR` isolation.
+- Background Discord process management stores `discord-bot.pid` and `discord-bot.log` in the active state directory, rejects duplicate starts for the same state, clears stale PID files on start, logs start/stop/signal/crash events to `puppetmaster.log.jsonl`, and honors `PUPPETMASTER_STATE_DIR` isolation.
 - Guild-scoped slash commands exist: `/puppet agents`, `/puppet bind`, `/puppet unbind`, `/puppet status`, `/puppet read`, `/puppet tree`, `/puppet screenshot`, `/puppet compact`, `/puppet clear`, and `/skills`.
 - `/puppet bind` accepts root orchestrators only: `handle_bind_command`.
 - `/puppet screenshot` captures the bound root orchestrator's visible tmux pane and sends a rendered terminal-text PNG attachment.

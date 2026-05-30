@@ -77,6 +77,8 @@ Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset 
 
 The registry is SQLite and stores agents, events, event deliveries, scheduled wakeups, Discord channel bindings, reusable Discord skills, and outbound human messages with optional attachment metadata. Agent artifacts live under the active state directory and include initial prompts, terminal logs, event logs, launch scripts, and generated Codex config. Inbound Discord human uploads also live under the active state directory in `human_files/`.
 
+Discord bot starts, shutdown signals, clean stops, and unhandled crashes are recorded in the supervisor JSONL log at `puppetmaster.log.jsonl`; foreground/background stdout and stderr for background bot runs go to `discord-bot.log`.
+
 Completion is explicit. A Codex turn stopping is not the same as finishing work. Agents should call `complete_agent` with `success`, `failed`, `blocked`, or `cancelled` when their assigned task is actually terminal.
 
 `puppet agent reset` is the global agent reset/nuke command. It kills every live tmux session using the Puppetmaster tmux prefix, clears all agent rows and agent-related events, deliveries, wakeups, Discord channel bindings, and outbound human messages, and preserves logs/artifacts plus reusable Discord skills. Use `--dry-run` to preview.
