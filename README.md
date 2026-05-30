@@ -102,6 +102,17 @@ puppet orchestrator start \
 
 Puppetmaster still gives every managed agent its own generated `CODEX_HOME`; the configured source home is used for Codex config/auth and is inherited by child agents spawned through the root's MCP tools.
 
+To give one root tree its own account pool, pass `--codex-home` multiple times or as a comma-delimited list:
+
+```bash
+puppet orchestrator start \
+  --cwd /home/kek/Projects/project-a \
+  --codex-home /path/to/codex-a,/path/to/codex-b \
+  --prompt "Manage project A."
+```
+
+The root-scoped pool is stored with the root orchestrator in SQLite. Future child agents spawned by that root use the stored pool even if the global config or another root's pool differs.
+
 To rotate agents across multiple Codex accounts, configure a pool in `~/.puppetmaster/config.toml`:
 
 ```toml
@@ -109,7 +120,7 @@ To rotate agents across multiple Codex accounts, configure a pool in `~/.puppetm
 home_pool = ["/path/to/codex-a", "/path/to/codex-b"]
 ```
 
-When `home_pool` is set, Puppetmaster chooses the next source Codex home for each newly spawned agent, including roots and MCP-spawned children, and wraps back to the first entry after the end of the list. Explicit root startup overrides such as `puppet orchestrator start --codex-home` or shell `CODEX_HOME=...` use that one source home for the root tree instead of the pool.
+When `home_pool` is set, Puppetmaster chooses the next source Codex home for each newly spawned agent and wraps back to the first entry after the end of the list. Each root records the active pool at startup, so MCP-spawned children keep using that root's pool. A single explicit `puppet orchestrator start --codex-home` or shell `CODEX_HOME=...` uses one source home for the root tree instead of a pool.
 
 When you run from the project directory, `--cwd` is optional and defaults to the current directory:
 
@@ -374,7 +385,7 @@ By default Puppetmaster writes state in `~/.puppetmaster/`:
 ~/.puppetmaster/agents/<agent-id>/codex-config/
 ```
 
-Each generated `codex-config/config.toml` starts from the selected source Codex home and overlays the per-agent hooks, project trust, and Puppetmaster MCP server settings. The source defaults to `~/.codex`, can be set globally with `[codex].home` in `~/.puppetmaster/config.toml`, can be rotated with `[codex].home_pool`, can be overridden for a root tree with `puppet orchestrator start --codex-home`, and honors `CODEX_HOME` when starting a root from the shell. Runtime `CODEX_HOME` is still per-agent so Puppetmaster can avoid mutating your global Codex config while giving each managed session its own hook trust and runtime state.
+Each generated `codex-config/config.toml` starts from the selected source Codex home and overlays the per-agent hooks, project trust, and Puppetmaster MCP server settings. The source defaults to `~/.codex`, can be set globally with `[codex].home` in `~/.puppetmaster/config.toml`, can be rotated with `[codex].home_pool`, can be overridden for a root tree with one or more `puppet orchestrator start --codex-home` values, and honors `CODEX_HOME` when starting a root from the shell. Runtime `CODEX_HOME` is still per-agent so Puppetmaster can avoid mutating your global Codex config while giving each managed session its own hook trust and runtime state.
 
 Override the state directory with `PUPPETMASTER_STATE_DIR` when you want an isolated registry, config, logs, and Discord PID file:
 

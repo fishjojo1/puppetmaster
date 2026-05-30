@@ -1051,6 +1051,8 @@ def test_codex_home_pool_rotates_across_spawned_agents(ctx, tmp_path, monkeypatc
     assert root_files["source_codex_home"] == str(pool_a.resolve())
     assert child_files["source_codex_home"] == str(pool_b.resolve())
     assert grandchild_files["source_codex_home"] == str(pool_a.resolve())
+    assert root["metadata"]["codex_home_pool"] == [str(pool_a.resolve()), str(pool_b.resolve())]
+    assert root_files["codex_home_pool"] == [str(pool_a.resolve()), str(pool_b.resolve())]
     assert root_config["model"] == "gpt-a"
     assert child_config["model"] == "gpt-b"
     assert child_config["mcp_servers"]["puppetmaster"]["env"]["PUPPETMASTER_CODEX_HOME"] == str(pool_b.resolve())
@@ -1061,6 +1063,54 @@ def test_codex_home_pool_rotates_across_spawned_agents(ctx, tmp_path, monkeypatc
     assert (child_generated_home / "auth.json").resolve() == pool_b.resolve() / "auth.json"
     assert f"export PUPPETMASTER_CODEX_HOME={str(pool_b.resolve())!r}" in child_launch
     assert "PUPPETMASTER_CODEX_HOME_POOL" in child_launch
+
+
+def test_root_scoped_codex_home_pool_controls_descendants(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    pool_a = tmp_path / "codex-a"
+    pool_b = tmp_path / "codex-b"
+    other_a = tmp_path / "other-a"
+    other_b = tmp_path / "other-b"
+    for path, model in [(pool_a, "gpt-a"), (pool_b, "gpt-b"), (other_a, "gpt-other-a"), (other_b, "gpt-other-b")]:
+        path.mkdir()
+        (path / "config.toml").write_text(f'model = "{model}"\n', encoding="utf-8")
+    monkeypatch.setattr(services, "discover_codex", lambda: {"path": "/usr/bin/codex", "version": "test"})
+    monkeypatch.setattr(services.time, "sleep", lambda seconds: None)
+
+    class FakeTmux:
+        def create_session(self, _session, _cwd, _command):
+            return None
+
+        def pipe_pane(self, _session, _log_path):
+            return None
+
+        def send_prompt(self, _session, _prompt):
+            return None
+
+    root = start_orchestrator(
+        cfg,
+        reg,
+        FakeTmux(),
+        cwd=str(tmp_path),
+        prompt="Manage this project.",
+        codex_home_pool=[str(pool_a), str(pool_b)],
+    )
+    changed_cfg = cfg.with_codex_home_pool([str(other_a), str(other_b)])
+    child = services.create_codex_agent(
+        changed_cfg,
+        reg,
+        FakeTmux(),
+        cwd=str(tmp_path),
+        description="child",
+        prompt="child",
+        parent_id=root["id"],
+    )
+
+    child_files = child["metadata"]["generated_files"]
+    child_config = tomllib.loads(Path(child_files["config"]).read_text(encoding="utf-8"))
+    assert child_files["source_codex_home"] == str(pool_b.resolve())
+    assert child_config["model"] == "gpt-b"
+    assert child["metadata"]["codex_home_pool"] == [str(pool_a.resolve()), str(pool_b.resolve())]
 
 
 def test_validate_agent_id_accepts_safe_ids_and_rejects_unsafe_ids():
@@ -1187,7 +1237,7 @@ def test_orchestrator_start_defaults_cwd_to_current_directory(tmp_path, monkeypa
     def fake_build_context():
         return object(), object(), FakeTmux()
 
-    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal, codex_home_pool=None):
         calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id, "goal": goal})
         return {"id": "agt_test", "tmux_session": "puppet_agt_test"}
 
@@ -1224,7 +1274,7 @@ def test_orchestrator_start_passes_goal_flag_from_cli(tmp_path, monkeypatch, cap
     def fake_build_context():
         return object(), object(), FakeTmux()
 
-    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal, codex_home_pool=None):
         calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id, "goal": goal})
         return {"id": "agt_test", "tmux_session": "puppet_agt_test"}
 
@@ -1271,7 +1321,7 @@ def test_orchestrator_start_applies_codex_home_from_cli(tmp_path, monkeypatch, c
     def fake_build_context():
         return FakeConfig(), object(), FakeTmux()
 
-    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal, codex_home_pool=None):
         calls.update(
             {
                 "cfg": cfg,
@@ -1296,6 +1346,61 @@ def test_orchestrator_start_applies_codex_home_from_cli(tmp_path, monkeypatch, c
     assert output["agent"]["id"] == "agt_test"
 
 
+def test_orchestrator_start_accepts_codex_home_pool_from_cli(tmp_path, monkeypatch, capsys):
+    work = tmp_path / "project"
+    source_a = tmp_path / "codex-a"
+    source_b = tmp_path / "codex-b"
+    source_c = tmp_path / "codex-c"
+    work.mkdir()
+    source_a.mkdir()
+    source_b.mkdir()
+    source_c.mkdir()
+    monkeypatch.chdir(work)
+    parser = cli_module.build_parser()
+    args = parser.parse_args(
+        [
+            "orchestrator",
+            "start",
+            "--codex-home",
+            f"{source_a},{source_b}",
+            "--codex-home",
+            str(source_c),
+            "--prompt",
+            "Manage this project.",
+            "--json",
+        ]
+    )
+    calls = {}
+
+    class FakeConfig:
+        def with_codex_home_pool(self, values):
+            calls["codex_home_pool_config"] = values
+            return "configured-cfg"
+
+    class FakeTmux:
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    def fake_build_context():
+        return FakeConfig(), object(), FakeTmux()
+
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal, codex_home_pool=None):
+        calls.update({"cfg": cfg, "codex_home_pool": codex_home_pool, "cwd": cwd, "prompt": prompt})
+        return {"id": "agt_test", "tmux_session": "puppet_agt_test"}
+
+    monkeypatch.setattr(cli_module, "build_context", fake_build_context)
+    monkeypatch.setattr(cli_module, "start_orchestrator", fake_start_orchestrator)
+
+    assert args.func(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    expected = [str(source_a), str(source_b), str(source_c)]
+    assert calls["codex_home_pool_config"] == expected
+    assert calls["codex_home_pool"] == expected
+    assert calls["cfg"] == "configured-cfg"
+    assert output["agent"]["id"] == "agt_test"
+
+
 def test_orchestrator_start_passes_custom_agent_id_from_cli(tmp_path, monkeypatch, capsys):
     work = tmp_path / "project"
     work.mkdir()
@@ -1311,7 +1416,7 @@ def test_orchestrator_start_passes_custom_agent_id_from_cli(tmp_path, monkeypatc
     def fake_build_context():
         return object(), object(), FakeTmux()
 
-    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal):
+    def fake_start_orchestrator(cfg, reg, tmux, *, cwd, prompt, name, new_root, agent_id, goal, codex_home_pool=None):
         calls.update({"cwd": cwd, "prompt": prompt, "name": name, "new_root": new_root, "agent_id": agent_id, "goal": goal})
         return {"id": agent_id, "root_id": agent_id, "tmux_session": f"puppet_{agent_id}"}
 

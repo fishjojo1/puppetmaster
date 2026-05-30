@@ -118,6 +118,18 @@ def read_prompt(args: argparse.Namespace) -> str:
     raise PuppetError("prompt_required", "prompt is required", "Pass --prompt or --prompt-file.")
 
 
+def parse_codex_home_args(values: list[str] | None) -> list[str]:
+    homes: list[str] = []
+    for value in values or []:
+        parts = str(value).split(",")
+        for part in parts:
+            text = part.strip()
+            if not text:
+                raise PuppetError("invalid_config", "--codex-home entries must be non-empty paths.")
+            homes.append(text)
+    return homes
+
+
 def add_json(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Render machine-readable JSON.")
 
@@ -401,9 +413,13 @@ def cmd_agent_cleanup_completed(args: argparse.Namespace) -> int:
 
 def cmd_orchestrator_start(args: argparse.Namespace) -> int:
     cfg, reg, tmux = build_context()
-    codex_home = getattr(args, "codex_home", None)
-    if codex_home:
-        cfg = cfg.with_codex_home(codex_home)
+    codex_homes = parse_codex_home_args(getattr(args, "codex_home", None))
+    codex_home_pool = None
+    if len(codex_homes) == 1:
+        cfg = cfg.with_codex_home(codex_homes[0])
+    elif len(codex_homes) > 1:
+        cfg = cfg.with_codex_home_pool(codex_homes)
+        codex_home_pool = codex_homes
     cwd = args.cwd or str(Path.cwd())
     agent = start_orchestrator(
         cfg,
@@ -415,6 +431,7 @@ def cmd_orchestrator_start(args: argparse.Namespace) -> int:
         new_root=args.new_root,
         agent_id=args.agent_id,
         goal=args.goal,
+        codex_home_pool=codex_home_pool,
     )
     emit({"agent": agent, "attach_command": tmux.attach_command(agent["tmux_session"])}, args.json)
     return 0
@@ -728,7 +745,14 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--prompt-file")
     start.add_argument("--name", default="root")
     start.add_argument("--agent-id", help="Use this exact safe id for the new root orchestrator.")
-    start.add_argument("--codex-home", help="Source CODEX_HOME for Codex config and auth inherited by this root tree.")
+    start.add_argument(
+        "--codex-home",
+        action="append",
+        help=(
+            "Source CODEX_HOME for Codex config/auth. Pass once for a fixed root tree home, "
+            "or pass multiple times/comma-delimited paths to set a root-scoped account pool."
+        ),
+    )
     start.add_argument("--goal", action="store_true", help="Start the orchestrator in Codex goal mode by prepending /goal to the initial prompt.")
     start.add_argument("--new-root", action="store_true", help="Deprecated compatibility flag; start always creates a root.")
     add_json(start)

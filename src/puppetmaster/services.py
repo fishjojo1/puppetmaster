@@ -13,7 +13,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import Config, codex_home_pool_env_value, inherited_pythonpath, puppetmaster_subprocess_env
+from .config import (
+    Config,
+    codex_home_pool_env_value,
+    inherited_pythonpath,
+    puppetmaster_subprocess_env,
+    resolve_codex_home_pool,
+)
 from .errors import PuppetError, require
 from .logging import log
 from .model import COMPLETION_STATUSES, TERMINAL_STATUSES, json_dumps, new_id, now, validate_cwd
@@ -1007,10 +1013,23 @@ def user_codex_config(codex_home: Path) -> dict[str, Any]:
         ) from exc
 
 
-def source_codex_home_for_spawn(config: Config, spawn_index: int) -> Path:
-    if config.codex_home_pool:
-        return config.codex_home_pool[spawn_index % len(config.codex_home_pool)]
+def source_codex_home_for_spawn(config: Config, spawn_index: int, pool: tuple[Path, ...] | None = None) -> Path:
+    active_pool = config.codex_home_pool if pool is None else pool
+    if active_pool:
+        return active_pool[spawn_index % len(active_pool)]
     return config.codex_home
+
+
+def agent_codex_home_pool(agent: dict[str, Any]) -> tuple[Path, ...]:
+    raw = agent_metadata(agent).get("codex_home_pool", [])
+    if not raw:
+        return ()
+    return resolve_codex_home_pool(raw)
+
+
+def root_codex_home_pool(config: Config, registry: Registry, root_id: str) -> tuple[Path, ...]:
+    root = registry.get_agent(root_id)
+    return agent_codex_home_pool(root) or config.codex_home_pool
 
 
 def write_codex_files(
@@ -1019,6 +1038,7 @@ def write_codex_files(
     user_prompt: str,
     orchestrator: bool = False,
     source_codex_home: Path | None = None,
+    codex_home_pool: tuple[Path, ...] | None = None,
 ) -> dict[str, str]:
     directory = agent_dir(config, agent["id"])
     codex_home = directory / "codex-config"
@@ -1046,8 +1066,9 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         "PUPPETMASTER_CONFIG_DIR": str(codex_home),
         "PUPPETMASTER_ROLE": agent["role"],
     }
-    if config.codex_home_pool:
-        env["PUPPETMASTER_CODEX_HOME_POOL"] = codex_home_pool_env_value(config.codex_home_pool)
+    active_pool = config.codex_home_pool if codex_home_pool is None else codex_home_pool
+    if active_pool:
+        env["PUPPETMASTER_CODEX_HOME_POOL"] = codex_home_pool_env_value(active_pool)
     pythonpath = inherited_pythonpath()
     if pythonpath is not None:
         env["PYTHONPATH"] = pythonpath
@@ -1107,8 +1128,8 @@ exec {sys.executable} -m puppetmaster.cli hook {hook_command} --agent-id "${{PUP
         flags.insert(1, "--dangerously-bypass-approvals-and-sandbox")
     pythonpath_export = f"export PYTHONPATH={pythonpath!r}\n" if pythonpath is not None else ""
     pool_export = (
-        f"export PUPPETMASTER_CODEX_HOME_POOL={codex_home_pool_env_value(config.codex_home_pool)!r}\n"
-        if config.codex_home_pool
+        f"export PUPPETMASTER_CODEX_HOME_POOL={codex_home_pool_env_value(active_pool)!r}\n"
+        if active_pool
         else ""
     )
     launch.write_text(
@@ -1136,6 +1157,7 @@ exec {codex!r} {' '.join(shlex_quote(flag) for flag in flags)}
         "hook": str(stop_hook),
         "codex_home": str(codex_home),
         "source_codex_home": str(source_home),
+        "codex_home_pool": [str(path) for path in active_pool],
     }
 
 
@@ -1172,14 +1194,25 @@ def create_codex_agent(
     role: str = "subagent",
     metadata: dict[str, Any] | None = None,
     agent_id: str | None = None,
+    codex_home_pool: list[str | os.PathLike[str]] | tuple[str | os.PathLike[str], ...] | None = None,
 ) -> dict[str, Any]:
     parent = registry.maybe_agent(parent_id) if parent_id else None
     enforce_create_limits(config, registry, parent)
     if agent_id is not None:
         ensure_agent_id_available(config, registry, tmux, agent_id)
     discover_codex()
-    spawn_index = registry.count_agents()
-    source_codex_home = source_codex_home_for_spawn(config, spawn_index)
+    if parent:
+        effective_pool = root_codex_home_pool(config, registry, parent["root_id"])
+        spawn_index = len(registry.list_agents(root_id=parent["root_id"]))
+    else:
+        effective_pool = resolve_codex_home_pool(list(codex_home_pool)) if codex_home_pool is not None else config.codex_home_pool
+        spawn_index = 0 if codex_home_pool is not None else registry.count_agents()
+    source_codex_home = source_codex_home_for_spawn(config, spawn_index, effective_pool)
+    base_metadata = {
+        "runtime": "codex",
+        "codex_home_pool": [str(path) for path in effective_pool],
+        **(metadata or {}),
+    }
     agent = create_agent_record(
         config,
         registry,
@@ -1189,7 +1222,7 @@ def create_codex_agent(
         parent_id=parent_id,
         root_id=parent["root_id"] if parent else None,
         name=name,
-        metadata={"runtime": "codex", **(metadata or {})},
+        metadata=base_metadata,
         agent_id=agent_id,
     )
     files = write_codex_files(
@@ -1198,6 +1231,7 @@ def create_codex_agent(
         prompt,
         orchestrator=role == "orchestrator",
         source_codex_home=source_codex_home,
+        codex_home_pool=effective_pool,
     )
     agent = registry.update_agent(
         agent["id"],
@@ -1230,8 +1264,11 @@ def start_orchestrator(
     agent_id: str | None = None,
     goal: bool = False,
     codex_home: str | os.PathLike[str] | None = None,
+    codex_home_pool: list[str | os.PathLike[str]] | tuple[str | os.PathLike[str], ...] | None = None,
 ) -> dict[str, Any]:
     config = config.with_codex_home(codex_home) if codex_home is not None else config
+    if codex_home_pool is not None:
+        config = config.with_codex_home_pool(list(codex_home_pool))
     task = f"/goal {prompt.strip()}" if goal and prompt.strip() else prompt
     return create_codex_agent(
         config,
@@ -1244,6 +1281,7 @@ def start_orchestrator(
         name=name,
         role="orchestrator",
         agent_id=agent_id,
+        codex_home_pool=codex_home_pool,
     )
 
 
