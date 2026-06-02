@@ -34,7 +34,7 @@ Managed Codex sessions intentionally run with broad local permissions and genera
 - `src/puppetmaster/native_screenshot.py`: optional native screenshot backends with terminal rendering fallback.
 - `tests/`: pytest coverage for core state, CLI, MCP tools, Discord behavior, tmux helpers, screenshots, terminal image rendering, and TUI helpers.
 - `milestones/`: implementation briefs and validation notes for completed design slices.
-- `skills/`: reusable prompt templates for Puppetmaster orchestrators or Discord `/skills` entries.
+- `skills/`: reusable prompt templates for Puppetmaster orchestrators and built-in `subagent-*.md` MCP skill entries. The ABBA IoT bug bounty workflow uses `abba-iot-bugbounty-orchestrator.md` plus the `subagent-abba-*` skill family.
 - `docs/spec-conformance.md`: checklist mapping v1 requirements to implementation artifacts.
 - `scripts/release-validate.sh`: local release validation script.
 
@@ -62,6 +62,8 @@ Managed agents receive an MCP server named `puppetmaster` with tools for listing
 Generated root orchestrator prompts instruct roots to always use `send_human_message` for human-facing answers, status updates, readiness notices, blockers, and regular progress updates during longer work. They also instruct roots to call `list_subagent_skills()` before role-specific delegation when useful, pass `create_agent(skill="subagent-...")` for matching templates, and call `kill_agent(agent_id)` after consuming final child output when a child is complete or no longer useful, so child tmux sessions and Codex processes do not accumulate. Generated child prompts instruct children to report through completion/blocker status or their parent/root instead of contacting the human directly.
 
 Generated managed-agent prompts place Puppetmaster runtime/tool instructions before the user task. The user task is appended at the bottom under a literal `USER INSTRUCTIONS` heading so task-specific instructions have the final prompt position.
+
+Built-in subagent skill templates are discovered from `skills/subagent-*.md` and must include YAML frontmatter `description`. Root workflow prompts in `skills/`, such as `project-orchestrator.md`, `vuln-research-orchestrator.md`, and `abba-iot-bugbounty-orchestrator.md`, are not returned by `list_subagent_skills` because they are orchestrator prompts rather than child-agent roles.
 
 Discord slash commands are guild-scoped. Channel bindings are the routing layer: one channel binds to one root orchestrator, and one root orchestrator binds to one channel.
 

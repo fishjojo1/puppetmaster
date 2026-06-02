@@ -357,6 +357,24 @@ send_human_message  # root orchestrators only
 
 `list_subagent_skills` returns built-in subagent skill templates discovered from `skills/subagent-*.md`, using each file's YAML frontmatter `description`. `create_agent` accepts an optional `skill` name from that list; when provided, Puppetmaster prepends the skill instructions to the child agent's initial prompt and records the selected skill in agent metadata.
 
+Built-in workflow prompts also live in `skills/`. Root/orchestrator prompts are ordinary Markdown files, while child prompts must be named `subagent-*.md` to appear in `list_subagent_skills`. The ABBA IoT bug bounty workflow is provided by `skills/abba-iot-bugbounty-orchestrator.md` plus these child skill ids:
+
+```text
+subagent-abba-researcher
+subagent-abba-recon-scoper
+subagent-abba-binary-analyst
+subagent-abba-scoper
+subagent-abba-scope-dedup
+subagent-abba-scope-ranker
+subagent-abba-exploitation
+subagent-abba-exploit-dedup
+subagent-abba-exploit-ranker
+subagent-abba-exploit-merger
+subagent-abba-escalation
+subagent-abba-triage
+subagent-abba-reporter
+```
+
 `create_agent` can start a child in goal mode with `goal: true`. `goal` is an optional boolean; when true, Puppetmaster prepends literal `/goal ` to the start of the child agent's initial `prompt`. Codex goal mode lets the child work continuously with auto-compaction until the goal reaches a terminal state, which is useful for substantial delegated goals with well-defined success criteria such as implementation, validation, audit, or research work. Avoid goal mode for vague exploration, small one-shot questions, or tasks that need frequent human steering. `create_agent` always requires an explicit absolute `cwd` and a `prompt`; v1 does not default to the caller's cwd and does not create worktrees.
 
 `puppet orchestrator start --goal` applies the same literal `/goal ` prefix to the root orchestrator's initial prompt.

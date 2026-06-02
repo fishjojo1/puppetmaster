@@ -2475,12 +2475,19 @@ def test_mcp_list_subagent_skills_returns_frontmatter_descriptions():
     assert names == sorted(names)
     assert "project-orchestrator" not in names
     assert "subagent-bugbounty-triage" in names
+    assert "subagent-abba-researcher" in names
+    assert "subagent-abba-binary-analyst" in names
+    assert "subagent-abba-exploitation" in names
+    assert "subagent-abba-triage" in names
+    assert "subagent-abba-reporter" in names
     assert "subagent-researcher" in names
     assert "subagent-milestone-executor" in names
     assert "subagent-vuln-recon" in names
     assert "subagent-vuln-exploitation" in names
     assert "subagent-vuln-verifier" in names
     assert descriptions["subagent-bugbounty-triage"].startswith("Triage bug bounty reports")
+    assert descriptions["subagent-abba-exploitation"].startswith("Validate one selected ABBA IoT scope")
+    assert descriptions["subagent-abba-triage"].startswith("Evaluate ABBA IoT exploit")
     assert descriptions["subagent-researcher"].startswith("Research requirements")
     assert descriptions["subagent-vuln-exploitation"].startswith("Prove or disprove exploitability")
     assert all(descriptions[name] for name in names)
