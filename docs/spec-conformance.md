@@ -53,7 +53,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - The bot entrypoint exists: `puppet discord serve`, `run_discord_bot`.
 - Background Discord process management stores `discord-bot.pid` and `discord-bot.log` in the active state directory, rejects duplicate starts for the same state, clears stale PID files on start, logs start/stop/signal/crash events to `puppetmaster.log.jsonl`, and honors `PUPPETMASTER_STATE_DIR` isolation.
 - Guild-scoped slash commands exist: `/puppet agents`, `/puppet bind`, `/puppet unbind`, `/puppet status`, `/puppet read`, `/puppet tree`, `/puppet screenshot`, `/puppet compact`, `/puppet clear`, and `/skills`.
-- `/puppet bind` accepts root orchestrators only: `handle_bind_command`.
+- `/puppet bind` accepts live root orchestrators only and rejects terminal root records: `handle_bind_command`.
 - `/puppet screenshot` captures the bound root orchestrator's visible tmux pane and sends a rendered terminal-text PNG attachment.
 - Channel binding is the global routing layer: one channel maps to one root, one root maps to one channel, and two channels can drive two different roots in one registry.
 - Mention/reply-only inbound prompt routing exists: `DiscordRuntime.handle_message`.

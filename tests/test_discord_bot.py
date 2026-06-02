@@ -1108,6 +1108,19 @@ def test_bind_rejects_missing_agents(ctx):
     assert exc.value.code == "not_found"
 
 
+def test_bind_rejects_terminal_root_orchestrators(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.update_agent(root["id"], status="completed", completion_status="success")
+
+    with pytest.raises(PuppetError) as exc:
+        handle_bind_command(reg, FakeTextChannel(), root["id"])
+
+    assert exc.value.code == "invalid_agent"
+    assert "no longer live" in exc.value.message
+    assert reg.discord_binding_for_channel("channel-1") is None
+
+
 def test_bind_rejects_non_text_channels(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")

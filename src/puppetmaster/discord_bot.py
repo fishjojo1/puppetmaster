@@ -873,6 +873,12 @@ def _require_root_orchestrator(registry: Registry, agent_id: str) -> dict[str, A
             f"agent is not a root orchestrator: {agent_id}",
             "/puppet bind accepts root orchestrator ids only.",
         )
+    if agent["status"] in TERMINAL_STATUSES:
+        raise PuppetError(
+            "invalid_agent",
+            f"root orchestrator is no longer live: {agent_id}",
+            "Start a new root orchestrator, then bind that live root.",
+        )
     return agent
 
 
