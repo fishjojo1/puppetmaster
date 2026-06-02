@@ -678,6 +678,33 @@ def test_inbound_prompt_delivery_failure_creates_visible_reply(ctx, tmp_path):
     assert "/puppet status or /puppet read" in message.replies[0]
 
 
+def test_inbound_message_reaches_completed_root_with_live_tmux(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.update_agent(root["id"], status="completed", completion_status="success")
+    reg.bind_discord_channel("456", root["id"], "123")
+    bot_user = FakeDiscordUser("999")
+    tmux = FakeTmux(live=True)
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux)
+        message = FakeDiscordMessage("<@999> hello", mentions=[bot_user])
+        try:
+            handled = await runtime.handle_message(message, bot_user)
+        finally:
+            await runtime.close()
+        return handled, message
+
+    handled, message = asyncio.run(run())
+
+    assert handled is True
+    assert message.replies == []
+    assert message.reactions == [PROMPT_DELIVERED_REACTION]
+    assert tmux.sent_prompts == [(root["tmux_session"], f"{DISCORD_PROMPT_PREFIX}hello")]
+    assert reg.get_agent(root["id"])["status"] == "running"
+    assert reg.discord_binding_for_channel("456")["root_agent_id"] == root["id"]
+
+
 def test_two_channel_global_routing_keeps_roots_distinct(ctx, tmp_path):
     cfg, reg, tmux = ctx
     project_a = tmp_path / "project-a"
@@ -1108,17 +1135,28 @@ def test_bind_rejects_missing_agents(ctx):
     assert exc.value.code == "not_found"
 
 
-def test_bind_rejects_terminal_root_orchestrators(ctx, tmp_path):
+def test_bind_rejects_killed_root_orchestrators(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
-    reg.update_agent(root["id"], status="completed", completion_status="success")
+    reg.update_agent(root["id"], status="killed", termination_reason="killed")
 
     with pytest.raises(PuppetError) as exc:
         handle_bind_command(reg, FakeTextChannel(), root["id"])
 
     assert exc.value.code == "invalid_agent"
-    assert "no longer live" in exc.value.message
+    assert "not available" in exc.value.message
     assert reg.discord_binding_for_channel("channel-1") is None
+
+
+def test_bind_allows_completed_root_orchestrators(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.update_agent(root["id"], status="completed", completion_status="success")
+
+    result = handle_bind_command(reg, FakeTextChannel(), root["id"])
+
+    assert result == f"Bound this channel to {root['id']}"
+    assert reg.discord_binding_for_channel("channel-1")["root_agent_id"] == root["id"]
 
 
 def test_bind_rejects_non_text_channels(ctx, tmp_path):

@@ -14,7 +14,7 @@ from typing import Any, Callable
 from .config import Config, DiscordConfig, load_config
 from .errors import PuppetError
 from .logging import log as supervisor_log
-from .model import TERMINAL_STATUSES, now
+from .model import now
 from .native_screenshot import capture_native_screenshot
 from .registry import Registry
 from .services import DISCORD_DEFAULT_ATTACHMENT_LIMIT_BYTES, prompt_agent, prompt_text, read_agent
@@ -454,7 +454,7 @@ class DiscordRuntime:
 
         if self.prompt_func is prompt_agent:
             root = self.registry.maybe_agent(binding["root_agent_id"])
-            if root is None or root["status"] in TERMINAL_STATUSES or not self.tmux.session_exists(root["tmux_session"]):
+            if root is None or not self.tmux.session_exists(root["tmux_session"]):
                 self.registry.unbind_discord_channel(channel_id)
                 self._log(
                     "warning",
@@ -873,10 +873,10 @@ def _require_root_orchestrator(registry: Registry, agent_id: str) -> dict[str, A
             f"agent is not a root orchestrator: {agent_id}",
             "/puppet bind accepts root orchestrator ids only.",
         )
-    if agent["status"] in TERMINAL_STATUSES:
+    if agent["status"] in {"killed", "dead"}:
         raise PuppetError(
             "invalid_agent",
-            f"root orchestrator is no longer live: {agent_id}",
+            f"root orchestrator is not available: {agent_id}",
             "Start a new root orchestrator, then bind that live root.",
         )
     return agent

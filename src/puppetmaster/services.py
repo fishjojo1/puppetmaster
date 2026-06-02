@@ -427,7 +427,7 @@ def prompt_agent(registry: Registry, tmux: Tmux, agent_id: str, prompt: str, sou
         raise PuppetError("invalid_state", f"agent session is not live: {agent_id}", "Use agent read to inspect logs.")
     tmux.send_prompt(agent["tmux_session"], prompt)
     event = registry.append_event(agent_id, "agent.prompted", "Prompt delivered.", {"prompt_length": len(prompt)}, source=source)
-    if agent["status"] in {"idle", "awaiting_input", "unknown"}:
+    if agent["status"] not in {"killed", "dead"}:
         registry.update_agent(agent_id, status="running")
     return event
 

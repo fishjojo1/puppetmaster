@@ -239,7 +239,7 @@ In Discord:
 
 For multi-project use, bind channel A to the project A root and channel B to the project B root. Custom root ids make these bindings stable and easy to type. A channel can have one active root binding, and a root can have one active channel binding. Rebinding a channel changes that channel only; rebinding a root moves that root from its previous channel.
 
-`/puppet bind` accepts only live root orchestrators. If a root has already completed, failed, stopped, or otherwise reached a terminal state, start a new root and bind that new id.
+`/puppet bind` rejects killed or dead root records. A completed root can be rebound and prompted again as long as its tmux session still exists; prompting it marks the agent running again.
 
 Slash commands:
 
