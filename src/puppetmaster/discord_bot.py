@@ -1058,16 +1058,25 @@ def handle_skills_command(
     channel: Any,
     skill_name: str | None = None,
     prompt: str | None = None,
+    extra_prompt: str | None = None,
     forget: bool | None = False,
     view: bool | None = False,
 ) -> str:
     normalized_name = _normalize_skill_name(skill_name)
     prompt_text_value = (prompt or "").strip()
+    extra_prompt_text_value = (extra_prompt or "").strip()
 
     if normalized_name is None:
-        if prompt_text_value or forget or view:
+        if prompt_text_value or extra_prompt_text_value or forget or view:
             raise PuppetError("skill_name_required", "skill-name is required.", "Pass a skill-name to create, run, view, or forget a skill.")
         return _format_skill_list(registry.list_discord_skills())
+
+    if extra_prompt_text_value and (prompt is not None or forget or view):
+        raise PuppetError(
+            "invalid_skill_options",
+            "extra-prompt can only be used when running a saved skill.",
+            "Pass skill-name with extra-prompt and omit prompt, view, and forget.",
+        )
 
     if forget:
         deleted = registry.delete_discord_skill(normalized_name)
@@ -1093,11 +1102,14 @@ def handle_skills_command(
         return _format_skill_detail(skill)
 
     root = _require_bound_root(registry, channel)
+    skill_prompt = skill["prompt"]
+    if extra_prompt_text_value:
+        skill_prompt = f"{skill_prompt}\n\nADDITIONAL USER PROMPT\n{extra_prompt_text_value}"
     prompt_agent(
         registry,
         tmux,
         root["id"],
-        f"{DISCORD_PROMPT_PREFIX}Run Discord skill `{normalized_name}`:\n\n{skill['prompt']}",
+        f"{DISCORD_PROMPT_PREFIX}Run Discord skill `{normalized_name}`:\n\n{skill_prompt}",
         "discord",
     )
     return f"Sent skill to {root['id']}: {normalized_name}"
@@ -1329,6 +1341,7 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
     @app_commands.describe(
         skill_name="Skill name to run, view, create, or forget.",
         prompt="Reusable prompt text. Omit this to run the skill.",
+        extra_prompt="One-off instructions to append when running the skill.",
         view="Show the stored prompt instead of running it.",
         forget="Delete this skill instead of running it.",
     )
@@ -1337,6 +1350,7 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
         interaction: discord.Interaction,
         skill_name: str | None = None,
         prompt: str | None = None,
+        extra_prompt: str | None = None,
         view: bool | None = False,
         forget: bool | None = False,
     ) -> None:
@@ -1349,6 +1363,7 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
             interaction.channel,
             skill_name,
             prompt,
+            extra_prompt,
             forget,
             view,
         )

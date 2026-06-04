@@ -253,14 +253,14 @@ Slash commands:
 /puppet screenshot mode:<optional>
 /puppet compact
 /puppet clear
-/skills skill-name:<optional> prompt:<optional> view:<optional> forget:<optional>
+/skills skill-name:<optional> prompt:<optional> extra-prompt:<optional> view:<optional> forget:<optional>
 ```
 
 After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Inbound user attachments are downloaded into `~/.puppetmaster/human_files/<root-agent-id>/<discord-message-id>/` and the delivered prompt includes a `FILES ATTACHED` block listing the saved local paths. Attachment-only messages are accepted.
 
 `/puppet agents` formats each root id in its own copy-friendly code block so Discord users can copy one id at a time.
 
-`/skills` manages reusable Discord prompts. With no arguments it lists saved skills. The `skill-name` option autocompletes from saved skills. With `skill-name` and `prompt`, it creates or updates a skill. With `skill-name` and `view:true`, it shows the stored prompt without running it. With only `skill-name`, it sends that saved prompt to the channel's bound root orchestrator. With `skill-name` and `forget:true`, it deletes the skill.
+`/skills` manages reusable Discord prompts. With no arguments it lists saved skills. The `skill-name` option autocompletes from saved skills. With `skill-name` and `prompt`, it creates or updates a skill. With `skill-name` and `view:true`, it shows the stored prompt without running it. With only `skill-name`, it sends that saved prompt to the channel's bound root orchestrator. With `skill-name` and `extra-prompt`, it appends one-off instructions when running the saved skill without modifying the saved prompt. With `skill-name` and `forget:true`, it deletes the skill.
 
 `/puppet screenshot` captures the bound root orchestrator's current tmux pane, renders the visible terminal text as a PNG, and posts it as an attachment. The renderer preserves common ANSI colors and handles wide Unicode, emoji, combining marks, variation selectors, and Nerd Font symbols. This default mode is headless and avoids capturing unrelated desktop content.
 

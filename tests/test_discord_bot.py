@@ -1283,6 +1283,53 @@ def test_skills_runs_saved_prompt_against_bound_root(ctx, tmp_path):
     assert event["source"] == "discord"
 
 
+def test_skills_runs_saved_prompt_with_extra_prompt(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    reg.upsert_discord_skill("release-check", "Check release readiness.")
+    tmux = FakeTmux(live=True)
+
+    output = handle_skills_command(
+        reg,
+        tmux,
+        FakeTextChannel(),
+        "release-check",
+        extra_prompt="Focus on the packaging changes only.",
+    )
+
+    assert output == f"Sent skill to {root['id']}: release-check"
+    assert reg.discord_skill("release-check")["prompt"] == "Check release readiness."
+    assert tmux.sent_prompts == [
+        (
+            root["tmux_session"],
+            (
+                f"{DISCORD_PROMPT_PREFIX}Run Discord skill `release-check`:\n\n"
+                "Check release readiness.\n\n"
+                "ADDITIONAL USER PROMPT\n"
+                "Focus on the packaging changes only."
+            ),
+        )
+    ]
+
+
+def test_skills_extra_prompt_only_applies_when_running(ctx):
+    _cfg, reg, _tmux = ctx
+    reg.upsert_discord_skill("review", "Review the diff.")
+
+    with pytest.raises(PuppetError) as exc:
+        handle_skills_command(
+            reg,
+            FakeTmux(),
+            FakeTextChannel(),
+            "review",
+            "Update saved prompt.",
+            extra_prompt="Also run this.",
+        )
+
+    assert exc.value.code == "invalid_skill_options"
+
+
 def test_skills_run_requires_channel_binding(ctx):
     _cfg, reg, _tmux = ctx
     reg.upsert_discord_skill("review", "Review the diff.")
