@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .config import Config
 from .errors import PuppetError
@@ -145,10 +146,19 @@ class Registry:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init()
 
-    def connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            conn.close()
 
     def _init(self) -> None:
         with self.connect() as conn:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import tomllib
 from pathlib import Path
@@ -710,6 +711,31 @@ def test_outbound_human_message_queue_lifecycle(ctx):
     assert failed_after_delivery["status"] == "failed"
     assert failed_after_delivery["delivered_at"] is None
     assert failed_after_delivery["failed_at"] is not None
+
+
+def test_registry_operations_do_not_leak_sqlite_file_descriptors(ctx):
+    cfg, reg, _tmux = ctx
+    proc_fd = Path("/proc") / str(os.getpid()) / "fd"
+    if not proc_fd.exists():
+        pytest.skip("/proc fd inspection is unavailable on this platform")
+
+    def registry_fd_count() -> int:
+        count = 0
+        for fd in proc_fd.iterdir():
+            try:
+                if fd.resolve() == cfg.registry_path:
+                    count += 1
+            except FileNotFoundError:
+                continue
+        return count
+
+    baseline = registry_fd_count()
+    for _ in range(50):
+        reg.pending_outbound_human_messages("discord")
+        reg.claim_pending_outbound_human_messages("discord", limit=20)
+        reg.list_discord_bindings()
+
+    assert registry_fd_count() == baseline
 
 
 def test_registry_migrates_outbound_attachment_columns(tmp_path, monkeypatch):
