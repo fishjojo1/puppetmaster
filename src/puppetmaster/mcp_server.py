@@ -56,6 +56,37 @@ def _is_root_orchestrator(caller: dict[str, Any]) -> bool:
     return caller["role"] == "orchestrator" and caller["id"] == caller["root_id"]
 
 
+def _compact_agent(agent: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": agent["id"],
+        "parent_id": agent.get("parent_id"),
+        "root_id": agent["root_id"],
+        "role": agent["role"],
+        "name": agent.get("name"),
+        "description": agent.get("description"),
+        "status": agent["status"],
+        "completion_status": agent.get("completion_status"),
+        "cwd": agent["cwd"],
+        "depth": agent["depth"],
+        "updated_at": agent.get("updated_at"),
+        "completed_at": agent.get("completed_at"),
+    }
+
+
+def _completion_ack(result: dict[str, Any], summary: str) -> dict[str, Any]:
+    agent = result["agent"]
+    event = result.get("event") or {}
+    return {
+        "ok": True,
+        "agent_id": agent["id"],
+        "status": agent["status"],
+        "completion_status": agent.get("completion_status"),
+        "summary": summary,
+        "event_id": event.get("id"),
+        "injected": result.get("injected", False),
+    }
+
+
 mcp = FastMCP("puppetmaster")
 
 
@@ -150,11 +181,18 @@ def list_subagent_skills() -> dict:
 
 
 @mcp.tool(name="complete_agent")
-def complete_agent_tool(status: str, summary: str, result: str | None = None, files_changed: list[str] | None = None, next_steps: list[str] | None = None) -> dict:
+def complete_agent_tool(
+    status: str,
+    summary: str,
+    result: str | None = None,
+    files_changed: list[str] | None = None,
+    next_steps: list[str] | None = None,
+    verbose: bool = False,
+) -> dict:
     """Report this agent complete, failed, blocked, or cancelled."""
     try:
         cfg, reg, tmux, caller = _context()
-        return complete_agent(
+        completion = complete_agent(
             reg,
             caller["id"],
             status=status,
@@ -166,6 +204,9 @@ def complete_agent_tool(status: str, summary: str, result: str | None = None, fi
             config=cfg,
             tmux=tmux,
         )
+        if verbose:
+            return completion
+        return _completion_ack(completion, summary)
     except PuppetError as exc:
         return _error(exc)
 
@@ -198,25 +239,62 @@ def read_agent_tool(agent_id: str, lines: int = 120, source: str = "auto") -> di
 
 
 @mcp.tool(name="inspect_agent")
-def inspect_agent_tool(agent_id: str) -> dict:
+def inspect_agent_tool(
+    agent_id: str,
+    include_output: bool = False,
+    include_events: bool = False,
+    include_metadata: bool = False,
+    include_children: bool = False,
+    verbose: bool = False,
+) -> dict:
     """Inspect metadata, state, children, events, and recent output for an authorized agent."""
     try:
         cfg, reg, tmux, caller = _context()
         _authorized(reg, caller, agent_id)
-        return inspect_agent(cfg, reg, tmux, agent_id)
+        if verbose:
+            return inspect_agent(cfg, reg, tmux, agent_id)
+
+        agent = reg.get_agent(agent_id)
+        compact_agent = _compact_agent(agent)
+        if include_metadata:
+            compact_agent["metadata"] = agent.get("metadata") or {}
+        response = {
+            "agent": compact_agent,
+            "tmux_session": agent["tmux_session"],
+            "tmux_exists": tmux.session_exists(agent["tmux_session"]),
+            "attach_command": tmux.attach_command(agent["tmux_session"]),
+            "child_count": len(reg.children(agent_id)),
+        }
+        if include_children:
+            response["children"] = [_compact_agent(child) for child in reg.children(agent_id)]
+        if include_events:
+            response["recent_events"] = reg.list_events(agent_id, limit=10)
+            response["pending_deliveries"] = reg.pending_deliveries(agent_id, limit=10)
+        if include_output:
+            response["recent_output"] = read_agent(cfg, reg, tmux, agent_id, cfg.limits.default_log_lines, "auto")
+        return response
     except PuppetError as exc:
         return _error(exc)
 
 
 @mcp.tool()
-def list_agents(root_id: str | None = None, parent_id: str | None = None, status: str | None = None, include_dead: bool = True) -> dict:
+def list_agents(
+    root_id: str | None = None,
+    parent_id: str | None = None,
+    status: str | None = None,
+    include_dead: bool = True,
+    verbose: bool = False,
+) -> dict:
     """List agents visible to the caller."""
     try:
         _cfg, reg, _tmux, caller = _context()
         root = root_id or caller["root_id"]
         if caller["role"] != "orchestrator" and root != caller["root_id"]:
             raise PuppetError("not_authorized", "caller cannot list another root tree")
-        return {"agents": reg.list_agents(root_id=root, parent_id=parent_id, status=status, include_dead=include_dead)}
+        agents = reg.list_agents(root_id=root, parent_id=parent_id, status=status, include_dead=include_dead)
+        if verbose:
+            return {"agents": agents}
+        return {"agents": [_compact_agent(agent) for agent in agents]}
     except PuppetError as exc:
         return _error(exc)
 

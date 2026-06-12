@@ -1707,6 +1707,85 @@ def test_mcp_wait_tool_schedules_for_caller_and_returns_instruction(ctx, tmp_pat
     assert wakeup["reason"] == "backoff"
 
 
+def test_mcp_complete_agent_returns_compact_ack_by_default(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    long_result = "LONG-COMPLETION-RESULT " * 100
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, child))
+
+    result = mcp_server.complete_agent_tool(status="success", summary="done", result=long_result)
+
+    assert result["ok"] is True
+    assert result["agent_id"] == child["id"]
+    assert result["status"] == "completed"
+    assert result["completion_status"] == "success"
+    assert result["summary"] == "done"
+    assert result["event_id"].startswith("evt_")
+    assert "agent" not in result
+    assert "deliveries" not in result
+    assert "LONG-COMPLETION-RESULT" not in json.dumps(result)
+
+
+def test_mcp_complete_agent_verbose_preserves_full_payload(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    long_result = "LONG-COMPLETION-RESULT " * 100
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, child))
+
+    result = mcp_server.complete_agent_tool(status="success", summary="done", result=long_result, verbose=True)
+
+    assert result["agent"]["id"] == child["id"]
+    assert result["agent"]["metadata"]["completion"]["result"] == long_result
+    assert result["event"]["payload"]["result"] == long_result
+
+
+def test_mcp_list_agents_is_compact_by_default(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(
+        cfg,
+        reg,
+        cwd=str(tmp_path),
+        description="root",
+        role="orchestrator",
+        metadata={"secret": "metadata"},
+    )
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    long_result = "LONG-COMPLETION-RESULT " * 100
+    complete_agent(reg, child["id"], status="success", summary="done", result=long_result)
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, root))
+
+    result = mcp_server.list_agents()
+
+    rows = result["agents"]
+    assert [row["id"] for row in rows] == [root["id"], child["id"]]
+    child_row = rows[1]
+    assert child_row["status"] == "completed"
+    assert child_row["completion_status"] == "success"
+    assert "metadata" not in child_row
+    assert "initial_prompt_path" not in child_row
+    assert "log_path" not in child_row
+    assert "events_path" not in child_row
+    assert "LONG-COMPLETION-RESULT" not in json.dumps(result)
+
+
+def test_mcp_list_agents_verbose_preserves_full_rows(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    long_result = "LONG-COMPLETION-RESULT " * 100
+    complete_agent(reg, child["id"], status="success", summary="done", result=long_result)
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, root))
+
+    result = mcp_server.list_agents(verbose=True)
+
+    child_row = result["agents"][1]
+    assert child_row["metadata"]["completion"]["result"] == long_result
+    assert child_row["log_path"]
+    assert "LONG-COMPLETION-RESULT" in json.dumps(result)
+
+
 def test_mcp_send_human_message_returns_queued_result(ctx, tmp_path, monkeypatch):
     cfg, reg, tmux = ctx
     caller = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
@@ -1828,6 +1907,88 @@ def test_mcp_kill_agent_tool_kills_authorized_child_session(ctx, tmp_path, monke
     assert result["termination_reason"] == "killed"
     assert fake.killed == [child["tmux_session"]]
     assert reg.get_agent(child["id"])["status"] == "killed"
+
+
+def test_mcp_inspect_agent_is_compact_by_default(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    create_agent_record(cfg, reg, cwd=str(tmp_path), description="grandchild", parent_id=child["id"])
+    long_result = "LONG-COMPLETION-RESULT " * 100
+    complete_agent(reg, child["id"], status="success", summary="done", result=long_result)
+
+    class FakeTmux:
+        def session_exists(self, session):
+            return True
+
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, FakeTmux(), root))
+
+    result = mcp_server.inspect_agent_tool(child["id"])
+
+    assert result["agent"]["id"] == child["id"]
+    assert result["agent"]["status"] == "completed"
+    assert result["tmux_session"] == child["tmux_session"]
+    assert result["tmux_exists"] is True
+    assert result["child_count"] == 1
+    assert "metadata" not in result["agent"]
+    assert "recent_events" not in result
+    assert "pending_deliveries" not in result
+    assert "recent_output" not in result
+    assert "children" not in result
+    assert "LONG-COMPLETION-RESULT" not in json.dumps(result)
+
+
+def test_mcp_inspect_agent_include_flags_return_requested_details(ctx, tmp_path, monkeypatch):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    grandchild = create_agent_record(cfg, reg, cwd=str(tmp_path), description="grandchild", parent_id=child["id"])
+    long_result = "LONG-COMPLETION-RESULT " * 100
+    complete_agent(reg, child["id"], status="success", summary="done", result=long_result)
+
+    class FakeTmux:
+        def session_exists(self, session):
+            return True
+
+        def attach_command(self, session):
+            return f"tmux attach -t {session}"
+
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, FakeTmux(), root))
+    monkeypatch.setattr(mcp_server, "read_agent", lambda *args, **kwargs: "RECENT OUTPUT")
+
+    result = mcp_server.inspect_agent_tool(
+        child["id"],
+        include_output=True,
+        include_events=True,
+        include_metadata=True,
+        include_children=True,
+    )
+
+    assert result["agent"]["metadata"]["completion"]["result"] == long_result
+    assert result["children"][0]["id"] == grandchild["id"]
+    assert "metadata" not in result["children"][0]
+    assert result["recent_events"][0]["payload"]["result"] == long_result
+    assert result["pending_deliveries"] == []
+    assert result["recent_output"] == "RECENT OUTPUT"
+
+
+def test_mcp_inspect_agent_verbose_preserves_full_payload(ctx, tmp_path, monkeypatch):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    long_result = "LONG-COMPLETION-RESULT " * 100
+    complete_agent(reg, child["id"], status="success", summary="done", result=long_result)
+    monkeypatch.setattr(mcp_server, "_context", lambda: (cfg, reg, tmux, root))
+
+    result = mcp_server.inspect_agent_tool(child["id"], verbose=True)
+
+    assert result["agent"]["metadata"]["completion"]["result"] == long_result
+    assert "recent_events" in result
+    assert "pending_deliveries" in result
+    assert "recent_output" in result
 
 
 def test_fire_wakeup_marks_fired_queues_wait_over_and_is_idempotent(ctx, tmp_path):

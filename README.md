@@ -357,6 +357,8 @@ send_human_message  # root orchestrators only
 
 `list_subagent_skills` returns built-in subagent skill templates discovered from `skills/subagent-*.md`, using each file's YAML frontmatter `description`. `create_agent` accepts an optional `skill` name from that list; when provided, Puppetmaster prepends the skill instructions to the child agent's initial prompt and records the selected skill in agent metadata.
 
+`complete_agent`, `list_agents`, and `inspect_agent` return compact payloads by default to keep managed-agent context usage low. `complete_agent(..., verbose:true)` returns the full service payload including the updated agent, event, and deliveries. `list_agents(..., verbose:true)` returns full registry rows. `inspect_agent` returns identity, status, tmux, and child count by default; pass `include_output`, `include_events`, `include_metadata`, or `include_children` for focused detail, or `verbose:true` for the legacy full inspection payload.
+
 Built-in workflow prompts also live in `skills/`. Root/orchestrator prompts are ordinary Markdown files, while child prompts must be named `subagent-*.md` to appear in `list_subagent_skills`. The ABBA IoT bug bounty workflow is provided by `skills/abba-iot-bugbounty-orchestrator.md` plus these child skill ids:
 
 ```text
