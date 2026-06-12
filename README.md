@@ -168,6 +168,13 @@ puppet agent reset
 
 `agent reset` clears agent registry state, agent events, event deliveries, wakeups, Discord channel bindings, and pending outbound human messages. It preserves logs, generated artifacts, configuration, and reusable skills.
 
+Clear only the SQLite event log and event delivery queue while preserving agents and terminal log files:
+
+```bash
+puppet events clear --dry-run
+puppet events clear
+```
+
 ## Discord Bot
 
 Create or update global state:
@@ -452,6 +459,7 @@ puppet doctor --deep
 puppet debug tmux
 puppet debug registry --json
 puppet events pending <agent-id>
+puppet events clear --dry-run
 puppet wakeup list --json
 puppet wakeup fire-due --json
 ```

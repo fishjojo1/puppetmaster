@@ -456,6 +456,23 @@ def cmd_events_ack(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_events_clear(args: argparse.Namespace) -> int:
+    _cfg, reg, _tmux = build_context()
+    counts = reg.clear_event_log_state(dry_run=args.dry_run)
+    emit(
+        {
+            "dry_run": args.dry_run,
+            "counts": counts,
+            "cleared": [] if args.dry_run else sorted(counts),
+            "would_clear": sorted(counts) if args.dry_run else [],
+            "agents_preserved": True,
+            "terminal_logs_preserved": True,
+        },
+        args.json,
+    )
+    return 0
+
+
 def cmd_hook_stop(args: argparse.Namespace) -> int:
     _cfg, reg, _tmux = build_context()
     handle_stop_hook(reg, args.agent_id, sys.stdin.read())
@@ -887,6 +904,10 @@ def build_parser() -> argparse.ArgumentParser:
     ack.add_argument("delivery_id")
     add_json(ack)
     ack.set_defaults(func=cmd_events_ack)
+    clear = e.add_parser("clear", help="Clear registry event logs and delivery records while preserving agents and terminal logs.")
+    clear.add_argument("--dry-run", action="store_true", help="Preview event log rows without deleting them.")
+    add_json(clear)
+    clear.set_defaults(func=cmd_events_clear)
 
     wakeup = sub.add_parser("wakeup", help="Manage scheduled agent wakeups.")
     w = wakeup.add_subparsers(required=True)

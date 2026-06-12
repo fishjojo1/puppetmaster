@@ -45,7 +45,7 @@ Important CLI groups:
 - `puppet init`
 - `puppet orchestrator start|inspect`
 - `puppet agent create|list|tree|inspect|read|prompt|attach|stop|kill|kill-tree|reset|complete|pause|resume|mark-status|cleanup-completed|cleanup-dead`
-- `puppet events list|pending|ack`
+- `puppet events list|pending|ack|clear`
 - `puppet wakeup fire-due|fire|list|sleep-and-fire`
 - `puppet hook stop|drain-events`
 - `puppet mcp serve`
@@ -86,6 +86,8 @@ Completion is explicit. A Codex turn stopping is not the same as finishing work.
 `puppet agent reset` is the global agent reset/nuke command. It kills every live tmux session using the Puppetmaster tmux prefix, clears all agent rows and agent-related events, deliveries, wakeups, Discord channel bindings, and outbound human messages, and preserves logs/artifacts plus reusable Discord skills. Use `--dry-run` to preview.
 
 Stop hooks and event delivery are central to orchestration. Orchestrator hooks drain pending events, and high-signal state changes are queued to parent/root recipients. Low-signal turn-stop noise is coalesced.
+
+`puppet events clear` clears the SQLite event log and event delivery records while preserving agents, scheduled wakeups, Discord bindings, outbound human messages, reusable skills, and terminal log files. Use `--dry-run` to preview row counts.
 
 `wait` is durable and non-blocking. It records a wakeup, returns immediately, and expects the agent to end its turn until Puppetmaster injects the wait-over prompt.
 

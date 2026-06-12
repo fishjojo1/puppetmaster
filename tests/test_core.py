@@ -2276,6 +2276,57 @@ def test_agent_reset_cli_passes_dry_run(tmp_path, monkeypatch, capsys):
     assert output["would_clear"] == ["agt_root"]
 
 
+def test_clear_event_log_state_clears_events_and_preserves_registry_state(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="child", parent_id=root["id"])
+    event = reg.append_event(child["id"], "agent.test", "queued")
+    reg.queue_delivery(event["id"], root["id"])
+    schedule_wakeup(cfg, reg, child["id"], 10, "test wakeup")
+    reg.bind_discord_channel("channel-1", root["id"], "guild-1")
+    reg.enqueue_outbound_human_message(root["id"], child["id"], "discord", "channel-1", "pending")
+    reg.upsert_discord_skill("keep-me", "Saved prompt.")
+
+    dry_run = reg.clear_event_log_state(dry_run=True)
+
+    assert dry_run == {"event_deliveries": 1, "events": 1}
+    assert len(reg.list_events()) == 1
+    assert len(reg.pending_deliveries(root["id"])) == 1
+
+    result = reg.clear_event_log_state()
+
+    assert result == {"event_deliveries": 1, "events": 1}
+    assert reg.list_events() == []
+    assert reg.pending_deliveries(root["id"]) == []
+    assert {agent["id"] for agent in reg.list_agents()} == {root["id"], child["id"]}
+    assert len(reg.list_wakeups()) == 1
+    assert len(reg.list_discord_bindings()) == 1
+    assert len(reg.pending_outbound_human_messages("discord")) == 1
+    assert [skill["name"] for skill in reg.list_discord_skills()] == ["keep-me"]
+
+
+def test_events_clear_cli_passes_dry_run(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    parser = cli_module.build_parser()
+    args = parser.parse_args(["events", "clear", "--dry-run", "--json"])
+    calls = {}
+
+    class FakeRegistry:
+        def clear_event_log_state(self, *, dry_run=False):
+            calls["dry_run"] = dry_run
+            return {"event_deliveries": 2, "events": 3}
+
+    monkeypatch.setattr(cli_module, "build_context", lambda: ("cfg", FakeRegistry(), "tmux"))
+
+    assert args.func(args) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert calls == {"dry_run": True}
+    assert output["counts"] == {"event_deliveries": 2, "events": 3}
+    assert output["would_clear"] == ["event_deliveries", "events"]
+    assert output["cleared"] == []
+
+
 def test_inject_pending_prompt_does_not_require_idle_status(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")

@@ -315,6 +315,20 @@ class Registry:
             }
         return {key: int(value) for key, value in counts.items()}
 
+    def clear_event_log_state(self, *, dry_run: bool = False) -> dict[str, int]:
+        with self.connect() as conn:
+            if dry_run:
+                counts = {
+                    "event_deliveries": conn.execute("select count(*) from event_deliveries").fetchone()[0],
+                    "events": conn.execute("select count(*) from events").fetchone()[0],
+                }
+            else:
+                counts = {
+                    "event_deliveries": conn.execute("delete from event_deliveries").rowcount,
+                    "events": conn.execute("delete from events").rowcount,
+                }
+        return {key: int(value) for key, value in counts.items()}
+
     def append_event(
         self,
         agent_id: str,
