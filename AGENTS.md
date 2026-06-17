@@ -34,7 +34,7 @@ Managed Codex sessions intentionally run with broad local permissions and genera
 - `src/puppetmaster/native_screenshot.py`: optional native screenshot backends with terminal rendering fallback.
 - `tests/`: pytest coverage for core state, CLI, MCP tools, Discord behavior, tmux helpers, screenshots, terminal image rendering, and TUI helpers.
 - `milestones/`: implementation briefs and validation notes for completed design slices.
-- `skills/`: reusable prompt templates for Puppetmaster orchestrators and built-in `subagent-*.md` MCP skill entries. The ABBA IoT bug bounty workflow uses `abba-iot-bugbounty-orchestrator.md` plus the `subagent-abba-*` skill family.
+- `skills/`: reusable prompt templates for Puppetmaster orchestrators and built-in `subagent-*.md` MCP skill entries. The project workflow uses `project-orchestrator.md` plus the planning/worktree review subagent family. The ABBA IoT bug bounty workflow uses `abba-iot-bugbounty-orchestrator.md` plus the `subagent-abba-*` skill family.
 - `docs/spec-conformance.md`: checklist mapping v1 requirements to implementation artifacts.
 - `scripts/release-validate.sh`: local release validation script.
 
@@ -63,7 +63,7 @@ Generated root orchestrator prompts instruct roots to always use `send_human_mes
 
 Generated managed-agent prompts place Puppetmaster runtime/tool instructions before the user task. The user task is appended at the bottom under a literal `USER INSTRUCTIONS` heading so task-specific instructions have the final prompt position.
 
-Built-in subagent skill templates are discovered from `skills/subagent-*.md` and must include YAML frontmatter `description`. Root workflow prompts in `skills/`, such as `project-orchestrator.md`, `vuln-research-orchestrator.md`, and `abba-iot-bugbounty-orchestrator.md`, are not returned by `list_subagent_skills` because they are orchestrator prompts rather than child-agent roles.
+Built-in subagent skill templates are discovered from `skills/subagent-*.md` and must include YAML frontmatter `description`. Root workflow prompts in `skills/`, such as `project-orchestrator.md`, `vuln-research-orchestrator.md`, and `abba-iot-bugbounty-orchestrator.md`, are not returned by `list_subagent_skills` because they are orchestrator prompts rather than child-agent roles. The project orchestrator workflow is intentionally tied to `planning/` artifacts, sibling git worktrees, and the `subagent-project-*`, `subagent-milestone-*`, `subagent-plan-synthesizer`, `subagent-worktree-*`, and `subagent-code-*` skill family.
 
 Discord slash commands are guild-scoped. Channel bindings are the routing layer: one channel binds to one root orchestrator, and one root orchestrator binds to one channel.
 

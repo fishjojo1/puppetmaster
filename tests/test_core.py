@@ -2718,15 +2718,18 @@ def test_mcp_list_subagent_skills_returns_frontmatter_descriptions():
     assert "subagent-abba-exploitation" in names
     assert "subagent-abba-triage" in names
     assert "subagent-abba-reporter" in names
-    assert "subagent-researcher" in names
-    assert "subagent-milestone-executor" in names
+    assert "subagent-project-conventions" in names
+    assert "subagent-milestone-researcher" in names
+    assert "subagent-worktree-executor" in names
+    assert "subagent-worktree-validator" in names
     assert "subagent-vuln-recon" in names
     assert "subagent-vuln-exploitation" in names
     assert "subagent-vuln-verifier" in names
     assert descriptions["subagent-bugbounty-triage"].startswith("Triage bug bounty reports")
     assert descriptions["subagent-abba-exploitation"].startswith("Validate one selected ABBA IoT scope")
     assert descriptions["subagent-abba-triage"].startswith("Evaluate ABBA IoT exploit")
-    assert descriptions["subagent-researcher"].startswith("Research requirements")
+    assert descriptions["subagent-project-conventions"].startswith("Inspect a spec-driven project")
+    assert descriptions["subagent-worktree-executor"].startswith("Implement one full milestone candidate")
     assert descriptions["subagent-vuln-exploitation"].startswith("Prove or disprove exploitability")
     assert all(descriptions[name] for name in names)
 
@@ -2748,18 +2751,20 @@ def test_mcp_create_agent_prepends_selected_subagent_skill_to_prompt(tmp_path, m
 
     result = mcp_server.create_agent(
         cwd=str(tmp_path),
-        prompt="Fix the validation failure in milestone 003.",
-        skill="subagent-fixer",
+        prompt="Fix the validation failure in milestone 003 candidate A.",
+        skill="subagent-worktree-fixer",
         metadata={"milestone": "003"},
     )
 
     assert result["id"] == "agt_child"
-    assert result["skill"] == "subagent-fixer"
-    assert captured["metadata"] == {"milestone": "003", "skill": "subagent-fixer"}
-    assert captured["description"] == "Fix the validation failure in milestone 003."
-    assert captured["prompt"].startswith("You are being started with Puppetmaster subagent skill `subagent-fixer`.")
-    assert "# Subagent Fixer" in captured["prompt"]
-    assert "Assigned task:\nFix the validation failure in milestone 003." in captured["prompt"]
+    assert result["skill"] == "subagent-worktree-fixer"
+    assert captured["metadata"] == {"milestone": "003", "skill": "subagent-worktree-fixer"}
+    assert captured["description"] == "Fix the validation failure in milestone 003 candidate A."
+    assert captured["prompt"].startswith(
+        "You are being started with Puppetmaster subagent skill `subagent-worktree-fixer`."
+    )
+    assert "# Subagent Worktree Fixer" in captured["prompt"]
+    assert "Assigned task:\nFix the validation failure in milestone 003 candidate A." in captured["prompt"]
 
 
 def test_mcp_create_agent_rejects_unknown_or_non_subagent_skill(tmp_path, monkeypatch):
