@@ -320,9 +320,20 @@ def _format_inbound_user_prompt(cleaned: str, file_paths: list[str]) -> str:
 def _format_inbound_prompt(agent: dict[str, Any], cleaned: str, file_paths: list[str]) -> str:
     if cleaned.startswith(CODEX_GOAL_PREFIX):
         user_prompt = _format_inbound_user_prompt(cleaned[len(CODEX_GOAL_PREFIX) :].strip(), file_paths)
-        return f"{CODEX_GOAL_PREFIX}{prompt_text(agent, user_prompt).strip()}"
+        return _format_goal_prompt(agent, user_prompt)
     user_prompt = _format_inbound_user_prompt(cleaned, file_paths)
     return f"{DISCORD_PROMPT_PREFIX}{user_prompt}"
+
+
+def _format_goal_prompt(agent: dict[str, Any], user_prompt: str) -> str:
+    return f"{CODEX_GOAL_PREFIX}{prompt_text(agent, user_prompt).strip()}"
+
+
+def _format_discord_skill_prompt(agent: dict[str, Any], skill_name: str, skill_prompt: str) -> str:
+    if skill_prompt.startswith(CODEX_GOAL_PREFIX):
+        user_prompt = f"Run Discord skill `{skill_name}`:\n\n{skill_prompt[len(CODEX_GOAL_PREFIX) :].strip()}"
+        return _format_goal_prompt(agent, user_prompt)
+    return f"{DISCORD_PROMPT_PREFIX}Run Discord skill `{skill_name}`:\n\n{skill_prompt}"
 
 
 async def _is_reply_to_bot(message: Any, bot_user: Any) -> bool:
@@ -1132,7 +1143,7 @@ def handle_skills_command(
         registry,
         tmux,
         root["id"],
-        f"{DISCORD_PROMPT_PREFIX}Run Discord skill `{normalized_name}`:\n\n{skill_prompt}",
+        _format_discord_skill_prompt(root, normalized_name, skill_prompt),
         "discord",
     )
     return f"Sent skill to {root['id']}: {normalized_name}"

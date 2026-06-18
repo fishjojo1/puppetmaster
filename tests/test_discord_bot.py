@@ -1394,6 +1394,56 @@ def test_skills_runs_saved_prompt_with_extra_prompt(ctx, tmp_path):
     ]
 
 
+def test_skills_runs_goal_saved_prompt_in_goal_mode(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    reg.upsert_discord_skill("ship-it", "/goal Finish the release validation.")
+    tmux = FakeTmux(live=True)
+
+    output = handle_skills_command(reg, tmux, FakeTextChannel(), "ship-it")
+
+    assert output == f"Sent skill to {root['id']}: ship-it"
+    assert len(tmux.sent_prompts) == 1
+    session, prompt = tmux.sent_prompts[0]
+    assert session == root["tmux_session"]
+    assert prompt.startswith("/goal You are a Puppetmaster-managed Codex agent.")
+    assert DISCORD_PROMPT_PREFIX not in prompt
+    assert "Puppetmaster tools:" in prompt
+    assert "USER INSTRUCTIONS\nRun Discord skill `ship-it`:\n\nFinish the release validation." in prompt
+
+
+def test_skills_runs_goal_saved_prompt_with_extra_prompt_in_goal_mode(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    handle_bind_command(reg, FakeTextChannel(), root["id"])
+    reg.upsert_discord_skill("ship-it", "/goal Finish the release validation.")
+    tmux = FakeTmux(live=True)
+
+    output = handle_skills_command(
+        reg,
+        tmux,
+        FakeTextChannel(),
+        "ship-it",
+        extra_prompt="Focus on Discord goal-mode regressions.",
+    )
+
+    assert output == f"Sent skill to {root['id']}: ship-it"
+    assert reg.discord_skill("ship-it")["prompt"] == "/goal Finish the release validation."
+    assert len(tmux.sent_prompts) == 1
+    session, prompt = tmux.sent_prompts[0]
+    assert session == root["tmux_session"]
+    assert prompt.startswith("/goal You are a Puppetmaster-managed Codex agent.")
+    assert DISCORD_PROMPT_PREFIX not in prompt
+    assert (
+        "USER INSTRUCTIONS\n"
+        "Run Discord skill `ship-it`:\n\n"
+        "Finish the release validation.\n\n"
+        "ADDITIONAL USER PROMPT\n"
+        "Focus on Discord goal-mode regressions."
+    ) in prompt
+
+
 def test_skills_extra_prompt_only_applies_when_running(ctx):
     _cfg, reg, _tmux = ctx
     reg.upsert_discord_skill("review", "Review the diff.")

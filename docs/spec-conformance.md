@@ -59,7 +59,7 @@ This checklist maps the explicit v1 requirements from `spec.md` and the mileston
 - Channel binding is the global routing layer: one channel maps to one root, one root maps to one channel, and two channels can drive two different roots in one registry.
 - Mention/reply-only inbound prompt routing exists: `DiscordRuntime.handle_message`.
 - Inbound Discord prompts use `DISCORD MESSAGE RECEIVED:\n<message>` and include a `FILES ATTACHED` block with saved local paths when the human attached files. Discord messages whose cleaned text starts with `/goal ` bypass that wrapper and are delivered as Codex goal-mode prompts with regenerated Puppetmaster runtime/tool instructions.
-- Reusable Discord skills persist prompt text, `/skills skill-name:<name> view:true` shows the saved prompt, and `/skills skill-name:<name>` sends the saved prompt to the channel's bound root.
+- Reusable Discord skills persist prompt text, `/skills skill-name:<name> view:true` shows the saved prompt, and `/skills skill-name:<name>` sends the saved prompt to the channel's bound root. Saved prompts that start with `/goal ` run as Codex goal-mode prompts with regenerated Puppetmaster runtime/tool instructions.
 - Outbound human replies use frontend-neutral `send_human_message` from root orchestrators and can include one local file attachment within Discord's default upload limit.
 - Outbound Discord dispatch is durable and status-based: pending rows deliver, delivered/failed rows are not selected again.
 - Typing indicators start after inbound prompt delivery and stop on outbound delivery, root turn stop, or timeout.
