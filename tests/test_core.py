@@ -2719,6 +2719,8 @@ def test_mcp_list_subagent_skills_returns_frontmatter_descriptions():
     assert "subagent-abba-triage" in names
     assert "subagent-abba-reporter" in names
     assert "subagent-project-conventions" in names
+    assert "subagent-google-vrp-scope-analyst" in names
+    assert "subagent-google-vrp-qualification-filter" in names
     assert "subagent-milestone-researcher" in names
     assert "subagent-worktree-executor" in names
     assert "subagent-worktree-validator" in names
@@ -2728,6 +2730,7 @@ def test_mcp_list_subagent_skills_returns_frontmatter_descriptions():
     assert descriptions["subagent-bugbounty-triage"].startswith("Triage bug bounty reports")
     assert descriptions["subagent-abba-exploitation"].startswith("Validate one selected ABBA IoT scope")
     assert descriptions["subagent-abba-triage"].startswith("Evaluate ABBA IoT exploit")
+    assert descriptions["subagent-google-vrp-scope-analyst"].startswith("Confirm Google web VRP")
     assert descriptions["subagent-project-conventions"].startswith("Inspect a spec-driven project")
     assert descriptions["subagent-worktree-executor"].startswith("Implement one full milestone candidate")
     assert descriptions["subagent-vuln-exploitation"].startswith("Prove or disprove exploitability")

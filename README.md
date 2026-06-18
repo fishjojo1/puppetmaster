@@ -22,6 +22,7 @@ If you bind Discord to Puppetmaster, the bound Discord channel becomes a remote 
 
 ## Docs
 
+- [Google web VRP official scope rules](docs/google-vrp/official-scope-rules.md): official Google Bug Hunters scope, exclusions, safe-testing constraints, and report-quality notes for web-facing Google VRP prompts.
 - [Google web VRP methodologies](docs/google-vrp/web-methodologies.md): defensive prompt research for safe, high-signal Google web vulnerability-research workflows.
 
 ## Prerequisites
