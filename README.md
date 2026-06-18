@@ -20,6 +20,10 @@ This is powerful and dangerous. Use Puppetmaster only in local workspaces where 
 
 If you bind Discord to Puppetmaster, the bound Discord channel becomes a remote control surface for local Codex sessions running with bypassed approvals and sandbox checks. Keep the bot token in local state, bind only trusted channels, and treat anyone who can post mention/reply prompts in that channel as able to control the local orchestrator.
 
+## Docs
+
+- [Google web VRP methodologies](docs/google-vrp/web-methodologies.md): defensive prompt research for safe, high-signal Google web vulnerability-research workflows.
+
 ## Prerequisites
 
 - Python 3.11+
