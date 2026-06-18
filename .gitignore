@@ -1,5 +1,8 @@
 .venv/
 .puppetmaster/
+# Built-in skill files already tracked under skills/ remain versioned.
+# Ignore local/untracked prompt experiments unless explicitly force-added.
+skills/
 .env
 .env.*
 !.env.example
