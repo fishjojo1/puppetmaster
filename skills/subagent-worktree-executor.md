@@ -31,7 +31,9 @@ If you are not running in the assigned worktree, stop and call `complete_agent(s
 - Use established project patterns, libraries, and tooling.
 - Do not introduce new dependencies unless the final plan calls for them or the repo clearly needs them; document why.
 - Maintain low code volume and remove dead code created during implementation.
-- Update docs/config examples/Makefile/container instructions when required by the plan.
+- Externalize configuration through `.env`, `config.json`, or the project's established config layer. Update `.env.example` when adding environment variables.
+- Update docs/config examples/Makefile or equivalent task commands/container instructions when required by the plan.
+- Keep expensive external API, LLM, paid-service, or slow integration checks short, clearly marked, and excluded from default test runs unless the milestone requires them.
 - If the plan is wrong, document the issue in the relevant planning artifact and stop as blocked unless the correction is small and clearly within scope.
 
 ## Git Rules

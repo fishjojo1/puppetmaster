@@ -20,7 +20,7 @@ Your prompt should specify:
 - `planning/<milestone-id>/FINAL_PLAN/implementation_plan.md`.
 - `planning/<milestone-id>/FINAL_PLAN/validation_plan.md`.
 - Candidate validation report path.
-- Required review report path, such as `planning/<milestone-id>/CANDIDATE_A_REVIEW.md`.
+- Required review report path, such as `planning/<milestone-id>/CANDIDATE_A_REVIEW.md`. If the orchestrator asks for a local `planning/<milestone-id>/REVIEW.md`, also make clear which candidate it belongs to so it can be preserved under a candidate-specific name in the main workspace.
 
 If the candidate cannot be reviewed because required evidence is missing, inspect the repo first. If still missing, call `complete_agent(status="blocked", summary=...)`.
 
@@ -45,10 +45,11 @@ Write the requested review report with:
 
 - Candidate label and commit range reviewed.
 - Rating out of 10.
-- Recommendation: select, select only with fixes, reject, or blocked.
+- Recommendation: merge/select, select only with fixes, do not merge/reject, or blocked.
 - Strengths.
 - Specific bugs, issues, and deficiencies with file references where possible.
 - Security and maintainability concerns.
+- Dead code, unnecessary complexity, missing edge cases, performance concerns, and test gaps.
 - Validation confidence.
 - Required fixes before selection, if any.
 - Useful ideas to preserve even if the candidate is rejected.

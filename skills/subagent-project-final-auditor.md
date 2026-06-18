@@ -26,7 +26,7 @@ Review:
 
 - Every spec requirement and milestone acceptance criterion.
 - Project conventions and whether the implementation follows or intentionally diverges from them.
-- Milestone research, final plans, validation reports, review reports, selection reports, code review reports, and post-merge validation reports.
+- Milestone research, final plans, candidate validation reports, candidate review reports, selection reports, code review reports, optimizer/fixer evidence, and final post-merge validation reports.
 - Current git status and recent commits.
 - Tests, docs, build, lint/typecheck, security-sensitive behavior, local-only artifacts, config/env examples, Makefile/task commands, container documentation, and deployment readiness as relevant.
 
@@ -37,6 +37,7 @@ Review:
 - Search for obvious secrets or local-only artifacts before recommending completion.
 - Confirm each milestone has successful post-merge validation.
 - Confirm rejected worktrees were cleaned up or intentionally retained.
+- Confirm final validation ran after post-merge review and cleanup, not only before candidate selection.
 - Identify deferred scope explicitly.
 
 ## Output

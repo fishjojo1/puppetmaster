@@ -27,7 +27,7 @@ If required evidence is missing, inspect the repo and git history first. If stil
 Find:
 
 - Bugs and behavioral gaps.
-- Dead code, duplicated code, unnecessary abstractions, and avoidable complexity.
+- Bad code, dead code, duplicated logic, unnecessary abstractions, and avoidable complexity.
 - Security and secret-handling issues.
 - Weak tests or missing regression coverage.
 - Performance or resource problems.
@@ -46,7 +46,8 @@ Write `planning/<milestone-id>/CODE-REVIEW.md` with:
 - Findings ordered by severity.
 - File references where possible.
 - Recommended fixes.
-- Dead code or simplification opportunities.
+- Priority of fixes.
+- Dead code, duplicated logic, and simplification opportunities.
 - Security and test gaps.
 - Residual risks.
 

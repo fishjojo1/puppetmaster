@@ -40,22 +40,24 @@ Write these files:
 
 `implementation_plan.md` must include:
 
-- Scope and non-scope.
+- Milestone summary, scope, and non-scope.
 - Acceptance criteria.
 - Proposed design.
-- File/module touchpoints.
-- Data/API/UI/config/migration details.
+- Files to create, modify, and delete.
+- Data structures, database schema changes, migration strategy, function signatures, API routes, request/response shapes, frontend component structure, backend service structure, config changes, error handling, logging, and security considerations.
 - Step-by-step implementation sequence.
 - Test additions or updates.
-- Risks and rollback notes.
+- Risks, tradeoffs, and rollback notes.
 
 `validation_plan.md` must include:
 
+- Validation goals and acceptance criteria.
 - Automated commands to run.
-- Manual API calls or CLI checks when applicable.
+- Unit, integration, migration, container startup, Makefile/task, regression, performance sanity, and configuration checks when applicable.
+- Manual API calls or CLI checks with expected responses when applicable.
 - Playwright/browser checks and screenshot expectations for web UI work.
 - Security checks.
-- Regression checks.
+- Known edge cases.
 - Evidence validators must record.
 - Failure criteria.
 
