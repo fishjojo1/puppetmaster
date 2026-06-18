@@ -94,7 +94,47 @@ Use these subagent skills for the project workflow:
 - `subagent-final-validator`: perform final regression validation after post-merge review and cleanup.
 - `subagent-project-final-auditor`: audit the finished project against all specs, milestones, and validation evidence.
 
-## Workflow
+## Exact Agent Schedule
+
+This workflow is not optional guidance. Unless the human explicitly changes the workflow for a specific project, follow this exact agent schedule.
+
+### Once Per Project
+
+1. Spawn exactly 1 `subagent-project-conventions` agent before any milestone work.
+2. After all milestones pass, spawn exactly 1 `subagent-project-final-auditor` agent.
+
+### For Every Milestone, In This Order
+
+1. Spawn exactly 1 `subagent-milestone-researcher`.
+2. Spawn exactly 2 `subagent-milestone-plan-candidate` agents in parallel:
+   - Planning agent A writes `planning/<milestone-id>/PLAN_A/`.
+   - Planning agent B writes `planning/<milestone-id>/PLAN_B/`.
+3. Spawn exactly 1 `subagent-plan-synthesizer`.
+4. Create exactly 3 sibling git worktrees:
+   - Candidate A worktree on `work/<milestone-id>-execution-a`.
+   - Candidate B worktree on `work/<milestone-id>-execution-b`.
+   - Candidate C worktree on `work/<milestone-id>-execution-c`.
+5. Spawn exactly 3 `subagent-worktree-executor` agents in parallel, one per worktree.
+6. Spawn exactly 3 initial `subagent-worktree-validator` agents in parallel, one per worktree.
+7. For any candidate whose validation fails, run this candidate-local loop:
+   - Spawn exactly 1 `subagent-worktree-fixer` for that failed candidate.
+   - After the fixer completes, spawn exactly 1 fresh `subagent-worktree-validator` for that same candidate.
+   - Repeat until that candidate is accepted, blocked, or rejected as nonviable.
+8. Spawn exactly 1 `subagent-worktree-reviewer` for each viable candidate that passed validation. In the normal case this is 3 reviewers.
+9. The root orchestrator selects the winning candidate. Do not delegate final selection unless conflict resolution is too large to handle safely.
+10. Merge exactly 1 winning candidate into the main workspace.
+11. Spawn exactly 1 `subagent-code-reviewer` after merge.
+12. Spawn exactly 1 `subagent-code-optimizer` after code review. If code review has no required fixes, the optimizer still performs a cleanup/no-op confirmation pass and records verification.
+13. Spawn exactly 1 `subagent-final-validator` after optimization.
+14. If final validation fails, run this main-workspace loop:
+   - Spawn exactly 1 fixer/optimizer for the current failure set.
+   - After fixes are committed, spawn exactly 1 fresh `subagent-final-validator`.
+   - Repeat until the merged milestone is accepted, blocked, or failed.
+15. Only then mark the milestone complete and start the next milestone.
+
+Do not collapse these phases. Do not let implementation agents also serve as validators. Do not use one planning agent for both plans. Do not skip the third implementation candidate because the first two look good. Do not start milestone `<N+1>` while any required gate for milestone `<N>` is incomplete.
+
+## Exact Workflow Runbook
 
 ### 0. Intake And Repository Setup
 
