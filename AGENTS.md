@@ -36,6 +36,7 @@ Managed Codex sessions intentionally run with broad local permissions and genera
 - `milestones/`: implementation briefs and validation notes for completed design slices.
 - `skills/`: reusable prompt templates for Puppetmaster orchestrators and built-in `subagent-*.md` MCP skill entries. The project workflow uses `project-orchestrator.md` plus the planning/worktree review subagent family. The ABBA IoT bug bounty workflow uses `abba-iot-bugbounty-orchestrator.md` plus the `subagent-abba-*` skill family.
 - `docs/spec-conformance.md`: checklist mapping v1 requirements to implementation artifacts.
+- `docs/google-vrp/official-scope-rules.md`: official-source research notes for orchestrators and subagents working on Google web VRP scope and safe documentation-only bug bounty prompts.
 - `scripts/release-validate.sh`: local release validation script.
 
 ## Public Interfaces
