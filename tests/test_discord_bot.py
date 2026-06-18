@@ -472,6 +472,87 @@ def test_inbound_mention_is_delivered_with_clean_prompt_and_reaction(ctx, tmp_pa
     assert message.replies == []
 
 
+def test_inbound_goal_message_preserves_goal_prefix_and_includes_puppetmaster_prompt(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("456", root["id"], "123")
+    delivered: list[tuple[str, str, str]] = []
+    bot_user = FakeDiscordUser("999")
+
+    def fake_prompt(registry, tmux_client, agent_id, prompt, source):
+        delivered.append((agent_id, prompt, source))
+        return {"created_at": "2026-05-20T00:00:01Z"}
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, prompt_func=fake_prompt)
+        message = FakeDiscordMessage(
+            "<@999> /goal implement the reporting workflow",
+            channel=FakeDiscordChannel(),
+            mentions=[bot_user],
+        )
+        try:
+            handled = await runtime.handle_message(message, bot_user)
+        finally:
+            await runtime.close()
+        return handled, message
+
+    handled, message = asyncio.run(run())
+
+    assert handled is True
+    assert len(delivered) == 1
+    agent_id, prompt, source = delivered[0]
+    assert agent_id == root["id"]
+    assert source == "discord"
+    assert prompt.startswith("/goal You are a Puppetmaster-managed Codex agent.")
+    assert DISCORD_PROMPT_PREFIX not in prompt
+    assert "Puppetmaster tools:" in prompt
+    assert "Use create_agent(cwd, prompt, description?, skill?, goal?, name?, metadata?)" in prompt
+    assert "USER INSTRUCTIONS\nimplement the reporting workflow" in prompt
+    assert message.reactions == [PROMPT_DELIVERED_REACTION]
+    assert message.replies == []
+
+
+def test_inbound_goal_message_preserves_attachment_paths_inside_user_instructions(ctx, tmp_path):
+    cfg, reg, tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    reg.bind_discord_channel("456", root["id"], "123")
+    delivered: list[str] = []
+    bot_user = FakeDiscordUser("999")
+    attachment = FakeDiscordAttachment("context.md", b"# context")
+
+    def fake_prompt(registry, tmux_client, agent_id, prompt, source):
+        delivered.append(prompt)
+        return {"created_at": "2026-05-20T00:00:01Z"}
+
+    async def run():
+        runtime = DiscordRuntime(DiscordConfig(guild_id=123), reg, tmux, prompt_func=fake_prompt)
+        message = FakeDiscordMessage(
+            "<@999> /goal inspect the attached context",
+            channel=FakeDiscordChannel(),
+            mentions=[bot_user],
+            attachments=[attachment],
+            message_id="goal-message",
+        )
+        try:
+            handled = await runtime.handle_message(message, bot_user)
+        finally:
+            await runtime.close()
+        return handled, message
+
+    handled, message = asyncio.run(run())
+
+    assert handled is True
+    saved_path = cfg.state_dir / "human_files" / root["id"] / "goal-message" / "01-context.md"
+    assert saved_path.read_bytes() == b"# context"
+    assert len(delivered) == 1
+    prompt = delivered[0]
+    assert prompt.startswith("/goal You are a Puppetmaster-managed Codex agent.")
+    assert DISCORD_PROMPT_PREFIX not in prompt
+    assert f"USER INSTRUCTIONS\ninspect the attached context\n\n{FILES_ATTACHED_HEADING}\n{saved_path}" in prompt
+    assert message.reactions == [PROMPT_DELIVERED_REACTION]
+    assert message.replies == []
+
+
 def test_inbound_duplicate_discord_message_is_claimed_once(ctx, tmp_path):
     cfg, reg, tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")

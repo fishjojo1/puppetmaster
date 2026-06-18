@@ -35,6 +35,7 @@ except ImportError:  # pragma: no cover
 TRUNCATED_MARKER = "[truncated]"
 CODE_BLOCK_OVERHEAD = len("```\n\n```")
 DISCORD_PROMPT_PREFIX = "DISCORD MESSAGE RECEIVED:\n"
+CODEX_GOAL_PREFIX = "/goal "
 FILES_ATTACHED_HEADING = "FILES ATTACHED"
 TEXT_ONLY_REPLY = "Send text or attach a file for the bound orchestrator."
 NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents, then /puppet bind."
@@ -305,15 +306,23 @@ def _safe_inbound_attachment_filename(attachment: Any, index: int) -> str:
     return _safe_path_component(name, f"attachment-{index}", max_length=180)
 
 
-def _format_inbound_prompt(cleaned: str, file_paths: list[str]) -> str:
+def _format_inbound_user_prompt(cleaned: str, file_paths: list[str]) -> str:
     if not file_paths:
-        return f"{DISCORD_PROMPT_PREFIX}{cleaned}"
-    lines = [DISCORD_PROMPT_PREFIX.rstrip()]
+        return cleaned
+    lines: list[str] = []
     if cleaned:
         lines.extend([cleaned, ""])
     lines.append(FILES_ATTACHED_HEADING)
     lines.extend(file_paths)
     return "\n".join(lines)
+
+
+def _format_inbound_prompt(agent: dict[str, Any], cleaned: str, file_paths: list[str]) -> str:
+    if cleaned.startswith(CODEX_GOAL_PREFIX):
+        user_prompt = _format_inbound_user_prompt(cleaned[len(CODEX_GOAL_PREFIX) :].strip(), file_paths)
+        return f"{CODEX_GOAL_PREFIX}{prompt_text(agent, user_prompt).strip()}"
+    user_prompt = _format_inbound_user_prompt(cleaned, file_paths)
+    return f"{DISCORD_PROMPT_PREFIX}{user_prompt}"
 
 
 async def _is_reply_to_bot(message: Any, bot_user: Any) -> bool:
@@ -452,9 +461,23 @@ class DiscordRuntime:
             await message.reply(NOT_BOUND_REPLY)
             return True
 
+        root = self.registry.maybe_agent(binding["root_agent_id"])
+        if root is None:
+            self.registry.unbind_discord_channel(channel_id)
+            self._log(
+                "warning",
+                "discord.inbound.stale_binding",
+                "Discord channel binding pointed at a missing root orchestrator.",
+                root_agent_id=binding["root_agent_id"],
+                channel_id=channel_id,
+                guild_id=str(getattr(guild, "id", "")),
+                discord_message_id=discord_message_id,
+            )
+            await message.reply(STALE_BINDING_REPLY)
+            return True
+
         if self.prompt_func is prompt_agent:
-            root = self.registry.maybe_agent(binding["root_agent_id"])
-            if root is None or not self.tmux.session_exists(root["tmux_session"]):
+            if not self.tmux.session_exists(root["tmux_session"]):
                 self.registry.unbind_discord_channel(channel_id)
                 self._log(
                     "warning",
@@ -490,7 +513,7 @@ class DiscordRuntime:
             await message.reply(f"I could not download that attachment. {format_error(exc)}")
             return True
 
-        prompt = _format_inbound_prompt(cleaned, file_paths)
+        prompt = _format_inbound_prompt(root, cleaned, file_paths)
         try:
             event = self.prompt_func(self.registry, self.tmux, binding["root_agent_id"], prompt, "discord")
         except PuppetError as exc:

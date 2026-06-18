@@ -263,7 +263,7 @@ Slash commands:
 /skills skill-name:<optional> prompt:<optional> extra-prompt:<optional> view:<optional> forget:<optional>
 ```
 
-After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Inbound user attachments are downloaded into `~/.puppetmaster/human_files/<root-agent-id>/<discord-message-id>/` and the delivered prompt includes a `FILES ATTACHED` block listing the saved local paths. Attachment-only messages are accepted.
+After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Inbound user attachments are downloaded into `~/.puppetmaster/human_files/<root-agent-id>/<discord-message-id>/` and the delivered prompt includes a `FILES ATTACHED` block listing the saved local paths. Attachment-only messages are accepted. If the cleaned Discord message starts with `/goal `, the bot delivers a Codex goal-mode prompt that starts with `/goal ` and includes the generated Puppetmaster runtime/tool instructions before the user task, instead of wrapping the text in `DISCORD MESSAGE RECEIVED`.
 
 `/puppet agents` formats each root id in its own copy-friendly code block so Discord users can copy one id at a time.
 

@@ -71,7 +71,7 @@ Discord `/skills` manages reusable prompts. With no arguments it lists saved ski
 
 The TUI opens on the agent tree. Press `s` to switch to the reusable skills view, where `n` creates a skill, `e` or Enter edits the selected skill through `$VISUAL`/`$EDITOR`, and `d` deletes the selected skill.
 
-Discord inbound file attachments are saved under the active state directory at `human_files/<root-agent-id>/<discord-message-id>/`. The delivered root prompt includes a literal `FILES ATTACHED` section with absolute saved paths. Attachment-only Discord messages are valid prompts.
+Discord inbound file attachments are saved under the active state directory at `human_files/<root-agent-id>/<discord-message-id>/`. The delivered root prompt includes a literal `FILES ATTACHED` section with absolute saved paths. Attachment-only Discord messages are valid prompts. When the cleaned Discord message starts with `/goal `, the delivered prompt starts with literal `/goal ` and includes regenerated Puppetmaster runtime/tool instructions before the user task instead of the normal `DISCORD MESSAGE RECEIVED` wrapper.
 
 Discord `/puppet compact` and `/puppet clear` both send the literal Codex reset command to the bound root, then queue a regenerated Puppetmaster orchestrator prompt after a short delay with a reset-specific task telling the root to notify the user that it is ready for new tasks.
 
