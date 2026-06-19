@@ -2617,11 +2617,13 @@ def test_tmux_send_prompt_pastes_and_confirms_with_second_enter(ctx, monkeypatch
 
     commands = [call[0] for call in calls]
     assert commands[:4] == [
-        ["tmux", "set-buffer", "-b", commands[0][3], "continue"],
+        ["tmux", "load-buffer", "-b", commands[0][3], "-"],
         ["tmux", "paste-buffer", "-pr", "-b", commands[0][3], "-t", "puppet_agt_child"],
         ["tmux", "send-keys", "-t", "puppet_agt_child", "C-m"],
         ["tmux", "send-keys", "-t", "puppet_agt_child", "C-m"],
     ]
+    assert calls[0][1]["input"] == "continue"
+    assert calls[0][1]["text"] is True
     assert commands[4] == ["tmux", "delete-buffer", "-b", commands[0][3]]
     assert sleeps == [
         tmux_module.PROMPT_PASTE_SETTLE_DELAY_SECONDS,

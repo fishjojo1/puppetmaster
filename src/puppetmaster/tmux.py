@@ -75,13 +75,26 @@ class Tmux:
     def send_prompt(self, session: str, prompt: str) -> None:
         self.require_tmux()
         buffer_name = f"puppet_prompt_{os.getpid()}"
-        subprocess.run(["tmux", "set-buffer", "-b", buffer_name, prompt], check=True)
+        proc = subprocess.run(
+            ["tmux", "load-buffer", "-b", buffer_name, "-"],
+            input=prompt,
+            text=True,
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise PuppetError("tmux_prompt_failed", f"tmux load-buffer failed: {proc.stderr.strip()}")
         try:
-            subprocess.run(["tmux", "paste-buffer", "-pr", "-b", buffer_name, "-t", session], check=True)
+            proc = subprocess.run(["tmux", "paste-buffer", "-pr", "-b", buffer_name, "-t", session], text=True, capture_output=True)
+            if proc.returncode != 0:
+                raise PuppetError("tmux_prompt_failed", f"tmux paste-buffer failed: {proc.stderr.strip()}")
             time.sleep(PROMPT_PASTE_SETTLE_DELAY_SECONDS)
-            subprocess.run(["tmux", "send-keys", "-t", session, "C-m"], check=True)
+            proc = subprocess.run(["tmux", "send-keys", "-t", session, "C-m"], text=True, capture_output=True)
+            if proc.returncode != 0:
+                raise PuppetError("tmux_prompt_failed", f"tmux send-keys failed: {proc.stderr.strip()}")
             time.sleep(PROMPT_SUBMIT_CONFIRM_DELAY_SECONDS)
-            subprocess.run(["tmux", "send-keys", "-t", session, "C-m"], check=True)
+            proc = subprocess.run(["tmux", "send-keys", "-t", session, "C-m"], text=True, capture_output=True)
+            if proc.returncode != 0:
+                raise PuppetError("tmux_prompt_failed", f"tmux send-keys failed: {proc.stderr.strip()}")
         finally:
             subprocess.run(["tmux", "delete-buffer", "-b", buffer_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
