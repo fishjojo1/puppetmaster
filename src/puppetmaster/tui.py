@@ -20,10 +20,33 @@ from .tmux import Tmux
 
 PREVIEW_DEBOUNCE_SECONDS = 0.15
 INPUT_POLL_SECONDS = 0.1
+DEFAULT_HIDDEN_AGENT_STATUSES = {"killed"}
 
 
 def short_id(agent_id: str) -> str:
     return agent_id.split("_", 1)[-1][:8]
+
+
+def filter_agent_tree(agents: list[dict[str, Any]], hidden_statuses: set[str]) -> list[dict[str, Any]]:
+    if not hidden_statuses:
+        return agents
+
+    by_parent: dict[str | None, list[dict[str, Any]]] = {}
+    for agent in agents:
+        by_parent.setdefault(agent["parent_id"], []).append(agent)
+
+    keep_cache: dict[str, bool] = {}
+
+    def keep(agent: dict[str, Any]) -> bool:
+        agent_id = agent["id"]
+        if agent_id in keep_cache:
+            return keep_cache[agent_id]
+        visible_self = agent["status"] not in hidden_statuses
+        visible_child = any(keep(child) for child in by_parent.get(agent_id, []))
+        keep_cache[agent_id] = visible_self or visible_child
+        return keep_cache[agent_id]
+
+    return [agent for agent in agents if keep(agent)]
 
 
 def build_tree_rows(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -145,6 +168,7 @@ class TuiApp:
         self.agent_stats: dict[str, Any] = {}
         self.child_counts: dict[str, int] = {}
         self.descendant_counts: dict[str, int] = {}
+        self.show_killed = False
         self.message = ""
         self.last_refresh = 0.0
         self.preview_refresh_due_at: float | None = None
@@ -193,12 +217,15 @@ class TuiApp:
     def reload(self, *, force_preview: bool = False) -> None:
         try:
             self.message = ""
-            agents = self.registry.list_agents(root_id=self.root_id)
+            all_agents = self.registry.list_agents(root_id=self.root_id)
+            hidden_statuses = set() if self.show_killed else DEFAULT_HIDDEN_AGENT_STATUSES
+            agents = filter_agent_tree(all_agents, hidden_statuses)
             self.reload_skills(clear_message=False)
             sessions = self.tmux.list_sessions(self.config.tmux_session_prefix)
             self.live_sessions = {item["session"] for item in sessions}
             self.rows = build_tree_rows(agents)
             self.tree_stats = summarize_tree(agents, self.live_sessions)
+            self.tree_stats["hidden"] = len(all_agents) - len(agents)
             self.child_counts, self.descendant_counts = summarize_agent_relationships(agents)
             if self.selected >= len(self.rows):
                 self.selected = max(0, len(self.rows) - 1)
@@ -323,9 +350,16 @@ class TuiApp:
                 self.schedule_preview_refresh(reset_scroll=True)
         elif key == ord("r"):
             self.reload(force_preview=True)
+        elif key == ord("K"):
+            self.toggle_killed_visibility()
         elif key in {10, 13, curses.KEY_ENTER, ord("a")}:
             self.attach_selected(stdscr)
         return False
+
+    def toggle_killed_visibility(self) -> None:
+        self.show_killed = not self.show_killed
+        self.reload(force_preview=True)
+        self.message = "Showing killed agents." if self.show_killed else "Hiding killed agents."
 
     def toggle_mode(self) -> None:
         if self.mode == "skills":
@@ -614,11 +648,12 @@ class TuiApp:
         if self.root_id:
             title += f" root={self.root_id}"
         addstr(stdscr, 0, 0, title, width, curses.A_BOLD)
+        killed_toggle_label = "K hide killed" if self.show_killed else "K show killed"
         addstr(
             stdscr,
             height - 1,
             0,
-            "q quit | s skills | up/down select | pgup/pgdn scroll preview | home/end preview | enter attach | r refresh",
+            f"q quit | s skills | {killed_toggle_label} | up/down select | pgup/pgdn scroll preview | enter attach | r refresh",
             width,
             curses.A_DIM,
         )
@@ -742,8 +777,12 @@ class TuiApp:
         addstr(stdscr, y - 1, x, "Stats", width, curses.A_BOLD)
         tree = self.tree_stats
         agent = self.agent_stats
+        hidden = int(tree.get("hidden", 0) or 0)
+        tree_line = f"tree: {tree.get('total', 0)} agents, {tree.get('live', 0)} live, depth {tree.get('max_depth', 0)}"
+        if hidden:
+            tree_line += f", {hidden} killed hidden"
         lines = [
-            f"tree: {tree.get('total', 0)} agents, {tree.get('live', 0)} live, depth {tree.get('max_depth', 0)}",
+            tree_line,
             f"statuses: {tree.get('statuses', '-')}",
             f"context left: {agent.get('context_left', 'unknown')}",
             f"selected: {agent.get('children', 0)} children, {agent.get('descendants', 0)} descendants",

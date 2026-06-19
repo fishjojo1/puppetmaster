@@ -44,6 +44,7 @@ import puppetmaster.tui as tui_module
 from puppetmaster.tui import (
     TuiApp,
     build_tree_rows,
+    filter_agent_tree,
     format_tree_row,
     parse_context_left,
     summarize_agent_relationships,
@@ -2829,6 +2830,24 @@ def test_tui_builds_nested_tree_rows(ctx, tmp_path):
     assert "live child" in format_tree_row(rows[1], live=True)
 
 
+def test_tui_filters_killed_leaf_agents_and_keeps_visible_descendants(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator", name="root")
+    killed_leaf = create_agent_record(cfg, reg, cwd=str(tmp_path), description="killed", parent_id=root["id"], name="killed")
+    killed_parent = create_agent_record(cfg, reg, cwd=str(tmp_path), description="killed parent", parent_id=root["id"], name="parent")
+    active_child = create_agent_record(cfg, reg, cwd=str(tmp_path), description="active", parent_id=killed_parent["id"], name="active")
+
+    reg.update_agent(killed_leaf["id"], status="killed")
+    reg.update_agent(killed_parent["id"], status="killed")
+    reg.update_agent(active_child["id"], status="running")
+
+    filtered = filter_agent_tree(reg.list_agents(), {"killed"})
+    rows = build_tree_rows(filtered)
+
+    assert [row["agent"]["id"] for row in rows] == [root["id"], killed_parent["id"], active_child["id"]]
+    assert rows[1]["has_children"] is True
+
+
 def test_tui_parses_context_left():
     assert parse_context_left("Context left: 42%") == "42%"
     assert parse_context_left("status 17.5% context remaining") == "17.5%"
@@ -2870,6 +2889,32 @@ def test_tui_summarizes_tree_stats(ctx, tmp_path):
     assert stats["max_depth"] == 1
     assert "idle:1" in stats["statuses"]
     assert "running:1" in stats["statuses"]
+
+
+def test_tui_reload_hides_killed_agents_by_default(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
+    killed = create_agent_record(cfg, reg, cwd=str(tmp_path), description="killed", parent_id=root["id"])
+    active = create_agent_record(cfg, reg, cwd=str(tmp_path), description="active", parent_id=root["id"])
+    reg.update_agent(killed["id"], status="killed")
+    reg.update_agent(active["id"], status="running")
+
+    class FakeTmux:
+        def list_sessions(self, _prefix):
+            return []
+
+    app = TuiApp(cfg, reg, FakeTmux(), root_id=None, refresh=1.0, lines=120)
+
+    app.reload()
+    assert [row["agent"]["id"] for row in app.rows] == [root["id"], active["id"]]
+    assert app.tree_stats["hidden"] == 1
+    assert "killed" not in app.tree_stats["statuses"]
+
+    app.show_killed = True
+    app.reload()
+    assert [row["agent"]["id"] for row in app.rows] == [root["id"], killed["id"], active["id"]]
+    assert app.tree_stats["hidden"] == 0
+    assert "killed:1" in app.tree_stats["statuses"]
 
 
 def test_tui_summarizes_agent_relationship_counts(ctx, tmp_path):

@@ -301,7 +301,7 @@ puppet tui --refresh 1 --lines 120
 puppet tui --root <root-agent-id>
 ```
 
-Press `s` in the TUI to switch to the skills view. The skills view lists saved reusable Discord prompts, previews the selected prompt, and supports `n` to create, `e` or Enter to edit with `$VISUAL`/`$EDITOR`, and `d` to delete.
+Killed agents are hidden by default in the agent tree; press `K` to show or hide them. Press `s` in the TUI to switch to the skills view. The skills view lists saved reusable Discord prompts, previews the selected prompt, and supports `n` to create, `e` or Enter to edit with `$VISUAL`/`$EDITOR`, and `d` to delete.
 
 Create a child from the human CLI:
 
