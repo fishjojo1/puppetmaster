@@ -243,21 +243,20 @@ puppet orchestrator start \
 In Discord:
 
 ```text
-/puppet agents
-/puppet bind agent_id:project-a
+/puppet bind
 /puppet status
 /puppet screenshot
 ```
 
-For multi-project use, bind channel A to the project A root and channel B to the project B root. Custom root ids make these bindings stable and easy to type. A channel can have one active root binding, and a root can have one active channel binding. Rebinding a channel changes that channel only; rebinding a root moves that root from its previous channel.
+For multi-project use, run `/puppet bind` in channel A and select the project A root, then run `/puppet bind` in channel B and select the project B root. Custom root ids remain useful for the optional typed `agent_id` fallback and for CLI workflows. A channel can have one active root binding, and a root can have one active channel binding. Rebinding a channel changes that channel only; rebinding a root moves that root from its previous channel.
 
-`/puppet bind` rejects killed or dead root records. A completed root can be rebound and prompted again as long as its tmux session still exists; prompting it marks the agent running again.
+`/puppet bind` without `agent_id` shows a Discord select menu of live root orchestrators and omits killed, dead, child, and stale records. The optional `agent_id` argument still accepts a root orchestrator id directly and rejects killed or dead root records. A completed root can be rebound and prompted again as long as its tmux session still exists; prompting it marks the agent running again.
 
 Slash commands:
 
 ```text
 /puppet agents
-/puppet bind agent_id:<root-agent-id>
+/puppet bind agent_id:<optional-root-agent-id>
 /puppet unbind
 /puppet status
 /puppet read lines:<optional>
@@ -270,7 +269,7 @@ Slash commands:
 
 After a channel is bound, the bot sends prompts to the root orchestrator only when a message mentions the bot or replies to a bot-authored message. Plain channel chatter is ignored. Inbound user attachments are downloaded into `~/.puppetmaster/human_files/<root-agent-id>/<discord-message-id>/` and the delivered prompt includes a `FILES ATTACHED` block listing the saved local paths. Attachment-only messages are accepted. If the cleaned Discord message starts with `/goal `, the bot delivers a Codex goal-mode prompt that starts with `/goal ` and includes the generated Puppetmaster runtime/tool instructions before the user task, instead of wrapping the text in `DISCORD MESSAGE RECEIVED`.
 
-`/puppet agents` formats each root id in its own copy-friendly code block so Discord users can copy one id at a time.
+`/puppet agents` formats each root id in its own copy-friendly code block as a fallback for typed binding or CLI inspection.
 
 `/skills` manages reusable Discord prompts. With no arguments it lists saved skills. The `skill-name` option autocompletes from saved skills. With `skill-name` and `prompt`, it creates or updates a skill. With `skill-name` and `view:true`, it shows the stored prompt without running it. With only `skill-name`, it sends that saved prompt to the channel's bound root orchestrator. With `skill-name` and `extra-prompt`, it appends one-off instructions when running the saved skill without modifying the saved prompt. With `skill-name` and `forget:true`, it deletes the skill. If the saved prompt starts with `/goal `, running the skill delivers a Codex goal-mode prompt with generated Puppetmaster runtime/tool instructions before the saved skill task.
 

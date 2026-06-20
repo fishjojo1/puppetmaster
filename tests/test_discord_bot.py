@@ -16,6 +16,7 @@ from puppetmaster.discord_bot import (
     NOT_BOUND_REPLY,
     PROMPT_DELIVERED_REACTION,
     TEXT_ONLY_REPLY,
+    autocomplete_root_agent_choices,
     autocomplete_discord_skill_names,
     build_discord_bot,
     chunk_text,
@@ -30,6 +31,7 @@ from puppetmaster.discord_bot import (
     handle_status_command,
     handle_tree_command,
     handle_unbind_command,
+    live_bindable_root_agents,
     send_plain_chunks,
     send_chunks,
     validate_discord_config,
@@ -729,7 +731,7 @@ def test_inbound_unbound_channel_mention_receives_setup_hint(ctx):
 
     assert handled is True
     assert message.replies == [NOT_BOUND_REPLY]
-    assert message.replies[0] == "No orchestrator is bound to this channel. Use /puppet agents, then /puppet bind."
+    assert message.replies[0] == "No orchestrator is bound to this channel. Use /puppet bind."
 
 
 def test_inbound_prompt_delivery_failure_creates_visible_reply(ctx, tmp_path):
@@ -1240,6 +1242,34 @@ def test_bind_allows_completed_root_orchestrators(ctx, tmp_path):
     assert reg.discord_binding_for_channel("channel-1")["root_agent_id"] == root["id"]
 
 
+def test_bindable_root_choices_include_only_live_available_roots(ctx, tmp_path):
+    cfg, reg, _tmux = ctx
+    live_cwd = tmp_path / "live"
+    stale_cwd = tmp_path / "stale"
+    killed_cwd = tmp_path / "killed"
+    child_cwd = tmp_path / "child"
+    for cwd in (live_cwd, stale_cwd, killed_cwd, child_cwd):
+        cwd.mkdir()
+    live_root = create_agent_record(cfg, reg, cwd=str(live_cwd), description="project live", role="orchestrator", name="live-root")
+    stale_root = create_agent_record(cfg, reg, cwd=str(stale_cwd), description="project stale", role="orchestrator", name="stale-root")
+    killed_root = create_agent_record(cfg, reg, cwd=str(killed_cwd), description="project killed", role="orchestrator", name="killed-root")
+    child = create_agent_record(cfg, reg, cwd=str(child_cwd), description="child", parent_id=live_root["id"], name="child")
+    reg.update_agent(killed_root["id"], status="killed")
+
+    class MultiTmux:
+        def session_exists(self, session):
+            return session == live_root["tmux_session"]
+
+    roots = live_bindable_root_agents(reg, MultiTmux())
+    choices = autocomplete_root_agent_choices(reg, MultiTmux(), "live")
+
+    assert [agent["id"] for agent in roots] == [live_root["id"]]
+    assert choices == [(f"live-root | {live_root['status']} | live | {live_root['id']}", live_root["id"])]
+    assert child["id"] not in {value for _name, value in autocomplete_root_agent_choices(reg, MultiTmux(), "")}
+    assert stale_root["id"] not in {value for _name, value in autocomplete_root_agent_choices(reg, MultiTmux(), "")}
+    assert killed_root["id"] not in {value for _name, value in autocomplete_root_agent_choices(reg, MultiTmux(), "")}
+
+
 def test_bind_rejects_non_text_channels(ctx, tmp_path):
     cfg, reg, _tmux = ctx
     root = create_agent_record(cfg, reg, cwd=str(tmp_path), description="root", role="orchestrator")
@@ -1519,7 +1549,7 @@ def test_read_requires_a_binding(ctx):
         handle_read_command(cfg, reg, tmux, FakeTextChannel(), lines=10)
 
     assert exc.value.code == "not_bound"
-    assert "Use /puppet agents" in exc.value.hint
+    assert "Use /puppet bind" in exc.value.hint
 
 
 def test_screenshot_requires_a_binding(ctx):
@@ -1925,7 +1955,7 @@ def test_tree_requires_binding_and_renders_descendants(ctx, tmp_path):
     with pytest.raises(PuppetError) as exc:
         handle_tree_command(reg, FakeTextChannel())
     assert exc.value.code == "not_bound"
-    assert "Use /puppet agents" in exc.value.hint
+    assert "Use /puppet bind" in exc.value.hint
 
     handle_bind_command(reg, FakeTextChannel(), root["id"])
     output = handle_tree_command(reg, FakeTextChannel())
@@ -2004,10 +2034,12 @@ def test_run_discord_bot_logs_crash(ctx, monkeypatch):
 def test_build_discord_bot_reports_missing_guild_access(ctx, monkeypatch):
     cfg, reg, tmux = ctx
     cfg = replace(cfg, discord=DiscordConfig(token="secret", guild_id=123))
+    root = create_agent_record(cfg, reg, cwd=str(Path.cwd()), description="root", role="orchestrator", name="root")
     reg.upsert_discord_skill("release-check", "Check release readiness.")
     monkeypatch.setattr(discord_bot_module, "discord", FakeDiscordModule)
     monkeypatch.setattr(discord_bot_module, "app_commands", FakeAppCommandsModule)
     monkeypatch.setattr(discord_bot_module, "commands", FakeCommandsModule)
+    monkeypatch.setattr(tmux, "session_exists", lambda session: session == root["tmux_session"])
 
     bot = build_discord_bot(cfg, reg, tmux)
     setup_hook = bot.events["setup_hook"]
@@ -2019,6 +2051,12 @@ def test_build_discord_bot_reports_missing_guild_access(ctx, monkeypatch):
     assert "screenshot" in {name for name, _description, _func in group.commands}
     assert "compact" in {name for name, _description, _func in group.commands}
     assert "clear" in {name for name, _description, _func in group.commands}
+    bind_command = next(func for name, _description, func in group.commands if name == "bind")
+    bind_autocomplete = bind_command.autocomplete_fields["agent_id"]
+    bind_choices = asyncio.run(bind_autocomplete(object(), "roo"))
+    assert [(choice.name, choice.value) for choice in bind_choices] == [
+        (f"root | {root['status']} | {Path.cwd().name} | {root['id']}", root["id"])
+    ]
     skills_command = bot.tree.added[1][0]
     assert skills_command.command_name == "skills"
     autocomplete = skills_command.autocomplete_fields["skill_name"]
@@ -2045,7 +2083,7 @@ def test_readme_documents_discord_operations_and_safety():
     assert "PUPPETMASTER_STATE_DIR" in readme
     assert "project-local `.puppetmaster/` directories are not migrated automatically" in readme
     assert "Automatic migration is not provided" in readme
-    assert "bind channel A to the project A root and channel B to the project B root" in readme
+    assert "run `/puppet bind` in channel A and select the project A root" in readme
     assert "--agent-id project-a" in readme
     assert "/puppet screenshot" in readme
     assert "tmux pane" in readme

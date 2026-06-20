@@ -38,12 +38,14 @@ DISCORD_PROMPT_PREFIX = "DISCORD MESSAGE RECEIVED:\n"
 CODEX_GOAL_PREFIX = "/goal "
 FILES_ATTACHED_HEADING = "FILES ATTACHED"
 TEXT_ONLY_REPLY = "Send text or attach a file for the bound orchestrator."
-NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet agents, then /puppet bind."
+NOT_BOUND_REPLY = "No orchestrator is bound to this channel. Use /puppet bind."
 PROMPT_DELIVERY_FAILED_REPLY = "I could not deliver that message to the bound root."
 PROMPT_DELIVERY_FAILED_HINT = "Use /puppet status or /puppet read."
-STALE_BINDING_REPLY = "The orchestrator bound to this channel is no longer live. Use /puppet agents, then /puppet bind."
+STALE_BINDING_REPLY = "The orchestrator bound to this channel is no longer live. Use /puppet bind."
 PROMPT_DELIVERED_REACTION = "\N{WHITE HEAVY CHECK MARK}"
 MAX_SKILL_AUTOCOMPLETE_CHOICES = 25
+MAX_BIND_AUTOCOMPLETE_CHOICES = 25
+MAX_DISCORD_CHOICE_TEXT = 100
 POST_RESET_PROMPT_DELAY_SECONDS = 3.0
 POST_CLEAR_TASK_PROMPT = (
     "Your context has just been cleared. Use the send message tool to inform the user that you are now ready to receive tasks."
@@ -847,6 +849,62 @@ def root_agents(registry: Registry) -> list[dict[str, Any]]:
     ]
 
 
+def live_bindable_root_agents(registry: Registry, tmux: Tmux) -> list[dict[str, Any]]:
+    roots: list[dict[str, Any]] = []
+    for agent in root_agents(registry):
+        if agent["status"] in {"killed", "dead"}:
+            continue
+        try:
+            if not tmux.session_exists(agent["tmux_session"]):
+                continue
+        except PuppetError:
+            continue
+        roots.append(agent)
+    return roots
+
+
+def _discord_choice_text(value: str) -> str:
+    value = " ".join(str(value).split())
+    if len(value) <= MAX_DISCORD_CHOICE_TEXT:
+        return value
+    return value[: MAX_DISCORD_CHOICE_TEXT - 1] + "..."
+
+
+def format_root_agent_choice(agent: dict[str, Any]) -> str:
+    name = agent.get("name") or agent["id"]
+    cwd = Path(str(agent["cwd"])).name or str(agent["cwd"])
+    return _discord_choice_text(f"{name} | {agent['status']} | {cwd} | {agent['id']}")
+
+
+def autocomplete_root_agent_choices(
+    registry: Registry,
+    tmux: Tmux,
+    current: str | None,
+    limit: int = MAX_BIND_AUTOCOMPLETE_CHOICES,
+) -> list[tuple[str, str]]:
+    query = (current or "").strip().casefold()
+    choices: list[tuple[str, str]] = []
+    for agent in live_bindable_root_agents(registry, tmux):
+        value = str(agent["id"])
+        if len(value) > MAX_DISCORD_CHOICE_TEXT:
+            continue
+        haystack = " ".join(
+            [
+                value,
+                str(agent.get("name") or ""),
+                str(agent.get("description") or ""),
+                str(agent.get("cwd") or ""),
+                str(agent.get("status") or ""),
+            ]
+        ).casefold()
+        if query and query not in haystack:
+            continue
+        choices.append((format_root_agent_choice(agent), value))
+        if len(choices) >= limit:
+            break
+    return choices
+
+
 def handle_agents_command(registry: Registry) -> str:
     roots = root_agents(registry)
     if not roots:
@@ -892,7 +950,7 @@ def _require_bound_root(registry: Registry, channel: Any) -> dict[str, Any]:
         raise PuppetError(
             "not_bound",
             "No orchestrator is bound to this channel.",
-            "Use /puppet agents, then /puppet bind.",
+            "Use /puppet bind.",
         )
     return registry.get_agent(binding["root_agent_id"])
 
@@ -927,6 +985,63 @@ def handle_bind_command(registry: Registry, channel: Any, agent_id: str) -> str:
         extra={"event": "discord.binding.bound", "channel_id": channel_id, "root_agent_id": agent["id"], "guild_id": guild_id},
     )
     return f"Bound this channel to {agent['id']}"
+
+
+async def send_bind_select_interaction(interaction: Any, config: Config, registry: Registry, tmux: Tmux) -> None:
+    if discord is None:
+        raise PuppetError("discord_dependency_missing", "discord.py is not installed.")
+    roots = live_bindable_root_agents(registry, tmux)
+    if not roots:
+        await send_plain_interaction_chunks(
+            interaction,
+            "No live root orchestrators found. Start one with `puppet orchestrator start`, then run `/puppet bind` again.",
+            config,
+        )
+        return
+
+    options = [
+        discord.SelectOption(
+            label=format_root_agent_choice(agent),
+            value=str(agent["id"]),
+            description=_discord_choice_text(str(agent["cwd"])),
+        )
+        for agent in roots[:MAX_BIND_AUTOCOMPLETE_CHOICES]
+        if len(str(agent["id"])) <= MAX_DISCORD_CHOICE_TEXT
+    ]
+    if not options:
+        await send_plain_interaction_chunks(
+            interaction,
+            "No selectable root orchestrator ids found. Use `/puppet agents`, then `/puppet bind agent_id:<root-agent-id>`.",
+            config,
+        )
+        return
+
+    class BindRootSelect(discord.ui.Select):  # type: ignore[union-attr]
+        def __init__(self) -> None:
+            super().__init__(placeholder="Choose a root orchestrator for this channel", options=options)
+
+        async def callback(self, select_interaction: Any) -> None:
+            try:
+                result = handle_bind_command(registry, select_interaction.channel, str(self.values[0]))
+            except PuppetError as exc:
+                result = format_error(exc)
+            if select_interaction.response.is_done():
+                await select_interaction.followup.send(result)
+            else:
+                await select_interaction.response.edit_message(content=result, view=None)
+
+    class BindRootView(discord.ui.View):  # type: ignore[union-attr]
+        def __init__(self) -> None:
+            super().__init__(timeout=180)
+            self.add_item(BindRootSelect())
+
+    message = "Select the live root orchestrator to bind to this channel."
+    if len(roots) > len(options):
+        message += f" Showing the first {len(options)} selectable roots."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, view=BindRootView())
+    else:
+        await interaction.response.send_message(message, view=BindRootView())
 
 
 def handle_unbind_command(registry: Registry, channel: Any) -> str:
@@ -1329,10 +1444,25 @@ def build_discord_bot(config: Config | None = None, registry: Registry | None = 
     async def agents(interaction: discord.Interaction) -> None:
         await _run_plain_interaction_command(interaction, cfg, handle_agents_command, reg)
 
+    async def root_agent_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        del interaction
+        return [
+            app_commands.Choice(name=name, value=value)
+            for name, value in autocomplete_root_agent_choices(reg, tmux_client, current)
+        ]
+
     @group.command(name="bind", description="Bind this channel to a root orchestrator.")
-    @app_commands.describe(agent_id="Root orchestrator agent id.")
-    async def bind(interaction: discord.Interaction, agent_id: str) -> None:
-        await _run_interaction_command(interaction, cfg, handle_bind_command, reg, interaction.channel, agent_id)
+    @app_commands.describe(agent_id="Optional root orchestrator agent id. Omit this to choose from a list.")
+    @app_commands.autocomplete(agent_id=root_agent_autocomplete)
+    async def bind(interaction: discord.Interaction, agent_id: str | None = None) -> None:
+        if agent_id:
+            await _run_interaction_command(interaction, cfg, handle_bind_command, reg, interaction.channel, agent_id)
+            return
+        await _defer_interaction_response(interaction)
+        try:
+            await send_bind_select_interaction(interaction, cfg, reg, tmux_client)
+        except PuppetError as exc:
+            await send_interaction_chunks(interaction, format_error(exc), cfg)
 
     @group.command(name="unbind", description="Remove this channel binding.")
     async def unbind(interaction: discord.Interaction) -> None:
